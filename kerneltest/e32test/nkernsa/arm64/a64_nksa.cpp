@@ -6,6 +6,7 @@
 // StartSystemTimer, __timer_period, DebugPrint, __finish) and the exception/interrupt dispatch.
 // The IRQ path follows Phorepoc adaptation-x86-64 ekern/xk_irq.cpp X64_Trap (Apache-2.0): EOI early, tick,
 // reschedule/generic IPIs, tied-event tail, and preemption when leaving the outermost interrupt.
+#define __INCLUDE_NTHREADBASE_DEFINES__		/* iReady/iCurrent/iLastCpu names for the stall dump */
 #include <nktest/nkutils.h>
 #include <e32rom.h>
 #include <kernboot.h>
@@ -68,8 +69,23 @@ extern "C" TInt A64_TimesliceRemaining()
 	}
 static volatile TUint32 TickCount;		// CPU 0 ticks, for the boot-time tick self-check
 
+/* stall detector: each CPU records its tick count and where its tick interrupted it; if the tests print
+ * nothing for 15 s, CPU 0 dumps every CPU (the phone hung in ThreadGroupTest1's migrate loop) */
+static volatile TUint32 CpuTicks[KMaxCpus];
+static volatile TUint64 CpuLastElr[KMaxCpus];
+static volatile TUint32 StallLinesSeen, StallQuietTicks, StallDumped;
+extern "C" TUint32 A64_StatusLines();
+static void DumpCpus();
+
 static void SystemTick(TSubScheduler& aSS)
 	{
+	++CpuTicks[aSS.iCpuNum & (KMaxCpus - 1)];
+	if (aSS.iCpuNum == 0 && TimerQReady)
+		{
+		TUint32 lines = A64_StatusLines();
+		if (lines != StallLinesSeen) { StallLinesSeen = lines; StallQuietTicks = 0; StallDumped = 0; }	// re-arm on progress
+		else if (++StallQuietTicks == 15000 && StallDumped < 3) { ++StallDumped; DumpCpus(); StallQuietTicks = 0; }
+		}
 	if (aSS.iCpuNum == 0)
 		++TickCount;
 	if (aSS.iCpuNum == 0 && TimerQReady)
@@ -93,7 +109,7 @@ static void TimerIrq(TSubScheduler& aSS)
 	TimerProgram(c);
 	}
 
-static void Irq()
+static void Irq(SThreadExcStack* aF)
 	{
 	TSubScheduler& ss = SubScheduler();
 	++ss.iSSX.iIrqNestCount;				// -1 = not in an ISR
@@ -105,7 +121,10 @@ static void Irq()
 			break;							// nothing (more) pending
 		Gicv3_Eoi(id);						// EOI first: a reschedule below may not return for a long time
 		if (id == A64_TimerPpi)
+			{
+			CpuLastElr[ss.iCpuNum & (KMaxCpus - 1)] = aF->iElr;
 			TimerIrq(ss);
+			}
 		else if (id == RESCHED_IPI_VECTOR)
 			ss.iRescheduleNeededFlag = TRUE;
 		else if (id == GENERIC_IPI_VECTOR)
@@ -130,10 +149,74 @@ static void Irq()
 		}
 	}
 
+static void DumpSched(const char* aWhat, NSchedulable* aS)
+	{
+	A64_DebugPuts(aWhat); A64_DebugPuts(" "); A64_DebugHex((TLinAddr)aS);
+	A64_DebugPuts(" pri="); A64_DebugHex(aS->iPriority);
+	A64_DebugPuts(" rdy="); A64_DebugHex(aS->iReady);
+	A64_DebugPuts(" cur="); A64_DebugHex(aS->iCurrent);
+	A64_DebugPuts(" last="); A64_DebugHex(aS->iLastCpu);
+	A64_DebugPuts(" aff="); A64_DebugHex(aS->iCpuAffinity);
+	A64_DebugPuts(" chg="); A64_DebugHex(aS->iCpuChange);
+	A64_DebugPuts(" frz="); A64_DebugHex(aS->iFreezeCpu);
+	A64_DebugPuts(" tr="); A64_DebugHex(aS->iTransientCpu);
+	A64_DebugPuts(" ev="); A64_DebugHex(aS->iEventState);
+	A64_DebugPuts(" act="); A64_DebugHex((TUint32)aS->iActiveState);
+	A64_DebugPuts(" pause="); A64_DebugHex(aS->iPauseCount);
+	A64_DebugPuts(" susp="); A64_DebugHex(aS->iSuspended);
+	if (aS->iParent)	// a thread
+		{
+		NThreadBase* t = (NThreadBase*)aS;
+		A64_DebugPuts(" par="); A64_DebugHex((TLinAddr)t->iParent);
+		A64_DebugPuts(" wst="); A64_DebugHex(t->iWaitState.iWtC.iWtStFlags);
+		A64_DebugPuts(" cs="); A64_DebugHex(t->iCsFunction);
+		A64_DebugPuts(" fmd="); A64_DebugHex(t->iFastMutexDefer);
+		A64_DebugPuts(" time="); A64_DebugHex((TUint32)t->iTime);
+		}
+	else
+		{
+		A64_DebugPuts(" nthr="); A64_DebugHex(((NThreadGroup*)aS)->iThreadCount);
+		}
+	A64_DebugPuts("\n");
+	}
+
+static void DumpCpus()
+	{
+	A64_DebugPuts("\n*** STALL: no test output for 15 s. Per CPU: ticks elr thread klock resched irqnest\n");
+	for (TInt i = 0; i < TheScheduler.iNumCpus && i < KMaxCpus; ++i)
+		{
+		TSubScheduler& s = TheSubSchedulers[i];
+		NThreadBase* t = s.iCurrentThread;
+		A64_DebugPuts(" cpu"); A64_DebugPutc((char)('0' + i));
+		A64_DebugPuts(" t="); A64_DebugHex(CpuTicks[i]);
+		A64_DebugPuts(" pc="); A64_DebugHex(CpuLastElr[i]);
+		A64_DebugPuts(" thr="); A64_DebugHex((TLinAddr)t);
+		A64_DebugPuts(" kl="); A64_DebugHex(s.iKernLockCount);
+		A64_DebugPuts(" rs="); A64_DebugHex(s.iRescheduleNeededFlag);
+		A64_DebugPuts(" in="); A64_DebugHex((TUint32)s.iSSX.iIrqNestCount);
+		if (t)
+			{
+			A64_DebugPuts(" pri="); A64_DebugHex(t->iPriority);
+			A64_DebugPuts(" grp="); A64_DebugHex((TLinAddr)t->iParent);
+			}
+		A64_DebugPuts("\n");
+		}
+	// the thread group under test (threadbasic.cpp TG1) and its member threads
+	extern NThreadGroup TG1;
+	DumpSched("group TG1", &TG1);
+	for (SIterDQLink* l = TheScheduler.iAllThreads.iA.Next(); l && l != &TheScheduler.iAllThreads.iA; l = l->Next())
+		{
+		if (!l->IsObject()) continue;
+		NThreadBase* t = _LOFF(l, NThreadBase, iEnumerateLink);
+		if (t->iParent == &TG1 || t->iNewParent == &TG1)
+			DumpSched("  member", t);
+		}
+	}
+
 extern "C" void A64_ExceptionDispatch(SThreadExcStack* aF, TUint64 aKind)
 	{
 	if ((aKind & 3) == 1)
-		{ Irq(); return; }
+		{ Irq(aF); return; }
 	TUint32 ec = (TUint32)(aF->iEsr >> 26);
 	if ((aKind & 3) == 0 && ec == 0x3C && (aF->iEsr & 0xFFFF) == 0x1234)	// the boot self-test BRK
 		{ ++A64_BrkSeen; aF->iElr += 4; return; }
@@ -240,6 +323,19 @@ extern "C" void Hw_Init3()
 	{
 	TimerQReady = TRUE;
 	StartSystemTimer();
+#ifdef __SMP__
+	// SMP load balancing, as kernel/sinit.cpp does in the full kernel (nkernsa never started it): the rebalance
+	// DFC queue at KRebalancePriority 26, InitLB, then the periodic balance timer. Without it a running thread is
+	// never moved off a CPU -- ThreadGroupTest1's migrate case hung with the group pinned behind the Main thread.
+	TheScheduler.iRebalanceDfcQ = CreateDfcQ("Rebalance", 26, KCpuAffinityAny);
+	if (TheScheduler.iRebalanceDfcQ)
+		{
+		TheScheduler.InitLB();
+		TheScheduler.StartPeriodicBalancing();
+		}
+	else
+		KPrintf("*** no rebalance DFC queue: SMP load balancing off");
+#endif
 	// self-check: 20 ms of busy-wait must see ticks, or every NKern::Sleep() hangs (wrong timer PPI, GIC setup)
 	TUint32 t0 = TickCount;
 	TUint64 c0 = fast_counter(), wait = (TUint64)NKern::TimestampFrequency() / 50;
@@ -259,6 +355,7 @@ extern "C" {
 
 /* status bar bookkeeping: the last "Testing ..." / "Basic..." headline, and the TEST_RESULT failure lines */
 static TUint32 StatusLines, StatusFails;
+extern "C" TUint32 A64_StatusLines() { return StatusLines; }
 static char StatusTest[80] = "boot";
 static char StatusShown[96];				// what the bar shows: test name, plus the last failure site
 /* failure sites ("threadbasic.cpp:437") with counts, printed as a summary by __finish */

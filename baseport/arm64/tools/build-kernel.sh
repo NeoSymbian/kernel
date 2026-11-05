@@ -43,14 +43,18 @@ for spec in nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nke
 	f=${spec%%:*}; ek "$EKA/${spec##*:}/$f" "nk_${f%.cpp}"
 done
 for f in "$HERE"/a64smp/*.cpp; do b=$(basename "$f" .cpp); ek "$f" "be_$b"; done
-for f in init kprintf tlsf nkutils diag main testutils threadbasic fastsem fastmutex debug testipi testdfc fastbuf \
+# NKSA_MAIN=groups: our a64_main_groups.cpp replaces the suite's main.cpp (focused reproduction)
+MAIN=main; [ "${NKSA_MAIN:-}" = groups ] && MAIN=""
+for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fastmutex debug testipi testdfc fastbuf \
          benchmark rwspinlock tiedevents; do
 	# benchmark.cpp times empty functions through a pointer: GCC -O2 inlines them and deletes the timed loop,
 	# so Measure() never reaches its threshold (RVCT did not). Keep the calls real.
 	extra=""; [ $f = benchmark ] && extra="-fno-inline -fno-ipa-cp"
 	ek "$NKSA/$f.cpp" "sa_$f" "$extra"
 done
-ek "$HERE/nksa/a64_nksa.cpp" "a64_nksa"
+# -Dprivate=public: the stall dump reads scheduler internals (NThreadWaitState, SIterDQ) of the 2010 headers
+ek "$HERE/nksa/a64_nksa.cpp" "a64_nksa" "-Dprivate=public"
+[ "${NKSA_MAIN:-}" = groups ] && ek "$HERE/nksa/a64_main_groups.cpp" "sa_main_groups"
 [ $fail = 0 ] || exit 1
 
 $AS "$HERE/a64smp/a64_ctxsw.S" -o "$OUT/a64_ctxsw.o"

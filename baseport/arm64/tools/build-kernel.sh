@@ -56,13 +56,15 @@ for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fast
          benchmark rwspinlock tiedevents; do
 	# benchmark.cpp times empty functions through a pointer: GCC -O2 inlines them and deletes the timed loop,
 	# so Measure() never reaches its threshold (RVCT did not). Keep the calls real.
-	extra=""; [ $f = benchmark ] && extra="-fno-inline -fno-ipa-cp"
+	# -ftrivial-auto-var-init=zero (test files only): tiedevents.cpp leaves SNThreadGroupCreateInfo::iDestructionDfc
+	# uninitialised, so group destruction queued a garbage DFC and faulted (RVCT-era stacks evidently held 0 there)
+	extra="-ftrivial-auto-var-init=zero"; [ $f = benchmark ] && extra="$extra -fno-inline -fno-ipa-cp"
 	ek "$NKSA/$f.cpp" "sa_$f" "$extra"
 done
 # -Dprivate=public: the stall dump reads scheduler internals (NThreadWaitState, SIterDQ) of the 2010 headers
 ek "$HERE/nksa/a64_nksa.cpp" "a64_nksa" "-Dprivate=public"
 [ "${NKSA_MAIN:-}" = groups ] && ek "$HERE/nksa/a64_main_groups.cpp" "sa_main_groups"
-[ "${NKSA_MAIN:-}" = select ] && ek "$HERE/nksa/a64_main_select.cpp" "sa_main_select" "$SELDEFS"
+[ "${NKSA_MAIN:-}" = select ] && ek "$HERE/nksa/a64_main_select.cpp" "sa_main_select" "$SELDEFS -ftrivial-auto-var-init=zero"
 [ $fail = 0 ] || exit 1
 
 $AS "$HERE/a64smp/a64_ctxsw.S" -o "$OUT/a64_ctxsw.o"

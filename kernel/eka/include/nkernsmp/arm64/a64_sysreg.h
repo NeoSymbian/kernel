@@ -13,7 +13,9 @@
 /* DAIF.I (bit 7) and DAIF.F (bit 6): masking both is "all interrupts off" (the ARM port's CPSIDIF) */
 #define A64_DAIF_IF		0xC0
 static inline void A64_CLI()	{ __asm__ __volatile__("msr daifset, #3" ::: "memory"); }
-static inline void A64_STI()	{ __asm__ __volatile__("msr daifclr, #3" ::: "memory"); }
+/* the ISB makes an already-pending interrupt be taken at once, before the next instruction (PSTATE.{I,F} writes are
+ * otherwise only guaranteed to be seen at the next context synchronization event) */
+static inline void A64_STI()	{ __asm__ __volatile__("msr daifclr, #3\n\tisb" ::: "memory"); }
 /* wait for an interrupt with interrupts MASKED (a pending one still wakes the core), then take it: the AArch64
  * form of x86 "sti; hlt", race-free because WFI completes on a pending-but-masked interrupt */
 static inline void A64_IDLE()	{ __asm__ __volatile__("dsb sy\n\twfi\n\tmsr daifclr, #3" ::: "memory"); }

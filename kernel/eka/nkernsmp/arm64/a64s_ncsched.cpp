@@ -99,6 +99,12 @@ extern "C" void send_ipi(TUint32 aMpidr, TUint32 aVector)
 
 extern "C" void send_resched_ipi(TInt aCpu)
     {
+    /* A CPU that has just been given work is not idle, even before it leaves WFI: mark it now, or a CPU going idle
+     * meanwhile thinks it is the last one and runs the idle DFCs itself (nkernsa DoIdleDFCTest1 expects them on
+     * the CPU that really idles last; Kryo's WFI exit is slower than another core's path into NKern::Idle). The
+     * woken CPU clears its bit again if it goes back to idle; the sender is running, so AllCpusIdle /
+     * FirstBackFromIdle (which need no CPU running) are unaffected. */
+    __e32_atomic_ior_ord32(&TheScheduler.iCpusNotIdle, 1u << aCpu);
     send_ipi(TheSubSchedulers[aCpu].iSSX.iMpidr, RESCHED_IPI_VECTOR);
     }
 
@@ -124,9 +130,32 @@ extern "C" void send_resched_ipi_and_wait(TInt aCpu)
     __sync_synchronize();
     }
 
+/* A self-IPI must act as if taken at once: TDfc::RawAdd relies on it to run an IDFC right away (nkernsa
+ * IDFCTest1 checks !Queued() straight after RawAdd, and straight after re-enabling interrupts). A GICv3 SGI to
+ * oneself goes round the redistributor and arrives some cycles later, so wait (bounded) until it has been taken
+ * (interrupts on) or is pending at this CPU interface (interrupts off: A64_STI's ISB then takes it immediately). */
+static void wait_self_sgi(TUint32 aVector, TUint32 aIrqCount0)
+    {
+    TSubScheduler& ss = SubScheduler();
+    TBool masked = (A64_SYSREG_READ(daif) & A64_DAIF_IF) != 0;
+    for (TInt n = 0; n < 100000; ++n)
+        {
+        if (masked)
+            {
+            if ((A64_SYSREG_READ(S3_0_C12_C12_2) & 0xFFFFFF) == aVector)	/* ICC_HPPIR1_EL1: highest pending */
+                return;
+            }
+        else if (ss.iSSX.iIrqCount != aIrqCount0)
+            return;
+        A64_PAUSE();
+        }
+    }
+
 extern "C" void send_self_resched_ipi()
     {
+    TUint32 c0 = SubScheduler().iSSX.iIrqCount;
     send_ipi(A64_Mpidr(), RESCHED_IPI_VECTOR);
+    wait_self_sgi(RESCHED_IPI_VECTOR, c0);
     }
 
 /* Deliver an arbitrary vector to THIS cpu via the APIC self-IPI shorthand (reliable,

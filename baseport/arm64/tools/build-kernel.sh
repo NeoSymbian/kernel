@@ -59,7 +59,28 @@ for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fast
 	# -ftrivial-auto-var-init=zero (test files only): tiedevents.cpp leaves SNThreadGroupCreateInfo::iDestructionDfc
 	# uninitialised, so group destruction queued a garbage DFC and faulted (RVCT-era stacks evidently held 0 there)
 	extra="-ftrivial-auto-var-init=zero"; [ $f = benchmark ] && extra="$extra -fno-inline -fno-ipa-cp"
-	ek "$NKSA/$f.cpp" "sa_$f" "$extra"
+	src="$NKSA/$f.cpp"
+	# Two statistical checks were tuned on ~400 MHz ARM11 boards; on the phone, compile a copy scaled for 2 GHz cores
+	# (QEMU's emulated cores are slow enough for the originals):
+	# - tiedevents: an untied reader must overlap the 10 ms timer, but 100 passes over 2048 flags take ~0.2 ms per
+	#   CPU ("Flag wasn't set, test broken?") -> 50x the passes.
+	# - fastmutex DoRWTest: a cross-CPU suspend must catch the writer inside an unprotected 256-word block >= 10% of
+	#   the time, but the block takes less than the ~1 us suspend IPI latency (F5 ~ 0 right after LeaveCS) -> 16x.
+	#   Each read is a full cross-CPU suspend/kill/migrate round trip, so 78 cases x 100000 reads took hours: 10000
+	#   reads keep both pass rules (0 bad reads protected, >= 10% unprotected) at a tenth of the time.
+	pat=""
+	if [ "$BOARD" = bonito ] || [ -n "${NKSA_SCALE:-}" ]; then	# NKSA_SCALE=1: the same on QEMU
+		case $f in
+		tiedevents) pat='s/^const TInt LoopCount = 100;$/const TInt LoopCount = 5000;	\/\/ a64 port: scaled for 2 GHz cores/' ;;
+		fastmutex)  pat='s/^	TUint32 bufwords = 256;$/	TUint32 bufwords = 4096;	\/\/ a64 port: scaled for 2 GHz cores/;s/^const TInt KReadCount = 100000;$/const TInt KReadCount = 10000;	\/\/ a64 port: reads/' ;;
+		esac
+	fi
+	if [ -n "$pat" ]; then
+		sed "$pat" "$src" > "$OUT/$f.cpp"
+		[ $(grep -c 'a64 port: ' "$OUT/$f.cpp") -eq $(echo "$pat" | grep -o 'a64 port: ' | wc -l) ] || { echo "FAIL $f scaling patch did not apply"; fail=1; }
+		src="$OUT/$f.cpp"
+	fi
+	ek "$src" "sa_$f" "$extra"
 done
 # -Dprivate=public: the stall dump reads scheduler internals (NThreadWaitState, SIterDQ) of the 2010 headers
 ek "$HERE/nksa/a64_nksa.cpp" "a64_nksa" "-Dprivate=public"

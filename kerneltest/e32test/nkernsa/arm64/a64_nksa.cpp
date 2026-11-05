@@ -70,7 +70,7 @@ extern "C" TInt A64_TimesliceRemaining()
 static volatile TUint32 TickCount;		// CPU 0 ticks, for the boot-time tick self-check
 
 /* stall detector: each CPU records its tick count and where its tick interrupted it; if the tests print
- * nothing for 15 s, CPU 0 dumps every CPU (the phone hung in ThreadGroupTest1's migrate loop) */
+ * nothing for 60 s (suspend/kill/migrate cases run ~30 s silently), CPU 0 dumps every CPU (the phone hung in ThreadGroupTest1's migrate loop) */
 static volatile TUint32 CpuTicks[KMaxCpus];
 static volatile TUint64 CpuLastElr[KMaxCpus];
 static volatile TUint32 StallLinesSeen, StallQuietTicks, StallDumped;
@@ -91,7 +91,7 @@ static void SystemTick(TSubScheduler& aSS)
 		{
 		TUint32 lines = A64_StatusLines();
 		if (lines != StallLinesSeen) { StallLinesSeen = lines; StallQuietTicks = 0; StallDumped = 0; }	// re-arm on progress
-		else if (++StallQuietTicks == 15000 && StallDumped < 3) { ++StallDumped; DumpCpus(); StallQuietTicks = 0; }
+		else if (++StallQuietTicks == 60000 && StallDumped < 3) { ++StallDumped; DumpCpus(); StallQuietTicks = 0; }
 		}
 	if (aSS.iCpuNum == 0)
 		++TickCount;
@@ -194,7 +194,7 @@ static void DumpSched(const char* aWhat, NSchedulable* aS)
 
 static void DumpCpus()
 	{
-	A64_DebugPuts("\n*** STALL: no test output for 15 s. Per CPU: ticks elr thread klock resched irqnest\n");
+	A64_DebugPuts("\n*** STALL: no test output for 60 s. Per CPU: ticks elr thread klock resched irqnest\n");
 	for (TInt i = 0; i < TheScheduler.iNumCpus && i < KMaxCpus; ++i)
 		{
 		TSubScheduler& s = TheSubSchedulers[i];
@@ -373,9 +373,10 @@ extern "C" TUint32 A64_StatusLines() { return StatusLines; }
 static char StatusTest[80] = "boot";
 static char StatusShown[96];				// what the bar shows: test name, plus the last failure site
 /* failure sites ("threadbasic.cpp:437") with counts, printed as a summary by __finish */
-struct SFailSite { char iWhere[40]; TUint32 iCount; char iTest[48]; char iMsg[32]; char iCase[48]; };
+struct SFailSite { char iWhere[40]; TUint32 iCount; char iTest[48]; char iMsg[64]; char iCase[48]; };
 static char LastLine[64];		// the TEST_RESULT message line printed just before "Line N File ..."
-static char LastCase[48];		// the last "TT2: ..." case header (the timing tests)
+static char LastCase[48];		// the last case header: "TT2: ...", "TiedEventTest ...", DoRWTest's "Type ..."
+static char LastDetail[64];		// DoRWTest's "F0 n F1 n ... F6 n" counts, shown instead of its bare "FAILED"
 
 static void CopyLine(char* aDst, TInt aMax, const char* s, TInt l)	// without the "c:NKTEST: " prefix
 	{
@@ -417,7 +418,8 @@ static void NoteFailure(const char* s, TInt l)	// s = "c:Line <n> File <path>/<n
 		FailSites[i].iWhere[k] = 0;
 		for (k = 0; StatusTest[k] && k < 47; ++k) FailSites[i].iTest[k] = StatusTest[k];
 		FailSites[i].iTest[k] = 0;
-		for (k = 0; LastLine[k] && k < 31; ++k) FailSites[i].iMsg[k] = LastLine[k];
+		const char* msg = LastDetail[0] ? LastDetail : LastLine;
+		for (k = 0; msg[k] && k < 63; ++k) FailSites[i].iMsg[k] = msg[k];
 		FailSites[i].iMsg[k] = 0;
 		for (k = 0; LastCase[k] && k < 47; ++k) FailSites[i].iCase[k] = LastCase[k];
 		FailSites[i].iCase[k] = 0;
@@ -426,15 +428,20 @@ static void NoteFailure(const char* s, TInt l)	// s = "c:Line <n> File <path>/<n
 	if (i < FailSiteCount)
 		{
 		++FailSites[i].iCount;
-		// pin: "<count>x <file:line> <message> | <case or test>"
+		// two pin rows per site: "<count>x <file:line> | <case or test>", then "   <message or counts>"
 		char pin[96]; TInt n = 0;
 		TUint32 v = FailSites[i].iCount; char d[12]; TInt j = 0;
 		do { d[j++] = (char)('0' + v % 10); v /= 10; } while (v);
 		while (j) pin[n++] = d[--j];
-		const char* parts[] = { "x ", FailSites[i].iWhere, " ", FailSites[i].iMsg, " | ", FailSites[i].iCase[0] ? FailSites[i].iCase : FailSites[i].iTest };
-		for (TInt p = 0; p < 6; ++p) for (const char* c = parts[p]; *c && n < 95; ++c) pin[n++] = *c;
+		const char* parts[] = { "x ", FailSites[i].iWhere, " | ", FailSites[i].iCase[0] ? FailSites[i].iCase : FailSites[i].iTest };
+		for (TInt p = 0; p < 4; ++p) for (const char* c = parts[p]; *c && n < 95; ++c) pin[n++] = *c;
 		pin[n] = 0;
-		A64_ConsolePin(i, pin);
+		A64_ConsolePin(2 * i, pin);
+		n = 0;
+		for (const char* c = "   "; *c; ++c) pin[n++] = *c;
+		for (const char* c = FailSites[i].iMsg; *c && n < 95; ++c) pin[n++] = *c;
+		pin[n] = 0;
+		A64_ConsolePin(2 * i + 1, pin);
 		}
 	// bar: "<test>  last fail <where>"
 	TInt n = 0;
@@ -478,8 +485,19 @@ void DebugPrint(const char* s, int l)
 		for (TInt j = 0; t[j]; ++j) StatusTest[k++] = t[j];
 		StatusTest[k] = 0;
 		}
-	else if (Contains(s, l, "TT2:") || Contains(s, l, "TiedEventTest"))
+	else if (Contains(s, l, "TT2:") || Contains(s, l, "TiedEventTest") || (Contains(s, l, "Type ") && Contains(s, l, "ISEQ")))
+		{
 		CopyLine(LastCase, sizeof(LastCase), s, l);
+		LastDetail[0] = 0;
+		}
+	else if (Contains(s, l, "F0 ") && Contains(s, l, " F6 "))
+		{
+		CopyLine(LastDetail, sizeof(LastDetail), s, l);
+		TInt w = 0;									// collapse the %6d padding so all seven counts fit one row
+		for (TInt r = 0; LastDetail[r]; ++r)
+			if (LastDetail[r] != ' ' || (w && LastDetail[w - 1] != ' ')) LastDetail[w++] = LastDetail[r];
+		LastDetail[w] = 0;
+		}
 	else if (Contains(s, l, "Testing") || Contains(s, l, "Tests Completed") || Contains(s, l, "Kill") || Contains(s, l, "Thread on CPU"))
 		{
 		const char* t = s; TInt n = l;
@@ -488,6 +506,7 @@ void DebugPrint(const char* s, int l)
 		TInt k = 0;
 		while (k < n && k < (TInt)sizeof(StatusTest) - 1 && t[k] && t[k] != '\r' && t[k] != '\n') { StatusTest[k] = t[k]; ++k; }
 		StatusTest[k] = 0;
+		LastCase[0] = 0; LastDetail[0] = 0;					// a new test: the last case header belongs to the previous one
 		}
 	if (!(Contains(s, l, "Line ") && Contains(s, l, " File ")))
 		CopyLine(LastLine, sizeof(LastLine), s, l);

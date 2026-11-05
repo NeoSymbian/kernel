@@ -490,10 +490,15 @@ void nfcfspin(TUint32 aTicks)
 
 void CheckPoint()						{ KPrintf("CPSR=%08x", __cpsr()); }
 
-/* timeslice ticks = generic-timer counts (the fast counter is the same counter) */
+/* timeslice ticks = generic-timer counts (the fast counter is the same counter). Use the frequency the tests
+ * calibrated (init_fast_counter: fcf = counts in NKern::Sleep(1000)) once it exists, so a slice of N us and the
+ * test's own __microseconds_to_*_fast_counter(N) agree to the count. Sleep guarantees AT LEAST N ticks, so fcf
+ * reads ~0.05-0.1% above CNTFRQ; with the nominal CNTFRQ every slice expired a few counts before the test's
+ * expected point (phone: TT2 pointE 449/437 and pointB 448, the only failures left). */
 TInt __microseconds_to_timeslice_ticks(TInt us)
 	{
-	return (TInt)(((TUint64)(TUint32)us * NKern::TimestampFrequency() + 500000) / 1000000);
+	TUint64 f = fcf ? fcf : NKern::TimestampFrequency();
+	return (TInt)(((TUint64)(TUint32)us * f + 500000) / 1000000);
 	}
 TInt __fast_counter_to_timeslice_ticks(TUint64 aFCdelta)	{ return (TInt)aFCdelta; }
 

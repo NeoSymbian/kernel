@@ -260,6 +260,50 @@ extern "C" {
 /* status bar bookkeeping: the last "Testing ..." / "Basic..." headline, and the TEST_RESULT failure lines */
 static TUint32 StatusLines, StatusFails;
 static char StatusTest[80] = "boot";
+static char StatusShown[96];				// what the bar shows: test name, plus the last failure site
+/* failure sites ("threadbasic.cpp:437") with counts, printed as a summary by __finish */
+struct SFailSite { char iWhere[40]; TUint32 iCount; char iTest[48]; };
+static SFailSite FailSites[24];
+static TInt FailSiteCount;
+
+static void NoteFailure(const char* s, TInt l)	// s = "c:Line <n> File <path>/<name>"
+	{
+	char where[40]; TInt w = 0;
+	const char* name = s; const char* line = 0;
+	for (TInt i = 0; i < l && s[i]; ++i)
+		{
+		if (s[i] == '/') name = s + i + 1;
+		if (!line && i + 5 <= l && s[i]=='L' && s[i+1]=='i' && s[i+2]=='n' && s[i+3]=='e' && s[i+4]==' ') line = s + i + 5;
+		}
+	for (const char* p = name; *p && *p != '\r' && *p != '\n' && w < 30; ++p) where[w++] = *p;
+	where[w++] = ':';
+	for (const char* p = line; p && *p >= '0' && *p <= '9' && w < 39; ++p) where[w++] = *p;
+	where[w] = 0;
+	TInt i;
+	for (i = 0; i < FailSiteCount; ++i)
+		{
+		TInt k = 0;
+		while (where[k] && where[k] == FailSites[i].iWhere[k]) ++k;
+		if (!where[k] && !FailSites[i].iWhere[k]) break;
+		}
+	if (i == FailSiteCount && FailSiteCount < (TInt)(sizeof(FailSites)/sizeof(FailSites[0])))
+		{
+		TInt k;
+		for (k = 0; where[k]; ++k) FailSites[i].iWhere[k] = where[k];
+		FailSites[i].iWhere[k] = 0;
+		for (k = 0; StatusTest[k] && k < 47; ++k) FailSites[i].iTest[k] = StatusTest[k];
+		FailSites[i].iTest[k] = 0;
+		++FailSiteCount;
+		}
+	if (i < FailSiteCount) ++FailSites[i].iCount;
+	// bar: "<test>  last fail <where>"
+	TInt n = 0;
+	for (const char* p = StatusTest; *p && n < 50; ++p) StatusShown[n++] = *p;
+	const char* t = "  last fail ";
+	for (const char* p = t; *p; ++p) StatusShown[n++] = *p;
+	for (const char* p = where; *p && n < 95; ++p) StatusShown[n++] = *p;
+	StatusShown[n] = 0;
+	}
 
 static TBool Contains(const char* s, TInt l, const char* w)
 	{
@@ -278,7 +322,10 @@ void DebugPrint(const char* s, int l)
 	++StatusLines;
 	static TUint32 pipeRounds;
 	if (Contains(s, l, "Line ") && Contains(s, l, " File "))
+		{
 		++StatusFails;
+		NoteFailure(s, l);
+		}
 	else if (Contains(s, l, "waits out of"))		// fastbuf.cpp: 0x01000000 writes / 131072 per round = 128 rounds
 		{
 		const char* h = "wait-free pipe, round ";
@@ -303,7 +350,7 @@ void DebugPrint(const char* s, int l)
 	while (l-- > 0 && *s) A64_DebugPutc(*s++);
 	A64_DebugPutc('\n');
 	TUint32 freq = NKern::TimestampFrequency();
-	A64_ConsoleStatus(StatusTest, StatusLines, StatusFails, freq ? (TUint32)(NKern::Timestamp() / freq) : 0);
+	A64_ConsoleStatus(StatusFails ? StatusShown : StatusTest, StatusLines, StatusFails, freq ? (TUint32)(NKern::Timestamp() / freq) : 0);
 	NKern::RestoreInterrupts(irq);
 	}
 
@@ -319,7 +366,17 @@ TUint32 norm_fast_counter();		// below, after nfcfs
 
 void __finish()
 	{
-	A64_DebugPuts("EKA2/arm64: nkernsa finished\n");
+	A64_DebugPuts("EKA2/arm64: nkernsa finished, failures: ");
+	A64_DebugHex(StatusFails);
+	A64_DebugPuts("\n");
+	for (TInt i = 0; i < FailSiteCount; ++i)		// one line per failure site: count, where, during which test
+		{
+		A64_DebugPuts("  "); A64_DebugHex(FailSites[i].iCount);
+		A64_DebugPuts(" x "); A64_DebugPuts(FailSites[i].iWhere);
+		A64_DebugPuts("  ("); A64_DebugPuts(FailSites[i].iTest); A64_DebugPuts(")\n");
+		}
+	// give a human time to read the summary on a phone before it powers off
+	for (TUint64 c0 = fast_counter(), w = (TUint64)NKern::TimestampFrequency() * 120; fast_counter() - c0 < w; ) {}
 	Psci(0x84000008, 0, 0, 0);		// PSCI SYSTEM_OFF (QEMU exits; the Pixel powers off)
 	for (;;) { A64_CLI(); __asm__ __volatile__("wfi"); }
 	}

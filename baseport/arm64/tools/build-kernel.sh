@@ -45,7 +45,7 @@ for spec in nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nke
 	# group that was already ready to the TAIL of the joining thread's priority (ChangePriority), behind its equal-
 	# priority peers, so the running thread lost its place and the next reschedule switched it out even while it held
 	# a fast mutex (fastmutex.cpp DoRWTest 0x138/0x438, F2 != 0). The group takes the joiner's place at the head.
-	if [ $f = nkern.cpp ]; then
+	if [ $f = nkern.cpp ] && [ -z "${NO_JOINGROUP_FIX:-}" ]; then	# NO_JOINGROUP_FIX=1: the 2010 original, to compare
 		sed -e 's/^			else if (pC->iPriority > aGroup->iPriority)$/			else if (pC->iPriority >= aGroup->iPriority)	\/\/ a64 port fix: JoinGroup keeps the head/' \
 		    -e 's/^				ss.SSChgEntryP(aGroup, pC->iPriority);$/				{ ss.SSRemoveEntry(aGroup); aGroup->iPriority = pC->iPriority; ss.SSAddEntryHead(aGroup); }	\/\/ a64 port fix: group first/' \
 		    "$src" > "$OUT/nkern.cpp"

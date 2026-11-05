@@ -103,6 +103,15 @@ void Main(TAny*)
 #ifdef SEL_SKMGRP
 	TestSkmGroup();
 #endif
+#ifdef SEL_SKMIS
+	// skmis: the interlocked-suspend mutex-holder-group cases, repeated (QEMU saw F2 = 2 once in 438/834)
+	TEST_PRINT("Testing interlocked suspend, mutex-holder group, x4...");
+	for (TInt i = 0; i < 4; ++i)
+		{
+		DoRWTest(4, 10000, 0x438, 0x834, 0, 1);		// 4 = SReaderInfo::EInterlockedSuspend
+		DoRWTest(4, 10000, 0x138, 0x831, 0, 1);
+		}
+#endif
 	TEST_PRINT("Tests Completed");
 	__finish();
 	}

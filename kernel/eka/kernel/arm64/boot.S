@@ -40,6 +40,10 @@ entry:
 at_el1:
 	msr	daifset, #0xf
 	msr	tpidr_el1, xzr			// no TSubScheduler yet (UNKNOWN at reset on real CPUs)
+	adr	x1, _start			// running where we were linked? (no relocation: absolute addresses in C++)
+	ldr	w2, =_start
+	cmp	x1, x2
+	b.ne	load_mismatch
 	adrp	x1, __boot_stack_top
 	add	x1, x1, :lo12:__boot_stack_top
 	mov	sp, x1
@@ -59,6 +63,23 @@ at_el1:
 	bl	A64_BootMain			// never returns
 3:	wfe
 	b	3b
+
+load_mismatch:
+#ifdef BOARD_BONITO
+	/* no console yet: paint the boot framebuffer magenta so a wrong load address is visible on the phone */
+	movz	x1, #0x9c00, lsl #16
+	movz	w2, #0xff00
+	movk	w2, #0xffff, lsl #16		// 0xffff00ff = magenta (a8r8g8b8)
+	movz	x3, #0x6200
+	movk	x3, #0x8e, lsl #16		// 4320 * 2160 bytes
+4:	str	w2, [x1], #4
+	subs	x3, x3, #4
+	b.ne	4b
+	dsb	sy
+#endif
+5:	wfe
+	b	5b
+	.ltorg
 
 /* Secondary CPU entry (PSCI CPU_ON target). In: x0 = context = SAPBootInfo* (identity-mapped), MMU off, EL1.
  * Stack = iInitStackBase + iInitStackSize; same vectors and MMU map as the boot CPU; then A64_ApMain(info). */

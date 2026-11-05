@@ -1,9 +1,11 @@
-/* SPDX-License-Identifier: Apache-2.0 -- step 1: runs at its load address on QEMU virt (RAM 0x40000000 + 0x80000) */
+/* SPDX-License-Identifier: Apache-2.0
+ * Runs at its load address (MMU off, then an identity map): KERNEL_BASE = RAM base + text_offset 0x80000,
+ * given by build-kernel.sh (QEMU virt 0x40080000, Pixel ABL 0x80080000). */
 OUTPUT_ARCH(aarch64:ilp32)
 ENTRY(_start)
 SECTIONS
 {
-	. = 0x40080000;
+	. = KERNEL_BASE;
 	.text : { KEEP(*(.text.head)) *(.text .text.*) }
 	.rodata : { *(.rodata .rodata.*) }
 	.init_array : { __init_array_start = .; KEEP(*(SORT(.init_array.*) .init_array)) __init_array_end = .; }

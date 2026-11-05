@@ -3,11 +3,18 @@
 # build-kernel.sh -- build the AArch64 EKA2 nanokernel test image (arm64 "Image") for QEMU virt:
 #   the arch-neutral 2010 nkernsmp core + the standalone nanokernel tests (kerneltest/e32test/nkernsa), both
 #   UNMODIFIED, + our arm64 backend, boot code, GICv3 driver and board glue. Runs in the symbian-a64dev image.
-# Env: KHS = kernelhwsrv checkout, OUT = output dir.
+# Env: BOARD = qemu (default) | bonito, KHS = kernelhwsrv checkout, OUT = output dir,
+#      BONITO_DTB = the Pixel's DTB (bonito: the boot.img needs it appended; ABL rejects an image without one).
 set -eu
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 KHS=${KHS:-/DATA/AppData/symbian-build/src/core/symbian/kernelhwsrv}
-OUT=${OUT:-$HERE/../../out/kernel}
+BOARD=${BOARD:-qemu}
+OUT=${OUT:-$HERE/../../out/kernel-$BOARD}
+case $BOARD in
+	qemu)   BASE=0x40080000; BOARD_SRC=qemu_virt.cpp ;;
+	bonito) BASE=0x80080000; BOARD_SRC=pixel_bonito.cpp ;;
+	*) echo "unknown BOARD=$BOARD" >&2; exit 2 ;;
+esac
 EKA=$KHS/kernel/eka
 NKSA=$KHS/kerneltest/e32test/nkernsa
 X=${CROSS:-aarch64-linux-gnu-}
@@ -47,16 +54,22 @@ ek "$HERE/nksa/a64_nksa.cpp" "a64_nksa"
 [ $fail = 0 ] || exit 1
 
 $AS "$HERE/a64smp/a64_ctxsw.S" -o "$OUT/a64_ctxsw.o"
-$AS "$HERE/boot/boot.S" -o "$OUT/boot.o"
+$AS -DBOARD_$(echo "$BOARD" | tr a-z A-Z) "$HERE/boot/boot.S" -o "$OUT/boot.o"
 $AS "$HERE/boot/vectors.S" -o "$OUT/vectors.o"
-$PLAIN -c "$HERE/board/qemu_virt.cpp" -o "$OUT/qemu_virt.o"
+[ "$BOARD" = bonito ] && python3 "$HERE/tools/mkfont.py" "$OUT/inc/font.h" >/dev/null
+$PLAIN -I "$OUT/inc" -c "$HERE/board/$BOARD_SRC" -o "$OUT/board.o"
+$PLAIN -c "$HERE/board/boot_common.cpp" -o "$OUT/boot_common.o"
 $PLAIN -c "$HERE/board/gicv3.cpp" -o "$OUT/gicv3.o"
 
-if ! ${X}ld -m aarch64linux32 -nostdlib --no-warn-rwx-segments -T "$HERE/boot/kernel.ld" -o "$OUT/kernel.elf" \
+if ! ${X}ld -m aarch64linux32 -nostdlib --no-warn-rwx-segments --defsym=KERNEL_BASE=$BASE -T "$HERE/boot/kernel.ld" -o "$OUT/kernel.elf" \
 		"$OUT"/*.o 2>"$OUT/link.log"; then
 	echo "LINK FAILED -- undefined:"; grep -o "undefined reference to .*" "$OUT/link.log" | sort -u | ${X}c++filt | head -40
 	grep -v "undefined reference" "$OUT/link.log" | head -5
 	exit 1
 fi
 ${X}objcopy -O binary "$OUT/kernel.elf" "$OUT/Image"
-echo "built $OUT/Image ($(wc -c < "$OUT/Image") bytes)"
+echo "built $OUT/Image ($(wc -c < "$OUT/Image") bytes, $BOARD at $BASE)"
+if [ "$BOARD" = bonito ]; then	# fastboot boot image: gzip(Image) + DTB, as the ztOS/Linux boot.img ABL accepts
+	gzip -9nc "$OUT/Image" > "$OUT/Image.gz"
+	python3 -I "$HERE/../../probes/mkboot.py" "$OUT/Image.gz" "${BONITO_DTB:?set BONITO_DTB to the Pixel DTB}" "$OUT/boot.img"
+fi

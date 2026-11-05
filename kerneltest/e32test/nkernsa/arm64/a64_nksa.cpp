@@ -11,19 +11,14 @@
 #include <kernboot.h>
 #include "../a64smp/a64_sysreg.h"
 #include "../board/gicv3.h"
+#include "../board/board.h"
 
-extern "C" void A64_DebugPutc(char c);
-extern "C" void A64_DebugPuts(const char* s);
-extern "C" void A64_DebugHex(TUint64 v);
 extern "C" void KernelMain();
 extern "C" void generic_ipi_isr(TSubScheduler* aS);		// nkernsmp/nkern.cpp
 extern "C" void run_event_handlers(TSubScheduler* aS);	// nkernsmp/nk_irq.cpp
 extern "C" void send_resched_ipis(TUint32 aMask);
 TSubScheduler& SubScheduler();
 
-// QEMU virt (-m 512: RAM 0x40000000-0x5FFFFFFF; QEMU puts the DTB at 0x48000000)
-static const TLinAddr KGicd = 0x08000000, KGicr = 0x080A0000;
-static const TLinAddr KHeapBase = 0x41000000, KHeapSize = 0x06000000;	// shortcut: fixed heap below the DTB; from the DTB /memory later
 static const TUint32 KTimerPpi = TIMESLICE_VECTOR;		// 27: CNTV, the per-CPU tick
 static const TInt KTickUs = 1000;						// 1 ms nanokernel tick
 
@@ -109,7 +104,7 @@ extern "C" TInt __timer_period()		{ return KTickUs; }
 
 static void InitThisCpuGic()		// this CPU's redistributor: IPIs (SGI 0-7) and the tick (PPI 27)
 	{
-	TLinAddr sgi = Gicv3_InitCpu(KGicr, A64_Mpidr());
+	TLinAddr sgi = Gicv3_InitCpu(A64_GicrBase, A64_Mpidr());
 	if (!sgi)
 		{ A64_DebugPuts("*** GICv3: no redistributor for this CPU\n"); return; }
 	for (TUint32 i = 0; i < 8; ++i)
@@ -119,7 +114,7 @@ static void InitThisCpuGic()		// this CPU's redistributor: IPIs (SGI 0-7) and th
 
 extern "C" void Hw_Init1()
 	{
-	Gicv3_InitDist(KGicd);
+	Gicv3_InitDist(A64_GicdBase);
 	InitThisCpuGic();
 	TimerReload = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
 	}
@@ -132,17 +127,20 @@ extern "C" void StartSystemTimer()
 extern "C" void ApMainGeneric(volatile SAPBootInfo* aInfo);	// nkernsa init.cpp
 extern "C" void A64_ApEntry();									// boot.S
 
-/* PSCI 0.2+ CPU_ON (SMC64 function id) through the QEMU virt conduit, HVC.
- * shortcut: conduit fixed to HVC; read /psci "method" from the DTB for the Pixel (SMC) */
-static TInt PsciCpuOn(TUint64 aMpidr, TUint64 aEntry, TUint64 aContext)
+/* PSCI 0.2+ call through the board's conduit (QEMU virt: HVC, Pixel/TrustZone: SMC) */
+static TInt Psci(TUint64 aFn, TUint64 aA1, TUint64 aA2, TUint64 aA3)
 	{
-	register TUint64 x0 __asm__("x0") = 0xC4000003;
-	register TUint64 x1 __asm__("x1") = aMpidr;
-	register TUint64 x2 __asm__("x2") = aEntry;
-	register TUint64 x3 __asm__("x3") = aContext;
-	__asm__ __volatile__("hvc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+	register TUint64 x0 __asm__("x0") = aFn;
+	register TUint64 x1 __asm__("x1") = aA1;
+	register TUint64 x2 __asm__("x2") = aA2;
+	register TUint64 x3 __asm__("x3") = aA3;
+	if (A64_PsciSmc)
+		__asm__ __volatile__("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) :: "memory");
+	else
+		__asm__ __volatile__("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) :: "memory");
 	return (TInt)x0;
 	}
+static TInt PsciCpuOn(TUint64 aMpidr, TUint64 aEntry, TUint64 aContext)	{ return Psci(0xC4000003, aMpidr, aEntry, aContext); }
 
 /* a secondary CPU, on its own stack with the MMU on: its GIC, its tick, then join the nanokernel */
 extern "C" void A64_ApMain(volatile SAPBootInfo* aInfo)
@@ -168,7 +166,7 @@ extern "C" void Hw_InitAPs()
 		info->iInitStackSize = KApStack;
 		info->iArgs[0] = t;
 		__e32_memory_barrier();
-		TInt r = PsciCpuOn(cpu, (TLinAddr)&A64_ApEntry, (TLinAddr)info);	// QEMU virt: MPIDR Aff0 = cpu
+		TInt r = PsciCpuOn(A64_CpuMpidr(cpu), (TLinAddr)&A64_ApEntry, (TLinAddr)info);
 		if (r != 0)
 			{
 			KPrintf("PSCI CPU_ON(%d) = %d: %d CPU(s)", cpu, r, cpu);		// -2 INVALID_PARAMETERS: no such CPU
@@ -215,8 +213,7 @@ TUint32 norm_fast_counter();		// below, after nfcfs
 void __finish()
 	{
 	A64_DebugPuts("EKA2/arm64: nkernsa finished\n");
-	register TUint64 x0 __asm__("x0") = 0x84000008;	// PSCI SYSTEM_OFF (QEMU virt conduit: HVC)
-	__asm__ __volatile__("hvc #0" : "+r"(x0) :: "memory");
+	Psci(0x84000008, 0, 0, 0);		// PSCI SYSTEM_OFF (QEMU exits; the Pixel powers off)
 	for (;;) { A64_CLI(); __asm__ __volatile__("wfi"); }
 	}
 
@@ -359,12 +356,12 @@ static TRomImageHeader ThePrimaryImage;
 
 extern "C" void A64_NkSaStart()
 	{
-	TheRomHeader.iKernDataAddress = KHeapBase;	// heap = iKernDataAddress + svdata(0) + primary stack(0)
+	TheRomHeader.iKernDataAddress = A64_HeapBase;	// heap = iKernDataAddress + svdata(0) + primary stack(0)
 	TheRomHeader.iTotalSvDataSize = 0;
 	ThePrimaryImage.iStackSize = 0;
 	ThePrimaryEntry.iAddressLin = (TLinAddr)&ThePrimaryImage;
 	TheSuperPage.iPrimaryEntry = (TLinAddr)&ThePrimaryEntry;
-	TheSuperPage.iInitialHeapSize = KHeapSize;
+	TheSuperPage.iInitialHeapSize = A64_HeapSize;
 	RomHeaderAddress = (TLinAddr)&TheRomHeader;
 	SuperPageAddress = (TLinAddr)&TheSuperPage;
 	A64_DebugPuts("EKA2/arm64: -> KernelMain()\n");

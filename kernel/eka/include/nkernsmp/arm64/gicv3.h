@@ -6,8 +6,8 @@
 typedef unsigned int TGicU32;
 
 void Gicv3_InitDist(unsigned long aGicd);
-int  Gicv3_InitCpu(unsigned long aGicrBase, unsigned int aMpidrPacked);	// 0 ok, -1 no redistributor matched
-void Gicv3_EnablePpiSgi(unsigned int aIntId, unsigned char aPriority);	// INTID 0-31 on this CPU
+unsigned long Gicv3_InitCpu(unsigned long aGicrBase, unsigned int aMpidrPacked);	// this CPU's SGI_base, 0 if no match
+void Gicv3_EnablePpiSgi(unsigned long aRdSgi, unsigned int aIntId, unsigned char aPriority);	// INTID 0-31
 TGicU32 Gicv3_Ack();												// ICC_IAR1_EL1 (1023 = spurious)
 void Gicv3_Eoi(TGicU32 aIntId);
 #endif

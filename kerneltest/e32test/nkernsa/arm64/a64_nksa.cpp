@@ -107,14 +107,20 @@ extern "C" void A64_ExceptionDispatch(SThreadExcStack* aF, TUint64 aKind)
  * ====================================================================================================== */
 extern "C" TInt __timer_period()		{ return KTickUs; }
 
+static void InitThisCpuGic()		// this CPU's redistributor: IPIs (SGI 0-7) and the tick (PPI 27)
+	{
+	TLinAddr sgi = Gicv3_InitCpu(KGicr, A64_Mpidr());
+	if (!sgi)
+		{ A64_DebugPuts("*** GICv3: no redistributor for this CPU\n"); return; }
+	for (TUint32 i = 0; i < 8; ++i)
+		Gicv3_EnablePpiSgi(sgi, i, 0x80);
+	Gicv3_EnablePpiSgi(sgi, KTimerPpi, 0xA0);
+	}
+
 extern "C" void Hw_Init1()
 	{
 	Gicv3_InitDist(KGicd);
-	if (Gicv3_InitCpu(KGicr, A64_Mpidr()) != 0)
-		A64_DebugPuts("*** GICv3: no redistributor for this CPU\n");
-	for (TUint32 sgi = 0; sgi < 8; ++sgi)
-		Gicv3_EnablePpiSgi(sgi, 0x80);
-	Gicv3_EnablePpiSgi(KTimerPpi, 0xA0);
+	InitThisCpuGic();
 	TimerReload = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
 	}
 
@@ -123,9 +129,58 @@ extern "C" void StartSystemTimer()
 	TimerArm();
 	}
 
+extern "C" void ApMainGeneric(volatile SAPBootInfo* aInfo);	// nkernsa init.cpp
+extern "C" void A64_ApEntry();									// boot.S
+
+/* PSCI 0.2+ CPU_ON (SMC64 function id) through the QEMU virt conduit, HVC.
+ * shortcut: conduit fixed to HVC; read /psci "method" from the DTB for the Pixel (SMC) */
+static TInt PsciCpuOn(TUint64 aMpidr, TUint64 aEntry, TUint64 aContext)
+	{
+	register TUint64 x0 __asm__("x0") = 0xC4000003;
+	register TUint64 x1 __asm__("x1") = aMpidr;
+	register TUint64 x2 __asm__("x2") = aEntry;
+	register TUint64 x3 __asm__("x3") = aContext;
+	__asm__ __volatile__("hvc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+	return (TInt)x0;
+	}
+
+/* a secondary CPU, on its own stack with the MMU on: its GIC, its tick, then join the nanokernel */
+extern "C" void A64_ApMain(volatile SAPBootInfo* aInfo)
+	{
+	InitThisCpuGic();
+	StartSystemTimer();
+	ApMainGeneric(aInfo);				// NKern::Init for this CPU's initial thread, then idles; never returns
+	}
+
 extern "C" void Hw_InitAPs()
 	{
-	// shortcut: single CPU until PSCI CPU_ON + per-CPU redistributor init land (step 4)
+	const TInt KApStack = 0x4000;
+	for (TInt cpu = 1; cpu < KMaxCpus; ++cpu)
+		{
+		SAPBootInfo* info = new SAPBootInfo;
+		NThread* t = new NThread;
+		TAny* stack = malloc(KApStack);
+		if (!info || !t || !stack)
+			{ KPrintf("AP%d: out of memory", cpu); return; }
+		memclr(info, sizeof(*info));
+		info->iCpu = cpu;
+		info->iInitStackBase = (TLinAddr)stack;
+		info->iInitStackSize = KApStack;
+		info->iArgs[0] = t;
+		__e32_memory_barrier();
+		TInt r = PsciCpuOn(cpu, (TLinAddr)&A64_ApEntry, (TLinAddr)info);	// QEMU virt: MPIDR Aff0 = cpu
+		if (r != 0)
+			{
+			KPrintf("PSCI CPU_ON(%d) = %d: %d CPU(s)", cpu, r, cpu);		// -2 INVALID_PARAMETERS: no such CPU
+			free(stack); delete t; delete info;
+			return;
+			}
+		TUint64 t0 = fast_counter(), limit = (TUint64)NKern::TimestampFrequency() * 5;
+		while (!__e32_atomic_load_acq32(&info->iArgs[1]))
+			if (fast_counter() - t0 > limit)
+				{ KPrintf("AP%d: did not check in", cpu); return; }
+		KPrintf("AP%d up", cpu);
+		}
 	}
 
 extern "C" void Hw_Init3()

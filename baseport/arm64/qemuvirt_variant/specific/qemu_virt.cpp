@@ -44,6 +44,17 @@ extern "C" void A64_MmuInit()
 	__asm__ __volatile__("isb" ::: "memory");
 	}
 
+/* a secondary CPU: the same translation regime the boot CPU built (TTBR0 = gL1, already populated) */
+extern "C" void A64_MmuInitAp()
+	{
+	SYSREG_W(mair_el1, 0xFF00ull);
+	SYSREG_W(tcr_el1, 32ull | (1ull << 8) | (1ull << 10) | (3ull << 12) | (1ull << 23));
+	SYSREG_W(ttbr0_el1, (TUint64)(unsigned long)gL1);
+	__asm__ __volatile__("dsb ish\n\ttlbi vmalle1\n\tdsb ish\n\tisb" ::: "memory");
+	SYSREG_W(sctlr_el1, SYSREG(sctlr_el1) | 1 | (1 << 2) | (1 << 12));
+	__asm__ __volatile__("isb" ::: "memory");
+	}
+
 extern "C" volatile int A64_BrkSeen;		// a64_nksa.cpp exception dispatch counts the self-test BRK
 extern "C" void A64_NkSaStart();			// a64_nksa.cpp: ROM/super page stand-ins, then KernelMain()
 

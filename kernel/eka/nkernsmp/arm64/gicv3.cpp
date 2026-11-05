@@ -13,7 +13,6 @@ enum { GICD_CTLR = 0x0, GICD_TYPER = 0x4, GICD_IGROUPR = 0x80, GICD_ISENABLER = 
 	   GICR_TYPER = 0x8, GICR_WAKER = 0x14, GICR_SGI = 0x10000, GICR_STRIDE = 0x20000,
 	   GICR_IGROUPR0 = 0x80, GICR_ISENABLER0 = 0x100, GICR_ICENABLER0 = 0x180, GICR_IPRIORITYR = 0x400 };
 
-static unsigned long gRdSgi;	// this CPU's SGI_base (one CPU in step 2; per-CPU when APs come up)
 
 static void WaitRwp(unsigned long aCtlr) { while (REG32(aCtlr) & (1u << 31)) {} }
 
@@ -31,7 +30,7 @@ void Gicv3_InitDist(unsigned long aGicd)
 	WaitRwp(aGicd + GICD_CTLR);
 	}
 
-int Gicv3_InitCpu(unsigned long aGicrBase, unsigned int aMpidrPacked)
+unsigned long Gicv3_InitCpu(unsigned long aGicrBase, unsigned int aMpidrPacked)
 	{
 	for (unsigned long rd = aGicrBase; ; rd += GICR_STRIDE)
 		{
@@ -40,26 +39,26 @@ int Gicv3_InitCpu(unsigned long aGicrBase, unsigned int aMpidrPacked)
 			{
 			REG32(rd + GICR_WAKER) &= ~(1u << 1);			// ProcessorSleep = 0
 			while (REG32(rd + GICR_WAKER) & (1u << 2)) {}	// wait ChildrenAsleep = 0
-			gRdSgi = rd + GICR_SGI;
-			REG32(gRdSgi + GICR_ICENABLER0) = ~0u;
-			REG32(gRdSgi + GICR_IGROUPR0) = ~0u;
+			unsigned long sgi = rd + GICR_SGI;
+			REG32(sgi + GICR_ICENABLER0) = ~0u;
+			REG32(sgi + GICR_IGROUPR0) = ~0u;
 			MSR(S3_0_C12_C12_5, MRS(S3_0_C12_C12_5) | 1);	// ICC_SRE_EL1.SRE
 			ISB();
 			MSR(S3_0_C4_C6_0, 0xFF);					// ICC_PMR_EL1: unmask all priorities
 			MSR(S3_0_C12_C12_3, 0);						// ICC_BPR1_EL1
 			MSR(S3_0_C12_C12_7, 1);						// ICC_IGRPEN1_EL1
 			ISB();
-			return 0;
+			return sgi;
 			}
 		if (typer & (1u << 4))							// GICR_TYPER.Last
-			return -1;
+			return 0;
 		}
 	}
 
-void Gicv3_EnablePpiSgi(unsigned int aIntId, unsigned char aPriority)
+void Gicv3_EnablePpiSgi(unsigned long aRdSgi, unsigned int aIntId, unsigned char aPriority)
 	{
-	*(volatile unsigned char*)(gRdSgi + GICR_IPRIORITYR + aIntId) = aPriority;
-	REG32(gRdSgi + GICR_ISENABLER0) = 1u << aIntId;
+	*(volatile unsigned char*)(aRdSgi + GICR_IPRIORITYR + aIntId) = aPriority;
+	REG32(aRdSgi + GICR_ISENABLER0) = 1u << aIntId;
 	}
 
 TGicU32 Gicv3_Ack()					{ return (TGicU32)MRS(S3_0_C12_C12_0) & 0xFFFFFF; }	// ICC_IAR1_EL1

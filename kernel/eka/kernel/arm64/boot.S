@@ -39,6 +39,7 @@ entry:
 	eret
 at_el1:
 	msr	daifset, #0xf
+	msr	tpidr_el1, xzr			// no TSubScheduler yet (UNKNOWN at reset on real CPUs)
 	adrp	x1, __boot_stack_top
 	add	x1, x1, :lo12:__boot_stack_top
 	mov	sp, x1
@@ -58,6 +59,29 @@ at_el1:
 	bl	A64_BootMain			// never returns
 3:	wfe
 	b	3b
+
+/* Secondary CPU entry (PSCI CPU_ON target). In: x0 = context = SAPBootInfo* (identity-mapped), MMU off, EL1.
+ * Stack = iInitStackBase + iInitStackSize; same vectors and MMU map as the boot CPU; then A64_ApMain(info). */
+	.text
+	.global	A64_ApEntry
+A64_ApEntry:
+	msr	daifset, #0xf
+	msr	tpidr_el1, xzr
+	mov	x19, x0
+	ldr	w1, [x19, #8]			// iInitStackBase
+	ldr	w2, [x19, #4]			// iInitStackSize
+	add	x1, x1, x2
+	and	x1, x1, #~15
+	mov	sp, x1
+	adrp	x1, A64_Vectors
+	add	x1, x1, :lo12:A64_Vectors
+	msr	vbar_el1, x1
+	isb
+	bl	A64_MmuInitAp
+	mov	x0, x19
+	bl	A64_ApMain			// never returns
+1:	wfe
+	b	1b
 
 	.section .bss.stack, "aw", %nobits
 	.balign	16

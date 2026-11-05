@@ -77,6 +77,13 @@ static volatile TUint32 StallLinesSeen, StallQuietTicks, StallDumped;
 extern "C" TUint32 A64_StatusLines();
 static void DumpCpus();
 
+/* HijackSystemTimer (tiedevents EInterrupt): CPU 0's tick is raised as software NIrq KTickIrq, whose one handler
+ * is tied to a thread/group, so NIrqHandler::Activate runs the tick -- and the untied NTimer callbacks Tick() calls
+ * -- on the CPU that thread/group is attached to, never concurrently with it. Vector 1023: no GIC EOI. */
+static const TInt KTickIrq = 0;
+static volatile TUint32 TickIrqHandle;		// nonzero while hijacked
+static void TickIsr(TAny*)	{ TheTimerQ.Tick(); }
+
 static void SystemTick(TSubScheduler& aSS)
 	{
 	++CpuTicks[aSS.iCpuNum & (KMaxCpus - 1)];
@@ -89,7 +96,12 @@ static void SystemTick(TSubScheduler& aSS)
 	if (aSS.iCpuNum == 0)
 		++TickCount;
 	if (aSS.iCpuNum == 0 && TimerQReady)
-		TheTimerQ.Tick();					// the nanokernel millisecond tick (may queue the timer DFC)
+		{
+		if (__e32_atomic_load_acq32(&TickIrqHandle))
+			NKern::Interrupt(KTickIrq);		// hijacked: the tied handler runs the tick where its thread/group is
+		else
+			TheTimerQ.Tick();				// the nanokernel millisecond tick (may queue the timer DFC)
+		}
 	}
 
 static void TimerIrq(TSubScheduler& aSS)
@@ -249,6 +261,8 @@ extern "C" void Hw_Init1()
 	Gicv3_InitDist(A64_GicdBase);
 	InitThisCpuGic();
 	TickPeriod = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
+	NKern::InterruptInit0();				// the NIrqHandler pool (ARM: NKern::Init's arch part)
+	NKern::InterruptInit(KTickIrq, NKern::EIrqInit_RisingEdge, 1023, 0);
 	}
 
 extern "C" void StartSystemTimer()		// this CPU: tick from now on, no timeslice deadline yet
@@ -391,9 +405,10 @@ static void NoteFailure(const char* s, TInt l)	// s = "c:Line <n> File <path>/<n
 	TInt i;
 	for (i = 0; i < FailSiteCount; ++i)
 		{
-		TInt k = 0;
+		TInt k = 0, c = 0;
 		while (where[k] && where[k] == FailSites[i].iWhere[k]) ++k;
-		if (!where[k] && !FailSites[i].iWhere[k]) break;
+		while (c < 47 && LastCase[c] && LastCase[c] == FailSites[i].iCase[c]) ++c;	// one site per (line, case)
+		if (!where[k] && !FailSites[i].iWhere[k] && (c == 47 || (!LastCase[c] && !FailSites[i].iCase[c]))) break;
 		}
 	if (i == FailSiteCount && FailSiteCount < (TInt)(sizeof(FailSites)/sizeof(FailSites[0])))
 		{
@@ -463,7 +478,7 @@ void DebugPrint(const char* s, int l)
 		for (TInt j = 0; t[j]; ++j) StatusTest[k++] = t[j];
 		StatusTest[k] = 0;
 		}
-	else if (Contains(s, l, "TT2:"))
+	else if (Contains(s, l, "TT2:") || Contains(s, l, "TiedEventTest"))
 		CopyLine(LastCase, sizeof(LastCase), s, l);
 	else if (Contains(s, l, "Testing") || Contains(s, l, "Tests Completed") || Contains(s, l, "Kill") || Contains(s, l, "Thread on CPU"))
 		{
@@ -614,10 +629,20 @@ TUint32 swap_out_if_bit0_clear(TUint32& a)
 	return o;
 	}
 
-/* shortcut: the tied-interrupt test case needs the system timer bound as an NIrq tied to a thread/group;
- * our tick is not an NIrq yet, so this is a no-op (tiedevents EInterrupt may report untied behaviour)
- * until the NIrq/GICv3 hardware layer replaces the weak demo one (full kernel, M4) */
-void HijackSystemTimer(NSchedulable*)			{}
+/* tie the system tick to aTieTo (NULL: back to the plain tick); see KTickIrq */
+void HijackSystemTimer(NSchedulable* aTieTo)
+	{
+	TInt h = (TInt)__e32_atomic_swp_ord32(&TickIrqHandle, 0);
+	if (h)
+		NKern::InterruptUnbind(h);			// waits out a tick in flight
+	if (!aTieTo)
+		return;
+	h = NKern::InterruptBind(KTickIrq, &TickIsr, 0, NKern::EIrqBind_Tied, aTieTo);
+	TInt r = h > 0 ? NKern::InterruptEnable(h) : h;
+	if (r != KErrNone)
+		{ KPrintf("HijackSystemTimer: bind/enable %d", r); return; }
+	__e32_atomic_store_rel32(&TickIrqHandle, (TUint32)h);
+	}
 void thread_request_signal(NThread* aThread)	{ NKern::ThreadRequestSignal(aThread); }
 
 } // extern "C"

@@ -913,7 +913,7 @@ NIRQ_WEAK void NIrq::HwInit() {}
 NIRQ_WEAK void NIrq::HwInit0() {}
 NIRQ_WEAK void NIrq::HwEnable() {}
 NIRQ_WEAK void NIrq::HwDisable() {}
-NIRQ_WEAK void NIrq::HwEoi() { A64_GicEoi(iVector); }
+NIRQ_WEAK void NIrq::HwEoi() { if (iVector < 1020) A64_GicEoi(iVector); }	// >= 1020: software-raised
 NIRQ_WEAK TBool NIrq::HwPending() { return FALSE; }
 NIRQ_WEAK void NIrq::HwWaitCpus() {}
 

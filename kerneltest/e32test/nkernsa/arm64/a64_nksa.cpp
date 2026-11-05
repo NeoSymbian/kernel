@@ -1,0 +1,317 @@
+// Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
+// SPDX-License-Identifier: EPL-1.0
+//
+// a64_nksa.cpp -- AArch64 / QEMU virt glue for the standalone nanokernel tests (kerneltest/e32test/nkernsa):
+// the AArch64 counterpart of nkernsa/arm/armutils.{cpp,cia} plus the board hooks (Hw_Init1/InitAPs/Init3,
+// StartSystemTimer, __timer_period, DebugPrint, __finish) and the exception/interrupt dispatch.
+// The IRQ path follows Phorepoc adaptation-x86-64 ekern/xk_irq.cpp X64_Trap (Apache-2.0): EOI early, tick,
+// reschedule/generic IPIs, tied-event tail, and preemption when leaving the outermost interrupt.
+#include <nktest/nkutils.h>
+#include <e32rom.h>
+#include <kernboot.h>
+#include "../a64smp/a64_sysreg.h"
+#include "../board/gicv3.h"
+
+extern "C" void A64_DebugPutc(char c);
+extern "C" void A64_DebugPuts(const char* s);
+extern "C" void A64_DebugHex(TUint64 v);
+extern "C" void KernelMain();
+extern "C" void generic_ipi_isr(TSubScheduler* aS);		// nkernsmp/nkern.cpp
+extern "C" void run_event_handlers(TSubScheduler* aS);	// nkernsmp/nk_irq.cpp
+extern "C" void send_resched_ipis(TUint32 aMask);
+TSubScheduler& SubScheduler();
+
+// QEMU virt (-m 512: RAM 0x40000000-0x5FFFFFFF; QEMU puts the DTB at 0x48000000)
+static const TLinAddr KGicd = 0x08000000, KGicr = 0x080A0000;
+static const TLinAddr KHeapBase = 0x41000000, KHeapSize = 0x06000000;	// shortcut: fixed heap below the DTB; from the DTB /memory later
+static const TUint32 KTimerPpi = TIMESLICE_VECTOR;		// 27: CNTV, the per-CPU tick
+static const TInt KTickUs = 1000;						// 1 ms nanokernel tick
+
+/* ======================================================================================================
+ *  Exception / interrupt dispatch (called from vectors.S with an SThreadExcStack frame)
+ * ====================================================================================================== */
+extern "C" { volatile int A64_BrkSeen; }
+static TUint64 TimerReload;
+static volatile TBool TimerQReady;
+
+static void TimerArm()
+	{
+	A64_SYSREG_WRITE(cntv_tval_el0, TimerReload);
+	A64_SYSREG_WRITE(cntv_ctl_el0, 1);
+	}
+
+static void SystemTick(TSubScheduler& aSS)
+	{
+	if (aSS.iCpuNum == 0 && TimerQReady)
+		TheTimerQ.Tick();					// the nanokernel millisecond tick (may queue the timer DFC)
+	NThreadBase* t = aSS.iCurrentThread;
+	if (t && t->iTime > 0 && --t->iTime == 0)
+		aSS.iRescheduleNeededFlag = TRUE;	// timeslice used up: round-robin at this priority
+	}
+
+static void Irq()
+	{
+	TSubScheduler& ss = SubScheduler();
+	++ss.iSSX.iIrqNestCount;				// -1 = not in an ISR
+	++ss.iSSX.iIrqCount;
+	for (;;)
+		{
+		TUint32 id = Gicv3_Ack();
+		if (id >= 1020)
+			break;							// nothing (more) pending
+		Gicv3_Eoi(id);						// EOI first: a reschedule below may not return for a long time
+		if (id == KTimerPpi)
+			{ TimerArm(); SystemTick(ss); }
+		else if (id == RESCHED_IPI_VECTOR)
+			ss.iRescheduleNeededFlag = TRUE;
+		else if (id == GENERIC_IPI_VECTOR)
+			generic_ipi_isr(&ss);
+		// TRANSFERRED_IRQ_VECTOR: the tail below runs the events
+		}
+	if (--ss.iSSX.iIrqNestCount >= 0)
+		return;
+	if (ss.iEventHandlersPending)
+		{
+		++ss.iSSX.iIrqNestCount;
+		run_event_handlers(&ss);
+		--ss.iSSX.iIrqNestCount;
+		}
+	if ((ss.iRescheduleNeededFlag || ss.iDfcPendingFlag || ss.iExIDfcPendingFlag) && ss.iKernLockCount == 0)
+		{
+		ss.iKernLockCount = 1;
+		TScheduler::Reschedule();			// returns (perhaps much later, perhaps on another CPU) unlocked, IRQs off
+		TUint32 ipis = __e32_atomic_swp_ord32(&SubScheduler().iReschedIPIs, 0);
+		if (ipis)
+			send_resched_ipis(ipis);
+		}
+	}
+
+extern "C" void A64_ExceptionDispatch(SThreadExcStack* aF, TUint64 aKind)
+	{
+	if ((aKind & 3) == 1)
+		{ Irq(); return; }
+	TUint32 ec = (TUint32)(aF->iEsr >> 26);
+	if ((aKind & 3) == 0 && ec == 0x3C && (aF->iEsr & 0xFFFF) == 0x1234)	// the boot self-test BRK
+		{ ++A64_BrkSeen; aF->iElr += 4; return; }
+	A64_DebugPuts("\n*** FAULT kind="); A64_DebugHex(aKind);
+	A64_DebugPuts(" esr="); A64_DebugHex(aF->iEsr);
+	A64_DebugPuts(" elr="); A64_DebugHex(aF->iElr);
+	A64_DebugPuts(" far="); A64_DebugHex(aF->iFar);
+	A64_DebugPuts(" lr="); A64_DebugHex(aF->iX[30]);
+	A64_DebugPuts("\n");
+	for (;;) { A64_CLI(); __asm__ __volatile__("wfi"); }
+	}
+
+/* ======================================================================================================
+ *  Board hooks the nkernsa init.cpp calls
+ * ====================================================================================================== */
+extern "C" TInt __timer_period()		{ return KTickUs; }
+
+extern "C" void Hw_Init1()
+	{
+	Gicv3_InitDist(KGicd);
+	if (Gicv3_InitCpu(KGicr, A64_Mpidr()) != 0)
+		A64_DebugPuts("*** GICv3: no redistributor for this CPU\n");
+	for (TUint32 sgi = 0; sgi < 8; ++sgi)
+		Gicv3_EnablePpiSgi(sgi, 0x80);
+	Gicv3_EnablePpiSgi(KTimerPpi, 0xA0);
+	TimerReload = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
+	}
+
+extern "C" void StartSystemTimer()
+	{
+	TimerArm();
+	}
+
+extern "C" void Hw_InitAPs()
+	{
+	// shortcut: single CPU until PSCI CPU_ON + per-CPU redistributor init land (step 4)
+	}
+
+extern "C" void Hw_Init3()
+	{
+	TimerQReady = TRUE;
+	StartSystemTimer();
+	}
+
+/* ======================================================================================================
+ *  armutils equivalents (nkernsa/utils.h)
+ * ====================================================================================================== */
+extern "C" {
+
+void DebugPrint(const char* s, int l)
+	{
+	TInt irq = NKern::DisableAllInterrupts();	// keep one line together across CPUs/interrupts
+	while (l-- > 0 && *s) A64_DebugPutc(*s++);
+	A64_DebugPutc('\n');
+	NKern::RestoreInterrupts(irq);
+	}
+
+void __cpu_idle()					{ A64_IDLE(); }
+void __cpu_yield()					{ A64_PAUSE(); }
+TLinAddr __stack_pointer()			{ TLinAddr sp; __asm__ __volatile__("mov %w0, wsp" : "=r"(sp)); return sp; }
+TUint32 __cpu_status_reg()			{ return (TUint32)A64_SYSREG_READ(daif); }
+TUint32 __cpsr()					{ return __cpu_status_reg(); }
+TUint32 __cpu_id()					{ return A64_Mpidr(); }
+TUint32 __trace_cpu_num()			{ return NKern::CurrentCpu(); }
+TUint64 fast_counter()				{ return NKern::Timestamp(); }
+TUint32 norm_fast_counter();		// below, after nfcfs
+
+void __finish()
+	{
+	A64_DebugPuts("EKA2/arm64: nkernsa finished\n");
+	register TUint64 x0 __asm__("x0") = 0x84000008;	// PSCI SYSTEM_OFF (QEMU virt conduit: HVC)
+	__asm__ __volatile__("hvc #0" : "+r"(x0) :: "memory");
+	for (;;) { A64_CLI(); __asm__ __volatile__("wfi"); }
+	}
+
+void* memcpy(void* aDest, const void* aSrc, unsigned aLen)
+	{
+	volatile TUint8* d = (volatile TUint8*)aDest;	// volatile: keep GCC from turning this into a memcpy call
+	const TUint8* s = (const TUint8*)aSrc;
+	while (aLen--) *d++ = *s++;
+	return aDest;
+	}
+
+void* wordmove(void* aDest, const void* aSrc, unsigned aLen)	// overlapping-safe word copy
+	{
+	TUint32* d = (TUint32*)aDest; const TUint32* s = (const TUint32*)aSrc;
+	TInt n = aLen >> 2;
+	if (d <= s) { while (n--) *d++ = *s++; }
+	else { d += n; s += n; while (n--) *--d = *--s; }
+	return aDest;
+	}
+
+/* --- from nkernsa/arm/armutils.cpp (EPL-1.0), unchanged apart from the timer-watchdog test (ARM11 only) --- */
+const TUint32 KPageSize = 0x1000u;
+TUint64 fcf;
+TUint32 nfcf;
+TUint32 nfcfs;
+
+TUint32 round_to_page(TUint32 x)		{ return (x + KPageSize - 1) &~ (KPageSize - 1); }
+TLinAddr __initial_stack_base()			{ return __stack_pointer() & ~0xfff; }
+TInt __initial_stack_size()				{ return 0x1000; }
+TUint64 fast_counter_freq()				{ return fcf; }
+TUint32 norm_fast_counter_freq()		{ return nfcf; }
+TUint32 norm_fast_counter()				{ return (TUint32)(fast_counter() >> nfcfs); }
+
+void init_fast_counter()
+	{
+	NKern::Sleep(30);
+	TUint64 initial = fast_counter();
+	NKern::Sleep(1000);
+	TUint64 final = fast_counter();
+	fcf = final - initial;
+	TUint64 f = fcf;
+	nfcfs = 0;
+	while (f > 2000000)
+		f>>=1, ++nfcfs;
+	nfcf = (TUint32)(fcf >> nfcfs);
+	DEBUGPRINT("fcf=%lx",fcf);
+	DEBUGPRINT("nfcf=%d",nfcf);
+	}
+
+TInt __microseconds_to_fast_counter(TInt us)
+	{
+	TUint64 x = TUint64(TUint32(us));
+	x *= fcf; x += TUint64(500000); x /= TUint64(1000000);
+	return (TInt)x;
+	}
+
+TInt __microseconds_to_norm_fast_counter(TInt us)
+	{
+	TUint64 x = TUint64(TUint32(us));
+	x *= nfcf; x += TUint64(500000); x /= TUint64(1000000);
+	return (TInt)x;
+	}
+
+void fcfspin(TUint64 aTicks)
+	{
+	TUint64 t0 = fast_counter();
+	TUint64 t1;
+	do	{ t1 = fast_counter(); t1 -= t0; } while (t1<aTicks);
+	}
+
+void nfcfspin(TUint32 aTicks)
+	{
+	TUint64 ticks = aTicks;
+	ticks <<= nfcfs;
+	fcfspin(ticks);
+	}
+
+void CheckPoint()						{ KPrintf("CPSR=%08x", __cpsr()); }
+
+/* timeslices are counted in 1 ms system ticks (SystemTick decrements NThreadBase::iTime) */
+TInt __microseconds_to_timeslice_ticks(TInt us)	{ return (us + KTickUs - 1) / KTickUs; }
+TInt __fast_counter_to_timeslice_ticks(TUint64 aFCdelta)
+	{
+	TUint64 perTick = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
+	return (TInt)((aFCdelta + perTick - 1) / perTick);
+	}
+
+/* armutils.cia, as compare-and-swap loops with full barriers */
+TUint32 set_bit0_if_nonnull(TUint32& a)
+	{
+	TUint32 o = __atomic_load_n(&a, __ATOMIC_SEQ_CST);
+	while (o && !__atomic_compare_exchange_n(&a, &o, o | 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+	return o;
+	}
+void flip_bit0(TUint32& a)						{ __atomic_fetch_xor(&a, 1u, __ATOMIC_SEQ_CST); }
+TUint32 swap_out_if_bit0_clear(TUint32& a)
+	{
+	TUint32 o = __atomic_load_n(&a, __ATOMIC_SEQ_CST);
+	while (!(o & 1) && !__atomic_compare_exchange_n(&a, &o, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+	return o;
+	}
+
+/* shortcut: the tied-interrupt test case needs the system timer bound as an NIrq tied to a thread/group;
+ * our tick is not an NIrq yet, so this is a no-op (tiedevents EInterrupt may report untied behaviour)
+ * until the NIrq/GICv3 hardware layer replaces the weak demo one (full kernel, M4) */
+void HijackSystemTimer(NSchedulable*)			{}
+void thread_request_signal(NThread* aThread)	{ NKern::ThreadRequestSignal(aThread); }
+
+} // extern "C"
+
+/* armutils.cia: atomically take the request status pointer; if there was one, complete it and signal */
+void RequestComplete(NThread* aThread, NRequestStatus*& aStatus, TInt aValue)
+	{
+	NRequestStatus* s = __atomic_exchange_n(&aStatus, (NRequestStatus*)0, __ATOMIC_SEQ_CST);
+	if (s)
+		{
+		*(TInt*)s = aValue;
+		thread_request_signal(aThread);
+		}
+	}
+
+TVersion::TVersion() : iMajor(0), iMinor(0), iBuild(0) {}	// euser's, needed by a header-only use in the tests
+
+TAny* operator new(TUint aSize) __NO_THROW		{ return malloc(aSize); }
+TAny* operator new[](TUint aSize) __NO_THROW	{ return malloc(aSize); }
+void operator delete(TAny* aPtr) __NO_THROW		{ free(aPtr); }
+void operator delete[](TAny* aPtr) __NO_THROW	{ free(aPtr); }
+void operator delete(TAny* aPtr, TUint) __NO_THROW	{ free(aPtr); }	// sized delete (GCC 14 emits it)
+
+/* ======================================================================================================
+ *  ROM header / super page stand-ins: SetupMemoryAllocator (tlsf.cpp) derives the heap from them
+ * ====================================================================================================== */
+extern "C" TLinAddr RomHeaderAddress;
+extern "C" TLinAddr SuperPageAddress;
+
+static TRomHeader TheRomHeader;
+static SSuperPageBase TheSuperPage;
+static TRomEntry ThePrimaryEntry;
+static TRomImageHeader ThePrimaryImage;
+
+extern "C" void A64_NkSaStart()
+	{
+	TheRomHeader.iKernDataAddress = KHeapBase;	// heap = iKernDataAddress + svdata(0) + primary stack(0)
+	TheRomHeader.iTotalSvDataSize = 0;
+	ThePrimaryImage.iStackSize = 0;
+	ThePrimaryEntry.iAddressLin = (TLinAddr)&ThePrimaryImage;
+	TheSuperPage.iPrimaryEntry = (TLinAddr)&ThePrimaryEntry;
+	TheSuperPage.iInitialHeapSize = KHeapSize;
+	RomHeaderAddress = (TLinAddr)&TheRomHeader;
+	SuperPageAddress = (TLinAddr)&TheSuperPage;
+	A64_DebugPuts("EKA2/arm64: -> KernelMain()\n");
+	KernelMain();
+	}

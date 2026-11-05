@@ -1,18 +1,62 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# build-kernel.sh -- build the AArch64 EKA2 kernel image (arm64 "Image") for QEMU virt. Runs in symbian-a64dev.
+# build-kernel.sh -- build the AArch64 EKA2 nanokernel test image (arm64 "Image") for QEMU virt:
+#   the arch-neutral 2010 nkernsmp core + the standalone nanokernel tests (kerneltest/e32test/nkernsa), both
+#   UNMODIFIED, + our arm64 backend, boot code, GICv3 driver and board glue. Runs in the symbian-a64dev image.
+# Env: KHS = kernelhwsrv checkout, OUT = output dir.
 set -eu
 HERE=$(cd "$(dirname "$0")/.." && pwd)
+KHS=${KHS:-/DATA/AppData/symbian-build/src/core/symbian/kernelhwsrv}
 OUT=${OUT:-$HERE/../../out/kernel}
+EKA=$KHS/kernel/eka
+NKSA=$KHS/kerneltest/e32test/nkernsa
 X=${CROSS:-aarch64-linux-gnu-}
-mkdir -p "$OUT"; rm -f "$OUT"/*.o
+mkdir -p "$OUT/inc"; rm -f "$OUT"/*.o "$OUT"/*.log
+ln -sfn "$NKSA" "$OUT/inc/nktest"			# the tests include <nktest/...>
+
 ARCH="-mabi=ilp32 -march=armv8.2-a -mno-outline-atomics"
-CXX="${X}g++-14 $ARCH -ffreestanding -fno-pic -fno-stack-protector -nostdinc -mgeneral-regs-only -fno-exceptions -fno-rtti -O2 -Wall"
+CFLAGS="$ARCH -ffreestanding -fno-pic -fno-stack-protector -nostdinc -mgeneral-regs-only -fno-exceptions -fno-rtti -O2 -Wall -Wno-unused"
+# EKA2 TUs: the census flags (-fpermissive: operator new(TUint) vs ILP32 size_t unsigned long)
+EKXX="${X}g++-14 $CFLAGS -std=gnu++03 -fno-lifetime-dse -fno-strict-aliasing -fno-delete-null-pointer-checks -fpermissive -Wno-invalid-offsetof"
+DEFS="-D__GCC32__ -D__EPOC32__ -D__SYMBIAN32__ -D__KERNEL_MODE__ -D__SMP__ -D__STANDALONE_NANOKERNEL__"
+INCS="-I $HERE/a64smp -I $EKA/include -I $EKA/include/nkernsmp -I $EKA/include/kernel -I $OUT/inc"
+PRE="-include $HERE/prelude/port_prelude.h -include $HERE/prelude/arm64_prelude.h -include $EKA/include/e32def.h"
+PLAIN="${X}g++-14 $CFLAGS -std=gnu++17"
 AS="${X}gcc-14 $ARCH -c"
+
+fail=0
+ek() {	# ek <src> <obj> [extra flags]
+	if ! $EKXX ${3:-} $DEFS $INCS $PRE -c "$1" -o "$OUT/$2.o" 2>"$OUT/$2.log"; then
+		echo "FAIL $1"; grep -m8 'error' "$OUT/$2.log" | sed 's/^/    /'; fail=1
+	fi
+}
+
+for spec in nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nkernsmp dfcs.cpp:nkernsmp \
+            nk_timer.cpp:nkernsmp nk_irq.cpp:nkernsmp nk_bal.cpp:nkernsmp; do
+	f=${spec%%:*}; ek "$EKA/${spec##*:}/$f" "nk_${f%.cpp}"
+done
+for f in "$HERE"/a64smp/*.cpp; do b=$(basename "$f" .cpp); ek "$f" "be_$b"; done
+for f in init kprintf tlsf nkutils diag main testutils threadbasic fastsem fastmutex debug testipi testdfc fastbuf \
+         benchmark rwspinlock tiedevents; do
+	# benchmark.cpp times empty functions through a pointer: GCC -O2 inlines them and deletes the timed loop,
+	# so Measure() never reaches its threshold (RVCT did not). Keep the calls real.
+	extra=""; [ $f = benchmark ] && extra="-fno-inline -fno-ipa-cp"
+	ek "$NKSA/$f.cpp" "sa_$f" "$extra"
+done
+ek "$HERE/nksa/a64_nksa.cpp" "a64_nksa"
+[ $fail = 0 ] || exit 1
+
+$AS "$HERE/a64smp/a64_ctxsw.S" -o "$OUT/a64_ctxsw.o"
 $AS "$HERE/boot/boot.S" -o "$OUT/boot.o"
 $AS "$HERE/boot/vectors.S" -o "$OUT/vectors.o"
-$CXX -std=gnu++17 -c "$HERE/board/qemu_virt.cpp" -o "$OUT/qemu_virt.o"
-$CXX -std=gnu++17 -c "$HERE/board/gicv3.cpp" -o "$OUT/gicv3.o"
-${X}ld -m aarch64linux32 -nostdlib --no-warn-rwx-segments -T "$HERE/boot/kernel.ld" -o "$OUT/kernel.elf" "$OUT"/*.o
+$PLAIN -c "$HERE/board/qemu_virt.cpp" -o "$OUT/qemu_virt.o"
+$PLAIN -c "$HERE/board/gicv3.cpp" -o "$OUT/gicv3.o"
+
+if ! ${X}ld -m aarch64linux32 -nostdlib --no-warn-rwx-segments -T "$HERE/boot/kernel.ld" -o "$OUT/kernel.elf" \
+		"$OUT"/*.o 2>"$OUT/link.log"; then
+	echo "LINK FAILED -- undefined:"; grep -o "undefined reference to .*" "$OUT/link.log" | sort -u | ${X}c++filt | head -40
+	grep -v "undefined reference" "$OUT/link.log" | head -5
+	exit 1
+fi
 ${X}objcopy -O binary "$OUT/kernel.elf" "$OUT/Image"
 echo "built $OUT/Image ($(wc -c < "$OUT/Image") bytes)"

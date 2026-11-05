@@ -382,6 +382,7 @@ __attribute__((weak)) EXPORT_C void NKFault(const char*, TInt)
     { for (;;) { A64_CLI(); __asm__ __volatile__("wfi"); } }
 
 EXPORT_C TBool BTrace::Out(TUint32, TUint32, TUint32, TUint32) { return EFalse; }
+EXPORT_C TBool BTrace::OutBig(TUint32, TUint32, const TAny*, TInt) { return EFalse; }
 
 /* =====================================================================
  *  Thread bring-up  (first-cut; primes the cooperative switch frame)

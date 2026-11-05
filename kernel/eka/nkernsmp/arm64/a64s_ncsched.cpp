@@ -151,21 +151,24 @@ extern "C" void send_irq_ipi(TSubScheduler* aSS)
 /* =====================================================================
  *  Per-CPU timer / thread-time bookkeeping  (real, simplified)
  * ===================================================================== */
+/* Timeslicing as the 2010 ARM port (nkernsmp/arm/ncsched.cpp UpdateThreadTimes, ncsched.cia SaveTimesliceTimer):
+ * iTime is in timeslice ticks = generic-timer counts. Switching a thread in arms this CPU's timeslice deadline
+ * with its remaining iTime; switching it out stores what is left (0 once expired); the expiry interrupt only
+ * asks for a reschedule. The deadline shares the CPU's virtual timer with the system tick (board glue). */
+extern "C" void A64_TimesliceSet(TInt aTicks);		// aTicks > 0: deadline = now + aTicks; else no deadline
+extern "C" TInt A64_TimesliceRemaining();			// ticks left before the deadline, 0 if it has passed
+
 void TSubScheduler::SaveTimesliceTimer(NThreadBase* aT)
     {
-    /* Deliberate no-op for this board's timer model: the LAPIC timeslice timer is armed
-     * FIXED-PERIODIC and board_smp_tick zeroes iTime each tick, so there is no per-thread
-     * one-shot INITCNT reload with a residual to reclaim. (The x86 backend reads CURRCNT
-     * and rescales via iTimerFreqRI; that would only apply under per-thread timer arming,
-     * a different model. The timestamp side IS real: NKern::Timestamp()=rdtsc with a
-     * PIT-calibrated NKern::TimestampFrequency(), so UpdateThreadTimes accrues true time.) */
-    (void)aT;
+    if (aT->iTime > 0 && !aT->i_NThread_Initial)
+        aT->iTime = A64_TimesliceRemaining();
     }
-
 void TSubScheduler::UpdateThreadTimes(NThreadBase* aOld, NThreadBase* aNew)
     {
     if (!aOld) aOld = iInitialThread;
     if (!aNew) aNew = iInitialThread;
+    if (aNew != aOld || aNew->iTime <= 0)
+        A64_TimesliceSet((aNew->iTime > 0 && !aNew->i_NThread_Initial) ? aNew->iTime : 0);
     if (aNew != aOld)
         {
         TUint64 now = NKern::Timestamp();

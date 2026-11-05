@@ -25,15 +25,48 @@ static const TInt KTickUs = 1000;						// 1 ms nanokernel tick
  *  Exception / interrupt dispatch (called from vectors.S with an SThreadExcStack frame)
  * ====================================================================================================== */
 extern "C" { volatile int A64_BrkSeen; }
-static TUint64 TimerReload;
+static TUint64 TickPeriod;				// counter ticks per 1 ms system tick
 static volatile TBool TimerQReady;
-static volatile TUint32 TickCount;		// CPU 0 ticks, for the boot-time tick self-check
 
-static void TimerArm()
+/* Each CPU's EL1 virtual timer serves two deadlines, programmed as an absolute CNTV_CVAL: the periodic system
+ * tick and the current thread's timeslice. Indexed by MPIDR so a secondary CPU can start its tick before
+ * NKern::Init has given it a TSubScheduler. */
+struct SCpuTimer { TUint64 iNextTick; TUint64 iSliceDeadline; TBool iSliceArmed; };
+static SCpuTimer CpuTimer[256];
+extern "C" TUint32 A64_MpidrIndex(TUint32 aMpidr);
+static inline SCpuTimer& ThisCpuTimer()	{ return CpuTimer[A64_MpidrIndex(A64_Mpidr()) & 0xFF]; }
+
+static void TimerProgram(SCpuTimer& c)
 	{
-	A64_SYSREG_WRITE(cntv_tval_el0, TimerReload);
+	TUint64 cval = c.iNextTick;
+	if (c.iSliceArmed && c.iSliceDeadline < cval)
+		cval = c.iSliceDeadline;
+	A64_SYSREG_WRITE(cntv_cval_el0, cval);
 	A64_SYSREG_WRITE(cntv_ctl_el0, 1);
+	__asm__ __volatile__("isb" ::: "memory");
 	}
+
+extern "C" void A64_TimesliceSet(TInt aTicks)
+	{
+	TInt irq = NKern::DisableAllInterrupts();
+	SCpuTimer& c = ThisCpuTimer();
+	c.iSliceArmed = aTicks > 0;
+	if (c.iSliceArmed)
+		c.iSliceDeadline = NKern::Timestamp() + (TUint32)aTicks;
+	TimerProgram(c);
+	NKern::RestoreInterrupts(irq);
+	}
+
+extern "C" TInt A64_TimesliceRemaining()
+	{
+	TInt irq = NKern::DisableAllInterrupts();
+	SCpuTimer& c = ThisCpuTimer();
+	TUint64 now = NKern::Timestamp();
+	TInt r = (c.iSliceArmed && c.iSliceDeadline > now) ? (TInt)(c.iSliceDeadline - now) : 0;
+	NKern::RestoreInterrupts(irq);
+	return r;
+	}
+static volatile TUint32 TickCount;		// CPU 0 ticks, for the boot-time tick self-check
 
 static void SystemTick(TSubScheduler& aSS)
 	{
@@ -41,9 +74,23 @@ static void SystemTick(TSubScheduler& aSS)
 		++TickCount;
 	if (aSS.iCpuNum == 0 && TimerQReady)
 		TheTimerQ.Tick();					// the nanokernel millisecond tick (may queue the timer DFC)
-	NThreadBase* t = aSS.iCurrentThread;
-	if (t && t->iTime > 0 && --t->iTime == 0)
-		aSS.iRescheduleNeededFlag = TRUE;	// timeslice used up: round-robin at this priority
+	}
+
+static void TimerIrq(TSubScheduler& aSS)
+	{
+	SCpuTimer& c = ThisCpuTimer();
+	TUint64 now = NKern::Timestamp();
+	if (now >= c.iNextTick)
+		{
+		do c.iNextTick += TickPeriod; while (c.iNextTick <= now);	// catch up, never fire twice for one tick
+		SystemTick(aSS);
+		}
+	if (c.iSliceArmed && now >= c.iSliceDeadline)
+		{
+		c.iSliceArmed = FALSE;				// expired: SaveTimesliceTimer will read 0
+		aSS.iRescheduleNeededFlag = TRUE;	// as the ARM do_timeslice_irq: just ask for a reschedule
+		}
+	TimerProgram(c);
 	}
 
 static void Irq()
@@ -58,7 +105,7 @@ static void Irq()
 			break;							// nothing (more) pending
 		Gicv3_Eoi(id);						// EOI first: a reschedule below may not return for a long time
 		if (id == A64_TimerPpi)
-			{ TimerArm(); SystemTick(ss); }
+			TimerIrq(ss);
 		else if (id == RESCHED_IPI_VECTOR)
 			ss.iRescheduleNeededFlag = TRUE;
 		else if (id == GENERIC_IPI_VECTOR)
@@ -118,12 +165,15 @@ extern "C" void Hw_Init1()
 	{
 	Gicv3_InitDist(A64_GicdBase);
 	InitThisCpuGic();
-	TimerReload = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
+	TickPeriod = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
 	}
 
-extern "C" void StartSystemTimer()
+extern "C" void StartSystemTimer()		// this CPU: tick from now on, no timeslice deadline yet
 	{
-	TimerArm();
+	SCpuTimer& c = ThisCpuTimer();
+	c.iNextTick = NKern::Timestamp() + TickPeriod;
+	c.iSliceArmed = FALSE;
+	TimerProgram(c);
 	}
 
 extern "C" void ApMainGeneric(volatile SAPBootInfo* aInfo);	// nkernsa init.cpp
@@ -226,8 +276,21 @@ void DebugPrint(const char* s, int l)
 	{
 	TInt irq = NKern::DisableAllInterrupts();	// keep one line together across CPUs/interrupts
 	++StatusLines;
+	static TUint32 pipeRounds;
 	if (Contains(s, l, "Line ") && Contains(s, l, " File "))
 		++StatusFails;
+	else if (Contains(s, l, "waits out of"))		// fastbuf.cpp: 0x01000000 writes / 131072 per round = 128 rounds
+		{
+		const char* h = "wait-free pipe, round ";
+		TInt k = 0;
+		while (h[k]) { StatusTest[k] = h[k]; ++k; }
+		TUint32 v = ++pipeRounds; char d[12]; TInt i = 0;
+		do { d[i++] = (char)('0' + v % 10); v /= 10; } while (v);
+		while (i) StatusTest[k++] = d[--i];
+		const char* t = "/128";
+		for (TInt j = 0; t[j]; ++j) StatusTest[k++] = t[j];
+		StatusTest[k] = 0;
+		}
 	else if (Contains(s, l, "Testing") || Contains(s, l, "Tests Completed") || Contains(s, l, "Kill") || Contains(s, l, "Thread on CPU"))
 		{
 		const char* t = s; TInt n = l;
@@ -337,13 +400,12 @@ void nfcfspin(TUint32 aTicks)
 
 void CheckPoint()						{ KPrintf("CPSR=%08x", __cpsr()); }
 
-/* timeslices are counted in 1 ms system ticks (SystemTick decrements NThreadBase::iTime) */
-TInt __microseconds_to_timeslice_ticks(TInt us)	{ return (us + KTickUs - 1) / KTickUs; }
-TInt __fast_counter_to_timeslice_ticks(TUint64 aFCdelta)
+/* timeslice ticks = generic-timer counts (the fast counter is the same counter) */
+TInt __microseconds_to_timeslice_ticks(TInt us)
 	{
-	TUint64 perTick = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
-	return (TInt)((aFCdelta + perTick - 1) / perTick);
+	return (TInt)(((TUint64)(TUint32)us * NKern::TimestampFrequency() + 500000) / 1000000);
 	}
+TInt __fast_counter_to_timeslice_ticks(TUint64 aFCdelta)	{ return (TInt)aFCdelta; }
 
 /* armutils.cia, as compare-and-swap loops with full barriers */
 TUint32 set_bit0_if_nonnull(TUint32& a)

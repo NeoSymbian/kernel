@@ -24,6 +24,7 @@ unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu << 8; }		// Aff1
 static const unsigned long KFb = 0x9c000000;
 static const int KFbW = 1080, KFbH = 2160, KFbStride = 4320;
 static const int KCols = KFbW / FONT_W, KRows = KFbH / FONT_H;
+static const int KPinRows = 8;		// rows 1..8: pinned failure lines; the console scrolls in the rows below
 static int gCol, gRow;
 
 static void DrawGlyph(int aCol, int aRow, char c, TUint32 aFg, TUint32 aBg = 0xFF000000)
@@ -44,15 +45,15 @@ static void ClearRow(int aRow)
 static void NewLine()
 	{
 	gCol = 0;
-	if (++gRow == KRows) gRow = 1;		// shortcut: wrap below the status row instead of scrolling (no memmove on a 9 MB fb)
+	if (++gRow == KRows) gRow = 1 + KPinRows;	// shortcut: wrap below the status + pin rows instead of scrolling
 	ClearRow(gRow);						// the next line starts clean; the one below the cursor shows where we are
-	ClearRow(gRow + 1 < KRows ? gRow + 1 : 1);
+	ClearRow(gRow + 1 < KRows ? gRow + 1 : 1 + KPinRows);
 	}
 
 extern "C" void A64_DebugPutc(char c)
 	{
 	static int started;
-	if (!started) { started = 1; gRow = 1; ClearRow(0); ClearRow(1); }
+	if (!started) { started = 1; gRow = 1 + KPinRows; for (int r = 0; r <= gRow; ++r) ClearRow(r); }
 	if (c == '\r') return;
 	if (c == '\n') { NewLine(); return; }
 	DrawGlyph(gCol, gRow, c, 0xFF00FF66);
@@ -71,6 +72,14 @@ extern "C" void A64_ConsoleStatus(const char* aTest, unsigned aLines, unsigned a
 	TUint32 bg = aFails ? 0xFF8B0000 : 0xFF103060;		// dark red if anything failed, else dark blue
 	for (int i = 0; i < KCols; ++i)
 		DrawGlyph(i, 0, buf[i], 0xFFFFE066, bg);
+	}
+
+extern "C" void A64_ConsolePin(int aSlot, const char* aText)
+	{
+	if (aSlot < 0 || aSlot >= KPinRows) return;
+	int i = 0;
+	for (; i < KCols && aText[i]; ++i) DrawGlyph(i, 1 + aSlot, aText[i], 0xFFFFFFFF, 0xFF600000);
+	for (; i < KCols; ++i) DrawGlyph(i, 1 + aSlot, ' ', 0xFFFFFFFF, 0xFF600000);
 	}
 
 /* --- MMU: identity map of only what we use (unmapped = no speculative access to TZ/hyp/modem memory) ---------

@@ -9,6 +9,8 @@ void A64_DebugPuts(const char* s);
 void A64_DebugHex(unsigned long long v);
 // one-line status (current test, output lines, failures, seconds); boards without a screen ignore it
 void A64_ConsoleStatus(const char* aTest, unsigned aLines, unsigned aFails, unsigned aSecs);
+// pin a line (a failure) on screen so it never scrolls away; aSlot 0..7
+void A64_ConsolePin(int aSlot, const char* aText);
 // MMU: the boot CPU builds and enables the map; secondary CPUs enable the same one
 void A64_MmuInit();
 void A64_MmuInitAp();

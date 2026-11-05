@@ -262,7 +262,19 @@ static TUint32 StatusLines, StatusFails;
 static char StatusTest[80] = "boot";
 static char StatusShown[96];				// what the bar shows: test name, plus the last failure site
 /* failure sites ("threadbasic.cpp:437") with counts, printed as a summary by __finish */
-struct SFailSite { char iWhere[40]; TUint32 iCount; char iTest[48]; };
+struct SFailSite { char iWhere[40]; TUint32 iCount; char iTest[48]; char iMsg[32]; char iCase[48]; };
+static char LastLine[64];		// the TEST_RESULT message line printed just before "Line N File ..."
+static char LastCase[48];		// the last "TT2: ..." case header (the timing tests)
+
+static void CopyLine(char* aDst, TInt aMax, const char* s, TInt l)	// without the "c:NKTEST: " prefix
+	{
+	for (TInt i = 0; i + 8 <= l; ++i)
+		if (s[i]=='N' && s[i+1]=='K' && s[i+2]=='T' && s[i+3]=='E' && s[i+4]=='S' && s[i+5]=='T' && s[i+6]==':' && s[i+7]==' ')
+			{ s += i + 8; l -= i + 8; break; }
+	TInt k = 0;
+	while (k < l && k < aMax - 1 && s[k] && s[k] != '\r' && s[k] != '\n') { aDst[k] = s[k]; ++k; }
+	aDst[k] = 0;
+	}
 static SFailSite FailSites[24];
 static TInt FailSiteCount;
 
@@ -293,9 +305,25 @@ static void NoteFailure(const char* s, TInt l)	// s = "c:Line <n> File <path>/<n
 		FailSites[i].iWhere[k] = 0;
 		for (k = 0; StatusTest[k] && k < 47; ++k) FailSites[i].iTest[k] = StatusTest[k];
 		FailSites[i].iTest[k] = 0;
+		for (k = 0; LastLine[k] && k < 31; ++k) FailSites[i].iMsg[k] = LastLine[k];
+		FailSites[i].iMsg[k] = 0;
+		for (k = 0; LastCase[k] && k < 47; ++k) FailSites[i].iCase[k] = LastCase[k];
+		FailSites[i].iCase[k] = 0;
 		++FailSiteCount;
 		}
-	if (i < FailSiteCount) ++FailSites[i].iCount;
+	if (i < FailSiteCount)
+		{
+		++FailSites[i].iCount;
+		// pin: "<count>x <file:line> <message> | <case or test>"
+		char pin[96]; TInt n = 0;
+		TUint32 v = FailSites[i].iCount; char d[12]; TInt j = 0;
+		do { d[j++] = (char)('0' + v % 10); v /= 10; } while (v);
+		while (j) pin[n++] = d[--j];
+		const char* parts[] = { "x ", FailSites[i].iWhere, " ", FailSites[i].iMsg, " | ", FailSites[i].iCase[0] ? FailSites[i].iCase : FailSites[i].iTest };
+		for (TInt p = 0; p < 6; ++p) for (const char* c = parts[p]; *c && n < 95; ++c) pin[n++] = *c;
+		pin[n] = 0;
+		A64_ConsolePin(i, pin);
+		}
 	// bar: "<test>  last fail <where>"
 	TInt n = 0;
 	for (const char* p = StatusTest; *p && n < 50; ++p) StatusShown[n++] = *p;
@@ -338,6 +366,8 @@ void DebugPrint(const char* s, int l)
 		for (TInt j = 0; t[j]; ++j) StatusTest[k++] = t[j];
 		StatusTest[k] = 0;
 		}
+	else if (Contains(s, l, "TT2:"))
+		CopyLine(LastCase, sizeof(LastCase), s, l);
 	else if (Contains(s, l, "Testing") || Contains(s, l, "Tests Completed") || Contains(s, l, "Kill") || Contains(s, l, "Thread on CPU"))
 		{
 		const char* t = s; TInt n = l;
@@ -347,6 +377,8 @@ void DebugPrint(const char* s, int l)
 		while (k < n && k < (TInt)sizeof(StatusTest) - 1 && t[k] && t[k] != '\r' && t[k] != '\n') { StatusTest[k] = t[k]; ++k; }
 		StatusTest[k] = 0;
 		}
+	if (!(Contains(s, l, "Line ") && Contains(s, l, " File ")))
+		CopyLine(LastLine, sizeof(LastLine), s, l);
 	while (l-- > 0 && *s) A64_DebugPutc(*s++);
 	A64_DebugPutc('\n');
 	TUint32 freq = NKern::TimestampFrequency();
@@ -373,7 +405,8 @@ void __finish()
 		{
 		A64_DebugPuts("  "); A64_DebugHex(FailSites[i].iCount);
 		A64_DebugPuts(" x "); A64_DebugPuts(FailSites[i].iWhere);
-		A64_DebugPuts("  ("); A64_DebugPuts(FailSites[i].iTest); A64_DebugPuts(")\n");
+		A64_DebugPuts(" "); A64_DebugPuts(FailSites[i].iMsg);
+		A64_DebugPuts("  ("); A64_DebugPuts(FailSites[i].iCase[0] ? FailSites[i].iCase : FailSites[i].iTest); A64_DebugPuts(")\n");
 		}
 	// give a human time to read the summary on a phone before it powers off
 	for (TUint64 c0 = fast_counter(), w = (TUint64)NKern::TimestampFrequency() * 120; fast_counter() - c0 < w; ) {}

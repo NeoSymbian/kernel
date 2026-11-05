@@ -539,6 +539,7 @@ void __finish()
 		A64_DebugPuts(" "); A64_DebugPuts(FailSites[i].iMsg);
 		A64_DebugPuts("  ("); A64_DebugPuts(FailSites[i].iCase[0] ? FailSites[i].iCase : FailSites[i].iTest); A64_DebugPuts(")\n");
 		}
+	StallDumped = 3;						// the 2-minute hold below is quiet on purpose: no stall dumps over the summary
 	// give a human time to read the summary on a phone before it powers off
 	for (TUint64 c0 = fast_counter(), w = (TUint64)NKern::TimestampFrequency() * 120; fast_counter() - c0 < w; ) {}
 	Psci(0x84000008, 0, 0, 0);		// PSCI SYSTEM_OFF (QEMU exits; the Pixel powers off)

@@ -19,6 +19,31 @@ extern void TestWaitFreePipe();
 extern void BenchmarkTests();
 extern void TestRWSpinLock();
 extern void TestTiedEvents();
+extern void DoRWTest(TInt aTestType, TUint32 aReadLimit, TUint32 aInSeq, TUint32 aOutSeq, TInt aRWCpu, TInt aICpu);	// fastmutex.cpp
+
+#ifdef SEL_SKMGRP
+/* skmgrp: TestSuspendKillMigrate's "join a group with a mutex-holder" section (in-op 8), which exercised the
+ * JoinGroup fix, plus two controls (frozen group, no group). Types: SReaderInfo::TTestType, private to fastmutex.cpp. */
+static void TestSkmGroup()
+	{
+	TEST_PRINT("Testing Suspend/Kill/Migrate, mutex-holder group...");
+	enum { ETimeslice, ESuspend, EKill, EMigrate, EInterlockedSuspend, EInterlockedKill, EInterlockedMigrate };
+	const TUint32 KReads = 10000;
+	static const TUint32 KCases[][3] = {
+		{ ETimeslice, 0x138, 0x831 }, { ETimeslice, 0x438, 0x834 },
+		{ ESuspend, 0x138, 0x831 }, { ESuspend, 0x438, 0x834 },
+		{ EKill, 0x138, 0x831 }, { EKill, 0x438, 0x834 },
+		{ EMigrate, 0x138, 0x831 }, { EMigrate, 0x438, 0x834 }, { EMigrate, 0x080, 0x800 },
+		{ EInterlockedSuspend, 0x438, 0x834 }, { EInterlockedSuspend, 0x138, 0x831 },
+		{ EInterlockedKill, 0x438, 0x834 }, { EInterlockedKill, 0x138, 0x831 },
+		{ EInterlockedMigrate, 0x138, 0x831 }, { EInterlockedMigrate, 0x438, 0x834 },
+		{ EInterlockedMigrate, 0x180, 0x810 }, { EInterlockedMigrate, 0x480, 0x840 },
+		{ ETimeslice, 0x137, 0x731 }, { ETimeslice, 0x310, 0x310 },		// controls
+		};
+	for (TUint i = 0; i < sizeof(KCases) / sizeof(KCases[0]); ++i)
+		DoRWTest(KCases[i][0], KReads, KCases[i][1], KCases[i][2], 0, 1);
+	}
+#endif
 
 #ifdef SEL_DFCQUICK
 static void TestDFCsQuick()
@@ -74,6 +99,9 @@ void Main(TAny*)
 #endif
 #ifdef SEL_SKM
 	TestSuspendKillMigrate();
+#endif
+#ifdef SEL_SKMGRP
+	TestSkmGroup();
 #endif
 	TEST_PRINT("Tests Completed");
 	__finish();

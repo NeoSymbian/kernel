@@ -40,7 +40,19 @@ ek() {	# ek <src> <obj> [extra flags]
 
 for spec in nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nkernsmp dfcs.cpp:nkernsmp \
             nk_timer.cpp:nkernsmp nk_irq.cpp:nkernsmp nk_bal.cpp:nkernsmp; do
-	f=${spec%%:*}; ek "$EKA/${spec##*:}/$f" "nk_${f%.cpp}"
+	f=${spec%%:*}; src="$EKA/${spec##*:}/$f"
+	# a64 port fix in the 2010 kernel (keep it in the ekern build too, see docs/port-map.md): NKern::JoinGroup moved a
+	# group that was already ready to the TAIL of the joining thread's priority (ChangePriority), behind its equal-
+	# priority peers, so the running thread lost its place and the next reschedule switched it out even while it held
+	# a fast mutex (fastmutex.cpp DoRWTest 0x138/0x438, F2 != 0). The group takes the joiner's place at the head.
+	if [ $f = nkern.cpp ]; then
+		sed -e 's/^			else if (pC->iPriority > aGroup->iPriority)$/			else if (pC->iPriority >= aGroup->iPriority)	\/\/ a64 port fix: JoinGroup keeps the head/' \
+		    -e 's/^				ss.SSChgEntryP(aGroup, pC->iPriority);$/				{ ss.SSRemoveEntry(aGroup); aGroup->iPriority = pC->iPriority; ss.SSAddEntryHead(aGroup); }	\/\/ a64 port fix: group first/' \
+		    "$src" > "$OUT/nkern.cpp"
+		[ $(grep -c 'a64 port fix:' "$OUT/nkern.cpp") -eq 2 ] || { echo "FAIL nkern.cpp JoinGroup fix did not apply"; fail=1; }
+		src="$OUT/nkern.cpp"
+	fi
+	ek "$src" "nk_${f%.cpp}"
 done
 for f in "$HERE"/a64smp/*.cpp; do b=$(basename "$f" .cpp); ek "$f" "be_$b"; done
 # NKSA_MAIN=groups: our a64_main_groups.cpp replaces the suite's main.cpp (focused reproduction)

@@ -12,6 +12,7 @@ AS="${X}gcc-14 $ARCH -c"
 $AS "$HERE/boot/boot.S" -o "$OUT/boot.o"
 $AS "$HERE/boot/vectors.S" -o "$OUT/vectors.o"
 $CXX -std=gnu++17 -c "$HERE/board/qemu_virt.cpp" -o "$OUT/qemu_virt.o"
+$CXX -std=gnu++17 -c "$HERE/board/gicv3.cpp" -o "$OUT/gicv3.o"
 ${X}ld -m aarch64linux32 -nostdlib --no-warn-rwx-segments -T "$HERE/boot/kernel.ld" -o "$OUT/kernel.elf" "$OUT"/*.o
 ${X}objcopy -O binary "$OUT/kernel.elf" "$OUT/Image"
 echo "built $OUT/Image ($(wc -c < "$OUT/Image") bytes)"

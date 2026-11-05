@@ -26,13 +26,13 @@ static const int KFbW = 1080, KFbH = 2160, KFbStride = 4320;
 static const int KCols = KFbW / FONT_W, KRows = KFbH / FONT_H;
 static int gCol, gRow;
 
-static void DrawGlyph(int aCol, int aRow, char c, TUint32 aFg)
+static void DrawGlyph(int aCol, int aRow, char c, TUint32 aFg, TUint32 aBg = 0xFF000000)
 	{
 	const unsigned int* g = (c >= FONT_FIRST && c <= FONT_LAST) ? KFont[c - FONT_FIRST] : KFont[0];
 	volatile TUint32* p = (volatile TUint32*)(KFb + (unsigned long)aRow * FONT_H * KFbStride + aCol * FONT_W * 4);
 	for (int y = 0; y < FONT_H; ++y, p += KFbStride / 4)
 		for (int x = 0; x < FONT_W; ++x)
-			p[x] = (g[y] & (0x80000000u >> x)) ? aFg : 0xFF000000;
+			p[x] = (g[y] & (0x80000000u >> x)) ? aFg : aBg;
 	}
 
 static void ClearRow(int aRow)
@@ -44,19 +44,33 @@ static void ClearRow(int aRow)
 static void NewLine()
 	{
 	gCol = 0;
-	if (++gRow == KRows) gRow = 0;		// shortcut: wrap to the top instead of scrolling (no memmove on a 9 MB fb)
+	if (++gRow == KRows) gRow = 1;		// shortcut: wrap below the status row instead of scrolling (no memmove on a 9 MB fb)
 	ClearRow(gRow);						// the next line starts clean; the one below the cursor shows where we are
-	ClearRow(gRow + 1 < KRows ? gRow + 1 : 0);
+	ClearRow(gRow + 1 < KRows ? gRow + 1 : 1);
 	}
 
 extern "C" void A64_DebugPutc(char c)
 	{
 	static int started;
-	if (!started) { started = 1; gRow = 0; ClearRow(0); }
+	if (!started) { started = 1; gRow = 1; ClearRow(0); ClearRow(1); }
 	if (c == '\r') return;
 	if (c == '\n') { NewLine(); return; }
 	DrawGlyph(gCol, gRow, c, 0xFF00FF66);
 	if (++gCol == KCols) NewLine();
+	}
+
+/* row 0: status bar -- current test, output lines, failures (red if any), seconds since boot */
+extern "C" void A64_ConsoleStatus(const char* aTest, unsigned aLines, unsigned aFails, unsigned aSecs)
+	{
+	char buf[KCols + 1];
+	int n = 0;
+	auto put = [&](const char* s) { while (*s && n < KCols) buf[n++] = *s++; };
+	auto num = [&](unsigned v) { char d[12]; int i = 0; do { d[i++] = (char)('0' + v % 10); v /= 10; } while (v); while (i && n < KCols) buf[n++] = d[--i]; };
+	put(" "); num(aSecs); put("s  lines "); num(aLines); put("  FAIL "); num(aFails); put("  | "); put(aTest);
+	while (n < KCols) buf[n++] = ' ';
+	TUint32 bg = aFails ? 0xFF8B0000 : 0xFF103060;		// dark red if anything failed, else dark blue
+	for (int i = 0; i < KCols; ++i)
+		DrawGlyph(i, 0, buf[i], 0xFFFFE066, bg);
 	}
 
 /* --- MMU: identity map of only what we use (unmapped = no speculative access to TZ/hyp/modem memory) ---------

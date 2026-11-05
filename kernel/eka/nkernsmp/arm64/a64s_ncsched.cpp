@@ -400,6 +400,16 @@ extern "C" void A64_ThreadStart(TAny* aParameterBlock, NThreadFunction aFunction
     if (ipis)
         send_resched_ipis(ipis);
     board_fpu_restore(0);
+    /* A thread killed (or diverted) before it ever ran: the 2010 ARM kernel reaches __StartThread through the
+     * tail of Reschedule, whose resched_thread_divert check makes such a thread exit instead of running. Our first
+     * resume bypasses that tail, so check here (found by nkernsa "Kill an unresumed thread": the killed Spinner
+     * ran forever at priority 33 and starved the test). do_forced_exit wants the kernel locked, as it is here. */
+    NThreadBase* me = ss.iCurrentThread;
+    if (me->iCsFunction == NThreadBase::ECSDivertPending)
+        {
+        A64_STI();
+        do_forced_exit(me);                    /* never returns */
+        }
     ss.iKernLockCount = 0;
     A64_STI();
     (*aFunction)(aParameterBlock);

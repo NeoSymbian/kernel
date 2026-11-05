@@ -207,11 +207,40 @@ extern "C" void Hw_Init3()
  * ====================================================================================================== */
 extern "C" {
 
+/* status bar bookkeeping: the last "Testing ..." / "Basic..." headline, and the TEST_RESULT failure lines */
+static TUint32 StatusLines, StatusFails;
+static char StatusTest[80] = "boot";
+
+static TBool Contains(const char* s, TInt l, const char* w)
+	{
+	for (TInt i = 0; i < l && s[i]; ++i)
+		{
+		TInt j = 0;
+		while (w[j] && i + j < l && s[i + j] == w[j]) ++j;
+		if (!w[j]) return TRUE;
+		}
+	return FALSE;
+	}
+
 void DebugPrint(const char* s, int l)
 	{
 	TInt irq = NKern::DisableAllInterrupts();	// keep one line together across CPUs/interrupts
+	++StatusLines;
+	if (Contains(s, l, "Line ") && Contains(s, l, " File "))
+		++StatusFails;
+	else if (Contains(s, l, "Testing") || Contains(s, l, "Tests Completed") || Contains(s, l, "Kill") || Contains(s, l, "Thread on CPU"))
+		{
+		const char* t = s; TInt n = l;
+		for (TInt i = 0; i + 8 <= n; ++i)			// drop the "c:NKTEST: " prefix
+			if (Contains(s + i, 8, "NKTEST: ")) { t = s + i + 8; n -= i + 8; break; }
+		TInt k = 0;
+		while (k < n && k < (TInt)sizeof(StatusTest) - 1 && t[k] && t[k] != '\r' && t[k] != '\n') { StatusTest[k] = t[k]; ++k; }
+		StatusTest[k] = 0;
+		}
 	while (l-- > 0 && *s) A64_DebugPutc(*s++);
 	A64_DebugPutc('\n');
+	TUint32 freq = NKern::TimestampFrequency();
+	A64_ConsoleStatus(StatusTest, StatusLines, StatusFails, freq ? (TUint32)(NKern::Timestamp() / freq) : 0);
 	NKern::RestoreInterrupts(irq);
 	}
 

@@ -13,6 +13,8 @@ extern "C" void A64_DebugHex(TUint64 v)
 	for (int i = 60; i >= 0; i -= 4) A64_DebugPutc("0123456789abcdef"[(v >> i) & 0xF]);
 	}
 
+extern "C" __attribute__((weak)) void A64_ConsoleStatus(const char*, unsigned, unsigned, unsigned) {}
+
 extern "C" volatile int A64_BrkSeen;		// a64_nksa.cpp exception dispatch counts the self-test BRK
 extern "C" void A64_NkSaStart();			// a64_nksa.cpp: ROM/super page stand-ins, then KernelMain()
 

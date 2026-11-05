@@ -44,8 +44,15 @@ for spec in nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nke
 done
 for f in "$HERE"/a64smp/*.cpp; do b=$(basename "$f" .cpp); ek "$f" "be_$b"; done
 # NKSA_MAIN=groups: our a64_main_groups.cpp replaces the suite's main.cpp (focused reproduction)
-MAIN=main; [ "${NKSA_MAIN:-}" = groups ] && MAIN=""
-for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fastmutex debug testipi testdfc fastbuf \
+# NKSA_MAIN=select NKSA_TESTS="...": a64_main_select.cpp runs only the named groups (see that file)
+MAIN=main; TESTDFC=testdfc; SELDEFS=""
+case "${NKSA_MAIN:-}" in
+	groups) MAIN="" ;;
+	select) MAIN=""
+	        for t in ${NKSA_TESTS:?NKSA_TESTS lists the tests to run}; do SELDEFS="$SELDEFS -DSEL_$(echo $t | tr a-z A-Z)"; done
+	        case " $NKSA_TESTS " in *" dfcquick "*) TESTDFC="" ;; esac ;;	# dfcquick compiles testdfc.cpp into the selector
+esac
+for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fastmutex debug testipi $TESTDFC fastbuf \
          benchmark rwspinlock tiedevents; do
 	# benchmark.cpp times empty functions through a pointer: GCC -O2 inlines them and deletes the timed loop,
 	# so Measure() never reaches its threshold (RVCT did not). Keep the calls real.
@@ -55,6 +62,7 @@ done
 # -Dprivate=public: the stall dump reads scheduler internals (NThreadWaitState, SIterDQ) of the 2010 headers
 ek "$HERE/nksa/a64_nksa.cpp" "a64_nksa" "-Dprivate=public"
 [ "${NKSA_MAIN:-}" = groups ] && ek "$HERE/nksa/a64_main_groups.cpp" "sa_main_groups"
+[ "${NKSA_MAIN:-}" = select ] && ek "$HERE/nksa/a64_main_select.cpp" "sa_main_select" "$SELDEFS"
 [ $fail = 0 ] || exit 1
 
 $AS "$HERE/a64smp/a64_ctxsw.S" -o "$OUT/a64_ctxsw.o"

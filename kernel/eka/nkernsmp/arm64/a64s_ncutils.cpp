@@ -101,8 +101,51 @@ EXPORT_C TUint32 NKern::CpuTimeMeasFreq()
 	return NKern::TimestampFrequency();
 	}
 
-/* --- Idle -------------------------------------------------------------------------------------------------- */
+/* --- Idle --------------------------------------------------------------------------------------------------
+ * Port of nkernsmp/arm/ncutils.cpp NKern::DoIdle (called by the neutral NKern::Idle with interrupts enabled):
+ * leave iCpusNotIdle; if this is the LAST CPU to go idle and idle DFCs are queued (TDfc::QueueOnIdle), take them
+ * and run them instead of sleeping; if a reschedule happened since NKern::Idle began, go round again; otherwise
+ * WFI with interrupts masked and rejoin iCpusNotIdle on wake-up. The x86-derived WFI-only version never ran idle
+ * DFCs (nkernsa DoIdleDFCTest1/2 failed and then hung on the phone).
+ * shortcut: no core retirement / power-down (the ERetire path); add with PSCI CPU_OFF when core control is needed. */
 EXPORT_C void NKern::DoIdle()
 	{
-	A64_IDLE();
+	TScheduler& s = TheScheduler;
+	TSubScheduler& ss = SubScheduler();		// OK since the idle thread is locked to this CPU
+	TUint32 m = ss.iCpuMask;
+	s.iIdleSpinLock.LockIrq();
+	TUint32 orig_cpus_not_idle = __e32_atomic_and_acq32(&s.iCpusNotIdle, ~m);
+	if (orig_cpus_not_idle == m && !s.iIdleDfcs.IsEmpty())
+		{
+		// all CPUs idle and idle DFCs pending: this CPU runs them
+		__e32_atomic_ior_ord32(&s.iCpusNotIdle, m);	// we aren't idle after all
+		s.iIdleGeneration ^= 1;
+		++s.iIdleGenerationCount;
+		s.iIdleSpillCpu = (TUint8)ss.iCpuNum;
+		ss.iDfcs.MoveFrom(&s.iIdleDfcs);
+		ss.iDfcPendingFlag = 1;
+		s.iIdleSpinLock.UnlockIrq();
+		NKern::Lock();
+		NKern::Unlock();					// process the idle DFCs here
+		return;
+		}
+	if (ss.iCurrentThread->iSavedSP)
+		{
+		// rescheduled between entry to NKern::Idle() and here: go round again to look for threads to pull
+		__e32_atomic_ior_ord32(&s.iCpusNotIdle, m);
+		s.iIdleSpinLock.UnlockIrq();
+		return;
+		}
+	TUint32 arg = orig_cpus_not_idle & ~m;
+	if (arg == 0)
+		s.AllCpusIdle();
+	s.iIdleSpinLock.UnlockOnly();			// interrupts stay masked
+
+	__asm__ __volatile__("dsb sy\n\twfi" ::: "memory");	// a pending (masked) interrupt still wakes us
+
+	s.iIdleSpinLock.LockOnly();
+	TUint32 ci = __e32_atomic_ior_ord32(&s.iCpusNotIdle, m);
+	if (ci == 0)
+		s.FirstBackFromIdle();
+	s.iIdleSpinLock.UnlockIrq();			// re-enables interrupts: the wake-up interrupt is taken now
 	}

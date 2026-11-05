@@ -374,9 +374,33 @@ static char StatusTest[80] = "boot";
 static char StatusShown[96];				// what the bar shows: test name, plus the last failure site
 /* failure sites ("threadbasic.cpp:437") with counts, printed as a summary by __finish */
 struct SFailSite { char iWhere[40]; TUint32 iCount; char iTest[48]; char iMsg[64]; char iCase[48]; };
-static char LastLine[64];		// the TEST_RESULT message line printed just before "Line N File ..."
-static char LastCase[48];		// the last case header: "TT2: ...", "TiedEventTest ...", DoRWTest's "Type ..."
-static char LastDetail[64];		// DoRWTest's "F0 n F1 n ... F6 n" counts, shown instead of its bare "FAILED"
+/* What a failure line refers to, kept per printing thread (skmpar runs several DoRWTest cases at once):
+ *   iLine   the TEST_RESULT message line printed just before "Line N File ..."
+ *   iCase   the last case header: "TT2: ...", "TiedEventTest ...", DoRWTest's "Type ..."
+ *   iDetail DoRWTest's "F0 n F1 n ... F6 n" counts, shown instead of its bare "FAILED" */
+struct SCaseSlot { NThreadBase* iThread; char iLine[64]; char iCase[48]; char iDetail[64]; };
+static SCaseSlot CaseSlots[8];
+static TUint32 CaseSlotNext;
+static SCaseSlot& CaseSlot()				// the calling thread's slot; a new thread takes over the oldest
+	{
+	NThreadBase* t = NKern::CurrentThread();
+	for (TUint32 i = 0; i < sizeof(CaseSlots) / sizeof(CaseSlots[0]); ++i)
+		if (CaseSlots[i].iThread == t)
+			return CaseSlots[i];
+	SCaseSlot& c = CaseSlots[CaseSlotNext++ % (sizeof(CaseSlots) / sizeof(CaseSlots[0]))];
+	c.iThread = t; c.iLine[0] = c.iCase[0] = c.iDetail[0] = 0;
+	return c;
+	}
+
+/* per-test durations for __finish: each "Testing ..." headline (and "Tests Completed") with its start time */
+struct STestTime { char iName[48]; TUint32 iStartMs; };
+static STestTime TestTimes[64];
+static TInt TestTimeCount;
+static TUint32 NowMs()
+	{
+	TUint32 f = NKern::TimestampFrequency();
+	return f ? (TUint32)(NKern::Timestamp() * 1000 / f) : 0;
+	}
 
 static void CopyLine(char* aDst, TInt aMax, const char* s, TInt l)	// without the "c:NKTEST: " prefix
 	{
@@ -390,8 +414,9 @@ static void CopyLine(char* aDst, TInt aMax, const char* s, TInt l)	// without th
 static SFailSite FailSites[24];
 static TInt FailSiteCount;
 
-static void NoteFailure(const char* s, TInt l)	// s = "c:Line <n> File <path>/<name>"
+static void NoteFailure(const char* s, TInt l, SCaseSlot& aC)	// s = "c:Line <n> File <path>/<name>"
 	{
+	const char* LastCase = aC.iCase;
 	char where[40]; TInt w = 0;
 	const char* name = s; const char* line = 0;
 	for (TInt i = 0; i < l && s[i]; ++i)
@@ -418,7 +443,7 @@ static void NoteFailure(const char* s, TInt l)	// s = "c:Line <n> File <path>/<n
 		FailSites[i].iWhere[k] = 0;
 		for (k = 0; StatusTest[k] && k < 47; ++k) FailSites[i].iTest[k] = StatusTest[k];
 		FailSites[i].iTest[k] = 0;
-		const char* msg = LastDetail[0] ? LastDetail : LastLine;
+		const char* msg = aC.iDetail[0] ? aC.iDetail : aC.iLine;
 		for (k = 0; msg[k] && k < 63; ++k) FailSites[i].iMsg[k] = msg[k];
 		FailSites[i].iMsg[k] = 0;
 		for (k = 0; LastCase[k] && k < 47; ++k) FailSites[i].iCase[k] = LastCase[k];
@@ -463,15 +488,20 @@ static TBool Contains(const char* s, TInt l, const char* w)
 	return FALSE;
 	}
 
+static volatile TUint32 PrintLock;			// one line at a time across CPUs (skmpar prints from four)
+
 void DebugPrint(const char* s, int l)
 	{
 	TInt irq = NKern::DisableAllInterrupts();	// keep one line together across CPUs/interrupts
+	while (__e32_atomic_swp_acq32(&PrintLock, 1))
+		A64_PAUSE();
+	SCaseSlot& cs = CaseSlot();
 	++StatusLines;
 	static TUint32 pipeRounds;
 	if (Contains(s, l, "Line ") && Contains(s, l, " File "))
 		{
 		++StatusFails;
-		NoteFailure(s, l);
+		NoteFailure(s, l, cs);
 		}
 	else if (Contains(s, l, "waits out of"))		// fastbuf.cpp: 0x01000000 writes / 131072 per round = 128 rounds
 		{
@@ -485,18 +515,20 @@ void DebugPrint(const char* s, int l)
 		for (TInt j = 0; t[j]; ++j) StatusTest[k++] = t[j];
 		StatusTest[k] = 0;
 		}
-	else if (Contains(s, l, "TT2:") || Contains(s, l, "TiedEventTest") || (Contains(s, l, "Type ") && Contains(s, l, "ISEQ")))
+	else if (Contains(s, l, "TT2:") || Contains(s, l, "TiedEventTest") || (Contains(s, l, "Type ") && Contains(s, l, "ISEQ"))
+			|| Contains(s, l, "NKTEST: DFCTest") || Contains(s, l, "NKTEST: Mode "))
 		{
-		CopyLine(LastCase, sizeof(LastCase), s, l);
-		LastDetail[0] = 0;
+		CopyLine(cs.iCase, sizeof(cs.iCase), s, l);
+		cs.iDetail[0] = 0;
 		}
 	else if (Contains(s, l, "F0 ") && Contains(s, l, " F6 "))
 		{
-		CopyLine(LastDetail, sizeof(LastDetail), s, l);
+		char* d = cs.iDetail;
+		CopyLine(d, sizeof(cs.iDetail), s, l);
 		TInt w = 0;									// collapse the %6d padding so all seven counts fit one row
-		for (TInt r = 0; LastDetail[r]; ++r)
-			if (LastDetail[r] != ' ' || (w && LastDetail[w - 1] != ' ')) LastDetail[w++] = LastDetail[r];
-		LastDetail[w] = 0;
+		for (TInt r = 0; d[r]; ++r)
+			if (d[r] != ' ' || (w && d[w - 1] != ' ')) d[w++] = d[r];
+		d[w] = 0;
 		}
 	else if (Contains(s, l, "Testing") || Contains(s, l, "Tests Completed") || Contains(s, l, "Kill") || Contains(s, l, "Thread on CPU"))
 		{
@@ -506,14 +538,21 @@ void DebugPrint(const char* s, int l)
 		TInt k = 0;
 		while (k < n && k < (TInt)sizeof(StatusTest) - 1 && t[k] && t[k] != '\r' && t[k] != '\n') { StatusTest[k] = t[k]; ++k; }
 		StatusTest[k] = 0;
-		LastCase[0] = 0; LastDetail[0] = 0;					// a new test: the last case header belongs to the previous one
+		cs.iCase[0] = 0; cs.iDetail[0] = 0;					// a new test: the last case header belongs to the previous one
+		if ((Contains(s, l, "Testing") || Contains(s, l, "Tests Completed")) && TestTimeCount < (TInt)(sizeof(TestTimes) / sizeof(TestTimes[0])))
+			{
+			STestTime& tt = TestTimes[TestTimeCount++];
+			CopyLine(tt.iName, sizeof(tt.iName), s, l);
+			tt.iStartMs = NowMs();
+			}
 		}
 	if (!(Contains(s, l, "Line ") && Contains(s, l, " File ")))
-		CopyLine(LastLine, sizeof(LastLine), s, l);
+		CopyLine(cs.iLine, sizeof(cs.iLine), s, l);
 	while (l-- > 0 && *s) A64_DebugPutc(*s++);
 	A64_DebugPutc('\n');
 	TUint32 freq = NKern::TimestampFrequency();
 	A64_ConsoleStatus(StatusFails ? StatusShown : StatusTest, StatusLines, StatusFails, freq ? (TUint32)(NKern::Timestamp() / freq) : 0);
+	__e32_atomic_store_rel32(&PrintLock, 0);
 	NKern::RestoreInterrupts(irq);
 	}
 
@@ -527,8 +566,26 @@ TUint32 __trace_cpu_num()			{ return NKern::CurrentCpu(); }
 TUint64 fast_counter()				{ return NKern::Timestamp(); }
 TUint32 norm_fast_counter();		// below, after nfcfs
 
+static void PutDec(TUint32 v)
+	{
+	char d[12]; TInt i = 0;
+	do { d[i++] = (char)('0' + v % 10); v /= 10; } while (v);
+	while (i) { char c[2] = { d[--i], 0 }; A64_DebugPuts(c); }
+	}
+
 void __finish()
 	{
+	// where the time went: every headline that lasted >= 2 s (the last one runs until now)
+	TUint32 end = NowMs();
+	A64_DebugPuts("Time per test (>= 2 s):\n");
+	for (TInt i = 0; i < TestTimeCount; ++i)
+		{
+		TUint32 ms = (i + 1 < TestTimeCount ? TestTimes[i + 1].iStartMs : end) - TestTimes[i].iStartMs;
+		if (ms < 2000)
+			continue;
+		A64_DebugPuts("  "); PutDec(ms / 1000); A64_DebugPuts("s  "); A64_DebugPuts(TestTimes[i].iName); A64_DebugPuts("\n");
+		}
+	A64_DebugPuts("  total "); PutDec(TestTimeCount ? (end - TestTimes[0].iStartMs) / 1000 : 0); A64_DebugPuts("s\n");
 	A64_DebugPuts("EKA2/arm64: nkernsa finished, failures: ");
 	A64_DebugHex(StatusFails);
 	A64_DebugPuts("\n");

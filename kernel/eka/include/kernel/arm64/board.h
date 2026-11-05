@@ -15,6 +15,7 @@ extern const char* const A64_BoardName;
 extern const unsigned long A64_GicdBase, A64_GicrBase;		// GICv3 distributor, first redistributor
 extern const unsigned long A64_HeapBase, A64_HeapSize;		// RAM for the nanokernel test heap
 extern const int A64_PsciSmc;								// PSCI conduit: 1 = SMC, 0 = HVC
+extern const unsigned int A64_TimerPpi;					// EL1 virtual timer INTID (DTB arm,armv8-timer, 3rd entry + 16)
 unsigned int A64_CpuMpidr(int aCpu);						// PSCI target_cpu affinity of logical CPU aCpu
 }
 #endif

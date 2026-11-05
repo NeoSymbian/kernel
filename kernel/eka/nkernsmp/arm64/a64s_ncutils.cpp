@@ -63,18 +63,25 @@ extern "C" TUint32 A64_MpidrIndex(TUint32 aMpidr)	// SubSchedulerLookupTable ind
 	return ((aMpidr >> 4) & 0xF0) | (aMpidr & 0x0F);
 	}
 
-EXPORT_C TInt NKern::CurrentCpu()
+/* Before NKern::Init gives this CPU its pointer, only the boot CPU runs kernel code (KernelMain's early
+ * KPrintf calls NKern::CurrentThread): it is CPU 0, as the 2010 ARM bootstrap assumed by presetting TPIDRPRW
+ * to &TheSubSchedulers[0]. (Found on the Pixel: QEMU's flash at VA 0 had hidden the NULL dereference.) */
+static inline TSubScheduler* ThisSubScheduler()
 	{
 	TSubScheduler* ss = SubSchedulerFromTpidr();
 	if (!ss)
 		ss = SubSchedulerLookupTable[A64_MpidrIndex(A64_Mpidr())];
-	return ss ? (TInt)ss->iCpuNum : 0;
+	return ss ? ss : &TheSubSchedulers[0];
+	}
+
+EXPORT_C TInt NKern::CurrentCpu()
+	{
+	return (TInt)ThisSubScheduler()->iCpuNum;
 	}
 
 TSubScheduler& SubScheduler()
 	{
-	TSubScheduler* ss = SubSchedulerFromTpidr();
-	return ss ? *ss : *SubSchedulerLookupTable[A64_MpidrIndex(A64_Mpidr())];
+	return *ThisSubScheduler();
 	}
 
 /* --- Timestamp: the generic timer's virtual count (CNTVCT_EL0) at CNTFRQ_EL0 ------------------------------- */

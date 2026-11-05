@@ -38,4 +38,18 @@ static inline void A64_SendSgi(TUint32 aMpidr, TUint32 aIntId)
 static inline TUint32 A64_GicAck()			{ return (TUint32)A64_SYSREG_READ(S3_0_C12_C12_0); }	/* ICC_IAR1_EL1 */
 static inline void A64_GicEoi(TUint32 aIntId)	{ A64_SYSREG_WRITE(S3_0_C12_C12_1, aIntId); }		/* ICC_EOIR1_EL1 */
 
+/* Clean (and optionally invalidate) a VA range to the point of coherency: data another CPU will read with its
+ * MMU/caches still off (a secondary core's boot info) must be in RAM, not only in this core's cache. */
+static inline void A64_DCacheRange(TLinAddr aBase, TUint32 aSize, TBool aInvalidate)
+	{
+	TUint64 ctr = A64_SYSREG_READ(ctr_el0);
+	TUint32 line = 4u << ((ctr >> 16) & 0xF);				// DminLine
+	for (TLinAddr a = aBase & ~(TLinAddr)(line - 1); a < aBase + aSize; a += line)
+		{
+		if (aInvalidate)	__asm__ __volatile__("dc civac, %0" :: "r"((TUint64)a) : "memory");
+		else				__asm__ __volatile__("dc cvac, %0" :: "r"((TUint64)a) : "memory");
+		}
+	__asm__ __volatile__("dsb sy" ::: "memory");
+	}
+
 #endif

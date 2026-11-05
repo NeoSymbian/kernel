@@ -19,7 +19,6 @@ extern "C" void run_event_handlers(TSubScheduler* aS);	// nkernsmp/nk_irq.cpp
 extern "C" void send_resched_ipis(TUint32 aMask);
 TSubScheduler& SubScheduler();
 
-static const TUint32 KTimerPpi = TIMESLICE_VECTOR;		// 27: CNTV, the per-CPU tick
 static const TInt KTickUs = 1000;						// 1 ms nanokernel tick
 
 /* ======================================================================================================
@@ -28,6 +27,7 @@ static const TInt KTickUs = 1000;						// 1 ms nanokernel tick
 extern "C" { volatile int A64_BrkSeen; }
 static TUint64 TimerReload;
 static volatile TBool TimerQReady;
+static volatile TUint32 TickCount;		// CPU 0 ticks, for the boot-time tick self-check
 
 static void TimerArm()
 	{
@@ -37,6 +37,8 @@ static void TimerArm()
 
 static void SystemTick(TSubScheduler& aSS)
 	{
+	if (aSS.iCpuNum == 0)
+		++TickCount;
 	if (aSS.iCpuNum == 0 && TimerQReady)
 		TheTimerQ.Tick();					// the nanokernel millisecond tick (may queue the timer DFC)
 	NThreadBase* t = aSS.iCurrentThread;
@@ -55,7 +57,7 @@ static void Irq()
 		if (id >= 1020)
 			break;							// nothing (more) pending
 		Gicv3_Eoi(id);						// EOI first: a reschedule below may not return for a long time
-		if (id == KTimerPpi)
+		if (id == A64_TimerPpi)
 			{ TimerArm(); SystemTick(ss); }
 		else if (id == RESCHED_IPI_VECTOR)
 			ss.iRescheduleNeededFlag = TRUE;
@@ -109,7 +111,7 @@ static void InitThisCpuGic()		// this CPU's redistributor: IPIs (SGI 0-7) and th
 		{ A64_DebugPuts("*** GICv3: no redistributor for this CPU\n"); return; }
 	for (TUint32 i = 0; i < 8; ++i)
 		Gicv3_EnablePpiSgi(sgi, i, 0x80);
-	Gicv3_EnablePpiSgi(sgi, KTimerPpi, 0xA0);
+	Gicv3_EnablePpiSgi(sgi, A64_TimerPpi, 0xA0);
 	}
 
 extern "C" void Hw_Init1()
@@ -165,7 +167,10 @@ extern "C" void Hw_InitAPs()
 		info->iInitStackBase = (TLinAddr)stack;
 		info->iInitStackSize = KApStack;
 		info->iArgs[0] = t;
-		__e32_memory_barrier();
+		// the AP reads its boot info, and pushes onto its stack, with MMU and caches OFF: put the info in RAM
+		// and evict the stack from this core's cache (a dirty line written back later would corrupt it)
+		A64_DCacheRange((TLinAddr)info, sizeof(*info), FALSE);
+		A64_DCacheRange((TLinAddr)stack, KApStack, TRUE);
 		TInt r = PsciCpuOn(A64_CpuMpidr(cpu), (TLinAddr)&A64_ApEntry, (TLinAddr)info);
 		if (r != 0)
 			{
@@ -185,6 +190,16 @@ extern "C" void Hw_Init3()
 	{
 	TimerQReady = TRUE;
 	StartSystemTimer();
+	// self-check: 20 ms of busy-wait must see ticks, or every NKern::Sleep() hangs (wrong timer PPI, GIC setup)
+	TUint32 t0 = TickCount;
+	TUint64 c0 = fast_counter(), wait = (TUint64)NKern::TimestampFrequency() / 50;
+	while (fast_counter() - c0 < wait) {}
+	TUint32 n = TickCount - t0;
+	if (n)
+		KPrintf("tick ok: %d ticks in 20 ms (timer PPI %d)", n, A64_TimerPpi);
+	else
+		KPrintf("NO TICKS on timer PPI %d: cntv_ctl=%x daif=%x", A64_TimerPpi,
+				(TUint32)A64_SYSREG_READ(cntv_ctl_el0), (TUint32)A64_SYSREG_READ(daif));
 	}
 
 /* ======================================================================================================

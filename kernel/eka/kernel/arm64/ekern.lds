@@ -55,6 +55,8 @@ SECTIONS
 		__code_base = .;
 		*(.text.entry)				/* _E32Startup first */
 		*(.text .text.*)
+		. = ALIGN(16);
+		*(.utext)					/* AArch32 EL0 code, XIP (the ROM is user-readable and -executable) */
 		} >ROMV
 	.rodata ALIGN(32) : AT(__rom_phys + (ADDR(.rodata) - __rom_lin))
 		{

@@ -46,14 +46,26 @@ I=$OUT/img
 # the bootstrap runs with the MMU off: no unaligned accesses, and no calls a loop could turn into memset/memcpy
 $EKXX $DEFS $INCS $PRE $BDEF -mstrict-align -fno-tree-loop-distribute-patterns -c "$HERE/boot/a64boot.cpp" -o "$I/a64boot.o"
 $EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_variant.cpp" -o "$I/a64_variant.o"
+# the real exstart (starts the ROM secondary), statically linked: only its entry points are renamed
+$EKXX $DEFS $INCS $PRE -DKernelModuleEntry=A64ExstartEntry -DInitExtension=A64ExstartInit \
+	-c "$EKA/kernel/exstart.cpp" -o "$I/exstart.o"
+# the AArch32 EL0 test program (the secondary for now): exec numbers from the generated exec_enum.h, assembled for
+# the 2010 user side's ISA, flattened, and carried in the ROM's .utext
+sed -n 's/^[[:space:]]*\(E[A-Za-z0-9_]*\) = \([0-9]*\),*$/	.equ \1, \2/p' "$C/kinc/kernel/exec_enum.h" > "$I/exec_enum.inc"
+grep -q "EExecDebugPrint" "$I/exec_enum.inc" || { echo "exec_enum.inc: no exec numbers"; exit 1; }
+arm-none-eabi-as -march=armv5te -I "$I" "$HERE/boot/a32test.S" -o "$I/a32test.a32"
+arm-none-eabi-objcopy -O binary "$I/a32test.a32" "$I/a32test.bin"
+printf '\t.section .utext, "ax"\n\t.balign 16\n\t.global A32Test, A32TestEnd\nA32Test:\n\t.incbin "%s"\nA32TestEnd:\n' \
+	"$I/a32test.bin" > "$I/a32test_rom.S"
 $AS $BDEF -DA64_EKERN "$HERE/boot/boot.S" -o "$I/boot.o"
 $AS "$HERE/boot/vectors.S" -o "$I/vectors.o"
+$AS "$I/a32test_rom.S" -o "$I/a32test_rom.o"
 [ "$BOARD" = bonito ] && python3 "$HERE/tools/mkfont.py" "$I/font.h" >/dev/null
 $PLAIN -I "$I" -c "$HERE/board/$BOARD_SRC" -o "$I/board.o"
 $PLAIN -c "$HERE/board/gicv3.cpp" -o "$I/gicv3.o"
 $PLAIN -c "$HERE/board/console_io.cpp" -o "$I/console_io.o"
 # the boot stub may reach the ROM only by address, never by a call
-bad=$(${X}nm -u "$I/a64boot.o" | awk '{print $2}' | grep -vE '^(_start|_E32Startup|A64VariantEntry|A64VariantInitialise|A64ExtensionEntry|A64_IoRegions|A64_IoRegionCount|__(rom|code|data|svdata)_[a-z]*)$' || true)
+bad=$(${X}nm -u "$I/a64boot.o" | awk '{print $2}' | grep -vE '^(_start|_E32Startup|A64VariantEntry|A64VariantInitialise|A64ExtensionEntry|A64ExstartShim|A32Test|A32TestEnd|A64_IoRegions|A64_IoRegionCount|__(rom|code|data|svdata)_[a-z]*)$' || true)
 [ -z "$bad" ] || { echo "a64boot.o calls outside the boot stub: $bad"; exit 1; }
 
 # 3. link at the native addresses

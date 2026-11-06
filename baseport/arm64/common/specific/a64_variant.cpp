@@ -203,3 +203,16 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	Kern::Printf("[probe] Kern::ThreadCreate -> %d", r);
 	return KErrNone;
 	}
+
+// The real exstart (kernel/exstart.cpp, KernelModuleEntry renamed by build-ekern.sh) starts the ROM's secondary
+// process. Linked statically, its global `TDfc StartSecondaryDfc(.., Kern::SvMsgQue(), ..)` was constructed by
+// _E32Startup's constructor walk, before the supervisor message queue existed, so it holds a NULL queue: bind it at
+// the moment a real extension's constructors would have run (Phorepoc's X64ExstartShim).
+TInt A64ExstartEntry(TInt aReason);
+extern TDfc StartSecondaryDfc;
+extern "C" TInt A64ExstartShim(TInt aReason)
+	{
+	if (aReason == KModuleEntryReasonExtensionInit1)
+		StartSecondaryDfc.SetDfcQ(Kern::SvMsgQue());
+	return A64ExstartEntry(aReason);
+	}

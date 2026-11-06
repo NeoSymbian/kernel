@@ -36,6 +36,8 @@ void _E32Startup(TLinAddr aRomHeader, TLinAddr aSuperPage);	// ROM: ekern/a64e_e
 TInt A64VariantEntry(TInt aReason);								// ROM: board/a64_variant.cpp
 TAny* A64VariantInitialise(TInt aMode);
 TInt A64ExtensionEntry(TInt aReason);
+TInt A64ExstartShim(TInt aReason);								// ROM: board/a64_variant.cpp -> kernel/exstart.cpp
+extern char A32Test[], A32TestEnd[];							// ROM .utext: boot/a32test.S, AArch32 EL0 code
 }
 #define SYMVAL(s)	((TUint32)(TLinAddr)(s))
 
@@ -245,6 +247,10 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 		TUint32				iVariantExports[1];
 		TRomEntry			iExtensionEntry; TUint8 iPad4[32];
 		TRomImageHeader		iExtension;
+		TRomEntry			iExstartEntry;	TUint8 iPad5[32];
+		TRomImageHeader		iExstart;
+		TRomEntry			iSecondaryEntry; TUint8 iPad6[32];
+		TRomImageHeader		iSecondary;
 		TRomRootDirectoryList iRootList;
 		TRomDir				iRootDir;		TUint8 iPad3[32];
 		};
@@ -268,7 +274,6 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	rh.iPrimaryFile = REC_LIN(iPrimaryEntry);
 	rh.iVariantFile = REC_LIN(iVariantEntry);
 	rh.iExtensionFile = REC_LIN(iExtensionEntry);
-	rh.iSecondaryFile = 0;										// shortcut: no user side yet (M4.4)
 	rh.iUserDataAddress = KUserLocalDataEnd;
 	rh.iKernelConfigFlags = 0;
 
@@ -315,6 +320,37 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	rec.iExtensionEntry.iAddressLin = REC_LIN(iExtension);
 	rec.iExtensionEntry.iNameLength = 4;
 	{ const char* n = "xext"; for (TInt i = 0; i < 4; ++i) rec.iExtensionEntry.iName[i << 1] = (TUint8)n[i]; }
+	x.iNextExtension = REC_LIN(iExstartEntry);
+
+	// the second extension is the real exstart (kernel/exstart.cpp, linked in): it starts the ROM's secondary process
+	TRomImageHeader& xs = rec.iExstart;
+	xs.iUid1 = 0x10000079u;
+	xs.iEntryPoint = SYMVAL(A64ExstartShim);
+	xs.iFlags = KRomImageFlagExtension;
+	xs.iS.iCaps[0] = 0xFFFFFFFFu;  xs.iS.iCaps[1] = 0xFFFFFFFFu;
+	xs.iHardwareVariant = 0x01000000u;
+	rec.iExstartEntry.iAddressLin = REC_LIN(iExstart);
+	rec.iExstartEntry.iNameLength = 7;
+	{ const char* n = "exstart"; for (TInt i = 0; i < 7; ++i) rec.iExstartEntry.iName[i << 1] = (TUint8)n[i]; }
+
+	// the secondary (efile.exe's slot): for now the AArch32 EL0 test program, XIP from the ROM's .utext. No data/bss,
+	// no imports; exstart creates the process from this header (Epoc::RomProcessInfo) and resumes it.
+	TRomImageHeader& u = rec.iSecondary;
+	u.iUid1 = 0x1000007Au;										// EXE
+	u.iEntryPoint = SYMVAL(A32Test);
+	u.iCodeAddress = SYMVAL(A32Test);
+	u.iCodeSize = u.iTextSize = SYMVAL(A32TestEnd) - SYMVAL(A32Test);
+	u.iDataBssLinearBase = KUserLocalDataBase;
+	u.iHeapSizeMin = 0x1000;  u.iHeapSizeMax = 0x100000;  u.iStackSize = 0x2000;
+	u.iPriority = EPriorityHigh;
+	u.iFlags = KRomImageEpt_Eka2;								// CHECK_ROM_ENTRY_POINT: an EKA2 entry point
+	u.iS.iCaps[0] = 0xFFFFFFFFu;  u.iS.iCaps[1] = 0xFFFFFFFFu;
+	u.iHardwareVariant = 0x01000000u;
+	rec.iSecondaryEntry.iSize = u.iCodeSize;
+	rec.iSecondaryEntry.iAddressLin = REC_LIN(iSecondary);
+	rec.iSecondaryEntry.iNameLength = 9;
+	{ const char* n = "efile.exe"; for (TInt i = 0; i < 9; ++i) rec.iSecondaryEntry.iName[i << 1] = (TUint8)n[i]; }
+	rh.iSecondaryFile = REC_LIN(iSecondaryEntry);
 
 	// an empty Z: root directory (iSize counts the TRomEntry region: 0 entries -> 0)
 	rec.iRootList.iNumRootDirs = 1;
@@ -363,7 +399,9 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	TUint64 sctlr;
 	__asm__ __volatile__("mrs %0, sctlr_el1" : "=r"(sctlr));
 	sctlr |= (1u << 0) | (1u << 2) | (1u << 12) | (1u << 23);	// M, C, I; SPAN: exceptions leave PSTATE.PAN alone
+	sctlr |= (1u << 5);											// CP15BEN: AArch32 EL0 may use the ARMv6 CP15 barriers
 	sctlr &= ~(TUint64)((1u << 1) | (1u << 19) | (1u << 25));	// no alignment checks, no WXN, little-endian EL1
+	sctlr &= ~(TUint64)((1u << 7) | (1u << 8));					// ITD, SED: AArch32 EL0 keeps IT and SETEND
 	__asm__ __volatile__(
 		"msr	pan, #0\n\t"
 		"msr	mair_el1, %0\n\t"

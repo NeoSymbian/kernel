@@ -81,6 +81,8 @@ __attribute__((weak)) void A64BlkDump() {}
 __attribute__((weak)) void A64KeysDump() {}
 __attribute__((weak)) void A64_RebootToFastboot() { Say("fastboot: not on this board"); }
 __attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
+__attribute__((weak)) void A64_WatchdogBite(TInt) { Say("wdt: not on this board"); }
+__attribute__((weak)) TInt A64BlkDev_Probe() { return KErrNotSupported; }
 __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
 __attribute__((weak)) int Spmi_Write(unsigned, unsigned, unsigned) { return KErrNotSupported; }
@@ -134,7 +136,13 @@ const TInt KMaxArgs = 6;
 static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 	{
 	static TUint8 s[KA64BlkSector];
-	if (aArgc >= 2 && Eq(aArg[1], "info"))
+	if (aArgc >= 2 && Eq(aArg[1], "init"))					// bring the device up now (Pixel: the eMMC)
+		{
+		TInt r = KErrNone, x;
+		XTRAP(x, XT_DEFAULT, r = A64BlkDev_Probe());		// an aborting register shows as -38, not a crash
+		Say("blk init -> %d (trap %d; see 'log' for the steps)", r, x);
+		}
+	else if (aArgc >= 2 && Eq(aArg[1], "info"))
 		{
 		A64BlkDump();
 		Say("window: %d sectors", (TInt)A64Blk_Sectors());
@@ -188,7 +196,7 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 			}
 		}
 	else
-		Say("blk info | blk gpt | blk read <lba> [n]");
+		Say("blk init | blk info | blk gpt | blk read <lba> [n]");
 	}
 
 static void Post(TRawEvent::TType aType, TInt aX, TInt aY)
@@ -238,7 +246,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log peek poke spmi blk touch keys threads usb tap swipe key shot reboot fastboot");
+		Say("help log peek poke spmi blk touch keys threads usb tap swipe key shot reboot fastboot wdt");
 	else if (Eq(c, "log"))
 		{
 		TUint32 pos = 0;
@@ -253,8 +261,14 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 			{
 			TUint32 a = (TUint32)num[1] + 4 * i;
 			TLinAddr l = Map(a);
+			TUint32 v = 0;
+			TInt x = KErrNone;
 			if (l)
-				Say("%08x: %08x", a, *(volatile TUint32*)l);
+				XTRAP(x, XT_DEFAULT, v = *(volatile TUint32*)l);	// a register can answer with an abort
+			if (l && x)
+				Say("%08x: abort (%d)", a, x);
+			else if (l)
+				Say("%08x: %08x", a, v);
 			else
 				Say("%08x: not mapped", a);
 			}
@@ -262,11 +276,12 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	else if (Eq(c, "poke") && argc >= 3)
 		{
 		TLinAddr l = Map((TUint32)num[1]);
+		TUint32 v = 0;
+		TInt x = KErrNone;
 		if (l)
-			{
-			*(volatile TUint32*)l = (TUint32)num[2];
-			Say("%08x <- %08x, reads %08x", (TUint32)num[1], (TUint32)num[2], *(volatile TUint32*)l);
-			}
+			XTRAP(x, XT_DEFAULT, *(volatile TUint32*)l = (TUint32)num[2]; v = *(volatile TUint32*)l);
+		if (l)
+			Say("%08x <- %08x, reads %08x (trap %d)", (TUint32)num[1], (TUint32)num[2], v, x);
 		}
 	else if (Eq(c, "spmi") && argc >= 4 && Eq(arg[1], "r"))
 		Say("spmi %d:%04x = %d (0x%02x)", (TInt)num[2], (TInt)num[3], Spmi_Read((TUint)num[2], (TUint)num[3]),
@@ -307,6 +322,11 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		NKern::Sleep(NKern::TimerTicks(30));
 		e.Set(TRawEvent::EKeyUp, (TInt)num[1]);
 		Kern::AddEvent(e);
+		}
+	else if (Eq(c, "wdt"))
+		{
+		Say("watchdog bite in 1 s");
+		A64_WatchdogBite(1000);
 		}
 	else if (Eq(c, "usb"))
 		{

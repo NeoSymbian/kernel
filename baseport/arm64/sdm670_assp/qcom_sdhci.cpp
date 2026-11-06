@@ -15,15 +15,15 @@
 const TUint32 KHc = 0x007c4000, KCqhci = 0x007c5000;
 enum
 	{
-	EBlockSizeCount = 0x04, EArgument = 0x08, EModeCommand = 0x0c, EResponse0 = 0x10, EBuffer = 0x20,
+	ESdmaAddr = 0x00, EBlockSizeCount = 0x04, EArgument = 0x08, EModeCommand = 0x0c, EResponse0 = 0x10, EBuffer = 0x20,
 	EPresentState = 0x24, EHostCtrl1 = 0x28, EClockCtrl = 0x2c, EIntStatus = 0x30, EIntStatusEn = 0x34,
 	ECaps = 0x40, ESlotVersion = 0xfc,
 	};
-enum { EPsCmdInhibit = 1 << 0, EPsDatInhibit = 1 << 1 };
+enum { EPsCmdInhibit = 1 << 0, EPsDatInhibit = 1 << 1, EPsBufWrEn = 1 << 10, EPsBufRdEn = 1 << 11 };
 enum { EIntCmd = 1 << 0, EIntXfer = 1 << 1, EIntBufWr = 1 << 4, EIntBufRd = 1 << 5, EIntErr = 1 << 15 };
-enum { EModeCount = 1 << 1, EModeAutoCmd12 = 1 << 2, EModeRead = 1 << 4, EModeMulti = 1 << 5 };
+enum { EModeDma = 1 << 0, EModeCount = 1 << 1, EModeAutoCmd12 = 1 << 2, EModeRead = 1 << 4, EModeMulti = 1 << 5 };
 enum { ERespR1 = 0x1a, ERespR1Data = 0x3a };			// 48-bit response, CRC + index check (+ data present)
-const TInt KSpin = 20000000;
+const TInt KSpin = 2000000;							// ~0.2 s of register reads: fail fast, never stall boot
 
 #ifdef A64_EMMC_C
 const TBool KWritable = ETrue;
@@ -33,16 +33,36 @@ const TBool KWritable = EFalse;
 
 static TUint32 Rca;
 static TUint64 Sectors;
-static TBuf8<100> Report[8];
+// data moves by SDMA through a bounce buffer: this host's PIO data port never drains (found on the phone; Linux
+// sdhci-msm only ever uses DMA). The SDHC sits behind the SMMU, which passes unconfigured streams through.
+const TInt KDmaMax = 128;								// sectors per transfer: 64 KB, inside one 512 KB boundary
+static TPhysAddr DmaPhys;
+static TUint8* DmaBuf;
+static TBuf8<200> Report[24];
 static TInt NReport;
 
 static volatile TUint32& R(TUint32 aOff) { return *(volatile TUint32*)(A64_Io(KHc) + aOff); }
+// this host answers 8- and 16-bit accesses with an asynchronous SError (found on the phone): sub-word registers are
+// read-modify-written through their 32-bit word
+static TUint32 Get(TUint32 aOff, TInt aBits) { return (R(aOff & ~3u) >> ((aOff & 3) * 8)) & ((1u << aBits) - 1); }
+static void Set(TUint32 aOff, TInt aBits, TUint32 aVal)
+	{
+	TUint32 sh = (aOff & 3) * 8, mask = ((1u << aBits) - 1) << sh;
+	R(aOff & ~3u) = (R(aOff & ~3u) & ~mask) | ((aVal << sh) & mask);
+	}
+
+// sdhci-msm v5 (Linux sdhci-msm.c sdhci_msm_v5_offset): the vendor register and the power-control handshake
+enum { EVendorSpec = 0x20c, EPwrStatus = 0x240, EPwrMask = 0x244, EPwrClear = 0x248, EPwrCtl = 0x24c };
+enum { EPowerCtrl = 0x29, ETimeoutCtrl = 0x2e, EHostCtrl2 = 0x3e };
+const TUint32 KGcc = 0x00100000;
+enum { ESdcc1Apps = 0x26004, ESdcc1Ahb = 0x26008, ESdcc1RcgCmd = 0x26028, ESdcc1RcgCfg = 0x2602c };
+static volatile TUint32& Gcc(TUint32 aOff) { return *(volatile TUint32*)A64_Io(KGcc + aOff); }	// only its pages are mapped
 
 static void Log(const char* aFmt, ...)
 	{
 	VA_LIST list;
 	VA_START(list, aFmt);
-	TBuf8<100> b;
+	TBuf8<200> b;
 	Kern::AppendFormat(b, aFmt, list);
 	VA_END(list);
 	Kern::Printf("[emmc] %S", &b);
@@ -62,6 +82,14 @@ static TBool WaitClear(TUint32 aOff, TUint32 aMask)
 		if (!(R(aOff) & aMask))
 			return ETrue;
 	return EFalse;
+	}
+
+static TInt WaitSet(TUint32 aOff, TUint32 aMask)
+	{
+	for (TInt i = 0; i < KSpin; ++i)
+		if (R(aOff) & aMask)
+			return KErrNone;
+	return KErrTimedOut;
 	}
 
 // the interrupt status bit aBit (or an error): KErrNone, KErrTimedOut or the error status in the upper half
@@ -86,9 +114,8 @@ static TInt WaitInt(TUint32 aBit)
 
 static void ResetLines()									// after an error: reset the CMD and DAT circuits
 	{
-	volatile TUint8* reset = (volatile TUint8*)(A64_Io(KHc) + EClockCtrl + 3);
-	*reset = 0x06;
-	for (TInt i = 0; i < KSpin && (*reset & 0x06); ++i)
+	Set(EClockCtrl + 3, 8, 0x06);						// SOFTWARE_RESET: CMD and DAT
+	for (TInt i = 0; i < KSpin && (Get(EClockCtrl + 3, 8) & 0x06); ++i)
 		{}
 	R(EIntStatus) = 0xffffffff;
 	}
@@ -100,7 +127,8 @@ static TInt Command(TUint aIndex, TUint32 aArg, TUint32 aFlags, TUint32 aMode = 
 		return KErrNotReady;
 	R(EIntStatus) = 0xffffffff;
 	if (aBlocks)
-		R(EBlockSizeCount) = (aBlocks << 16) | KA64BlkSector;
+		R(EBlockSizeCount) = (aBlocks << 16) | (7u << 12) | KA64BlkSector;	// SDMA boundary 512 KB
+		R(ESdmaAddr) = DmaPhys;
 	R(EArgument) = aArg;
 	R(EModeCommand) = (aIndex << 24) | (aFlags << 16) | aMode;	// the command half triggers it
 	TInt r = WaitInt(EIntCmd);
@@ -109,21 +137,27 @@ static TInt Command(TUint aIndex, TUint32 aArg, TUint32 aFlags, TUint32 aMode = 
 	return r;
 	}
 
+// one SDMA transfer of aCount (<= KDmaMax) blocks between the card and DmaBuf
+static TInt Transfer(TUint aCmd, TUint32 aArg, TInt aCount, TBool aRead)
+	{
+	TUint32 mode = EModeDma | (aRead ? EModeRead : 0) | (aCount > 1 ? EModeMulti | EModeCount | EModeAutoCmd12 : 0);
+	TInt r = Command(aCmd, aArg, ERespR1Data, mode, aCount);
+	if (r == KErrNone)
+		r = WaitInt(EIntXfer);							// all data moved (a write: and the card's busy time)
+	if (r != KErrNone)
+		{
+		Log("CMD%d x%d failed: %d, int %08x present %08x resp %08x", aCmd, aCount, r, R(EIntStatus),
+			R(EPresentState), R(EResponse0));
+		ResetLines();
+		}
+	return r;
+	}
+
 static TInt ReadBlocks(TUint aCmd, TUint32 aArg, TInt aCount, TUint8* aBuf)
 	{
-	TUint32 mode = EModeRead | (aCount > 1 ? EModeMulti | EModeCount | EModeAutoCmd12 : 0);
-	TInt r = Command(aCmd, aArg, ERespR1Data, mode, aCount);
-	for (TInt b = 0; r == KErrNone && b < aCount; ++b)
-		{
-		r = WaitInt(EIntBufRd);
-		TUint32* w = (TUint32*)(aBuf + b * KA64BlkSector);
-		for (TInt i = 0; r == KErrNone && i < KA64BlkSector / 4; ++i)
-			w[i] = R(EBuffer);
-		}
+	TInt r = Transfer(aCmd, aArg, aCount, ETrue);
 	if (r == KErrNone)
-		r = WaitInt(EIntXfer);
-	if (r != KErrNone)
-		ResetLines();
+		memcpy(aBuf, DmaBuf, aCount * KA64BlkSector);
 	return r;
 	}
 
@@ -131,7 +165,15 @@ TInt A64BlkDev_Read(TUint64 aLba, TInt aCount, TUint8* aBuf)
 	{
 	if (!Rca || aLba + aCount > Sectors)
 		return KErrArgument;
-	return ReadBlocks(aCount > 1 ? 18 : 17, (TUint32)aLba, aCount, aBuf);	// sector addressing (> 2 GB)
+	for (TInt done = 0; done < aCount; )
+		{
+		TInt n = Min(aCount - done, KDmaMax);
+		TInt r = ReadBlocks(n > 1 ? 18 : 17, (TUint32)(aLba + done), n, aBuf + done * KA64BlkSector);	// sector addressing
+		if (r != KErrNone)
+			return r;
+		done += n;
+		}
+	return KErrNone;
 	}
 
 TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
@@ -140,44 +182,161 @@ TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
 		return KErrAccessDenied;
 	if (!Rca || aLba + aCount > Sectors)
 		return KErrArgument;
-	TUint32 mode = aCount > 1 ? EModeMulti | EModeCount | EModeAutoCmd12 : 0;
-	TInt r = Command(aCount > 1 ? 25 : 24, (TUint32)aLba, ERespR1Data, mode, aCount);
-	for (TInt b = 0; r == KErrNone && b < aCount; ++b)
+	for (TInt done = 0; done < aCount; )
 		{
-		r = WaitInt(EIntBufWr);
-		const TUint32* w = (const TUint32*)(aBuf + b * KA64BlkSector);
-		for (TInt i = 0; r == KErrNone && i < KA64BlkSector / 4; ++i)
-			R(EBuffer) = w[i];
+		TInt n = Min(aCount - done, KDmaMax);
+		memcpy(DmaBuf, aBuf + done * KA64BlkSector, n * KA64BlkSector);
+		TInt r = Transfer(n > 1 ? 25 : 24, (TUint32)(aLba + done), n, EFalse);
+		if (r != KErrNone)
+			return r;
+		done += n;
 		}
+	return KErrNone;
+	}
+
+// msm raises a power interrupt for each bus/IO power change and holds it until the driver acks; there are no
+// regulator calls to make here (RPMh keeps the eMMC supplies on), so ack success, as sdhci_msm_handle_pwr_irq does
+static TUint32 PwrAck()
+	{
+	TUint32 st = 0;
+	for (TInt i = 0; i < 200 && !st; ++i)
+		{
+		st = R(EPwrStatus);
+		if (!st)
+			NKern::Sleep(NKern::TimerTicks(1));
+		}
+	if (st)
+		{
+		R(EPwrClear) = st;
+		R(EPwrCtl) = ((st & 3) ? 1u : 0) | ((st & 0xc) ? 4u : 0);	// BUS_SUCCESS, IO_SUCCESS
+		}
+	return st;
+	}
+
+// SD clock = 19.2 MHz (XO, the GCC root) / (2 * aDiv), aDiv 0 = undivided
+static void SdClock(TUint aDiv)
+	{
+	Set(EClockCtrl, 16, 0);
+	Set(EClockCtrl, 16, ((aDiv & 0xff) << 8) | ((aDiv >> 8) << 6) | 1);	// internal clock on
+	for (TInt i = 0; i < KSpin && !(Get(EClockCtrl, 16) & 2); ++i)
+		{}
+	Set(EClockCtrl, 16, Get(EClockCtrl, 16) | 4);			// card clock on
+	}
+
+// ABL powers the host down before it starts a kernel (bus power off, card clock off, 1-bit): bring the card up
+// again from scratch -- CMD0 also undoes any HS200/HS400 timing the card was left in -- at a legacy 19.2 MHz
+// the core (apps) clock first: ABL switched it off, and the msm vendor registers hang the bus without it
+static void ClocksOn()
+	{
+	Gcc(ESdcc1RcgCfg) = 1;									// source 0 = XO, pre-divider 1 (encoded 2*1-1)
+	Gcc(ESdcc1RcgCmd) |= 1;
+	for (TInt i = 0; i < KSpin && (Gcc(ESdcc1RcgCmd) & 1); ++i)
+		{}
+	Gcc(ESdcc1Ahb) |= 1;
+	Gcc(ESdcc1Apps) |= 1;
+	for (TInt i = 0; i < KSpin && ((Gcc(ESdcc1Apps) | Gcc(ESdcc1Ahb)) & (1u << 31)); ++i)	// CLK_OFF clears
+		{}
+	}
+
+static TInt Reinit()
+	{
+	// as Linux at probe: reset the whole SDHCI core (ABL leaves HS400 state behind), the vendor register to its
+	// power-on value with the I/O pads switchable, then bus power and 1.8 V signalling, each acked (sdhci-msm.c)
+	Log("step: reset all");
+	R(EPwrMask) = 0xf;
+	Set(EClockCtrl + 3, 8, 0x01);							// SOFTWARE_RESET_ALL
+	for (TInt i = 0; i < KSpin && (Get(EClockCtrl + 3, 8) & 1); ++i)
+		{}
+	TUint32 pwrOff = R(EPwrStatus) ? PwrAck() : 0;
+	R(EVendorSpec) = 0xa9c | (1u << 15) | (1u << 16);		// POR value + IO_PAD_PWR_SWITCH_EN + 1.8 V pads
+	R(EIntStatusEn) = 0xffff0033;							// the reset cleared the status enables
+	R(EPwrMask) = 0xf;
+	Log("step: power (reset pwr irq %x)", pwrOff);
+	Set(EPowerCtrl, 8, 0x0b);									// bus power on, 1.8 V
+	TUint32 pwr = PwrAck();
+	Set(EHostCtrl2, 16, 1u << 3);							// 1.8 V signalling: msm switches the pads (IO_LOW)
+	pwr |= PwrAck() << 8;
+	Log("step: clock 400k (pwr irq %x)", pwr);
+	SdClock(24);											// 400 kHz for identification
+	Set(ETimeoutCtrl, 8, 0x0e);
+	Set(EHostCtrl1, 8, 0);										// 1-bit, SDR
+	NKern::Sleep(NKern::TimerTicks(2));
+	Log("step: cmd0");
+	Command(0, 0, 0);										// GO_IDLE_STATE (no response)
+	NKern::Sleep(NKern::TimerTicks(2));
+	TUint32 ocr = 0;
+	for (TInt i = 0; i < 1000 && !(ocr & 0x80000000u); ++i)	// SEND_OP_COND: sector mode, 1.8 V + 2.7-3.6 V
+		{
+		if (Command(1, 0x40ff8080, 0x02) == KErrNone)
+			ocr = R(EResponse0);
+		if (!(ocr & 0x80000000u))
+			NKern::Sleep(NKern::TimerTicks(1));
+		}
+	TInt r2 = (ocr & 0x80000000u) ? Command(2, 0, 0x09) : KErrNotReady;	// ALL_SEND_CID (R2)
+	TInt r3 = r2 == KErrNone ? Command(3, 1 << 16, ERespR1) : r2;		// SET_RELATIVE_ADDR = 1
+	if (r3 == KErrNone)
+		SdClock(0);											// identification done: 19.2 MHz
+	TInt r7 = r3 == KErrNone ? Command(7, 1 << 16, 0x1b) : r3;			// SELECT_CARD (R1b)
+	if (r7 == KErrNone)
+		WaitInt(EIntXfer);									// the card's busy time
+	TInt r13 = r7 == KErrNone ? Command(13, 1 << 16, ERespR1) : r7;
+	TUint32 state = (R(EResponse0) >> 9) & 0xf;
+	Log("reinit: pwr irq %x, ocr %08x, cid %d, rca %d, select %d, status %d state %d", pwr, ocr, r2, r3, r7, r13,
+		state);
+	if (r13 != KErrNone || state != 4)
+		return KErrNotReady;
+	Rca = 1;
+	return KErrNone;
+	}
+
+static TInt DoInit(TUint64& aSectors);
+
+// at boot only in the EMMC_C build; else the monitor's "blk init" (a hang then stops only the console's thread)
+TInt A64BlkDev_Init(TUint64& aSectors)
+	{
+	if (!KWritable)
+		return KErrNotSupported;
+	return DoInit(aSectors);
+	}
+
+TInt A64BlkDev_Probe()
+	{
+	TUint64 sectors = 0, first = 0, count = 0;
+	TInt r = DoInit(sectors);
 	if (r == KErrNone)
-		r = WaitInt(EIntXfer);							// includes the card's busy time after the last block
-	if (r != KErrNone)
-		ResetLines();
+		r = A64BlkBoard_Window(sectors, first, count);
 	return r;
 	}
 
-TInt A64BlkDev_Init(TUint64& aSectors)
+static TInt DoInit(TUint64& aSectors)
 	{
+	if (!DmaBuf)
+		{
+		NKern::ThreadEnterCS();
+		TInt r = Epoc::AllocPhysicalRam(KDmaMax * KA64BlkSector, DmaPhys, 12);
+		DPlatChunkHw* chunk = NULL;
+		if (r == KErrNone)
+			r = DPlatChunkHw::New(chunk, DmaPhys, KDmaMax * KA64BlkSector, EMapAttrSupRw | EMapAttrBufferedNC);
+		NKern::ThreadLeaveCS();
+		if (r != KErrNone)
+			return r;
+		DmaBuf = (TUint8*)chunk->LinearAddress();
+		}
+	Log("host v%x caps %08x present %08x hostctl %08x clock %08x; gcc apps %08x ahb %08x", R(ESlotVersion) >> 16,
+		R(ECaps), R(EPresentState), R(EHostCtrl1), R(EClockCtrl), Gcc(ESdcc1Apps), Gcc(ESdcc1Ahb));
+	Log("step: gcc clocks");
+	ClocksOn();
+	Log("step: int enable");
 	R(EIntStatusEn) = 0xffff0033;						// make the status bits we poll visible (no signals)
-	Log("host v%x caps %08x present %08x hostctl %08x clock %08x cqhci cfg %08x",
-		R(ESlotVersion) >> 16, R(ECaps), R(EPresentState), R(EHostCtrl1), R(EClockCtrl),
-		*(volatile TUint32*)(A64_Io(KCqhci) + 0x08));
-	if (*(volatile TUint32*)(A64_Io(KCqhci) + 0x08) & 1)
-		{
-		Log("command queueing is on: not taken over");
-		return KErrNotSupported;
-		}
-	for (TUint32 rca = 1; rca <= 2 && !Rca; ++rca)		// ABL's RCA: CMD13 SEND_STATUS answers only to the right one
-		if (Command(13, rca << 16, ERespR1) == KErrNone && ((R(EResponse0) >> 9) & 0xf) == 4)	// state 4 = tran
-			Rca = rca;
-	if (!Rca)
-		{
-		Log("no card in transfer state at RCA 1 or 2 (status %08x)", R(EResponse0));
-		return KErrNotReady;
-		}
+	Log("clocks on: gcc apps %08x ahb %08x; vendor %08x pwr %08x cqhci %08x", Gcc(ESdcc1Apps), Gcc(ESdcc1Ahb),
+		R(EVendorSpec), R(EPwrStatus), *(volatile TUint32*)(A64_Io(KCqhci) + 0x08));
+	*(volatile TUint32*)(A64_Io(KCqhci) + 0x08) &= ~1u;	// command queueing off: plain SDHCI commands
+	TInt r = Reinit();
+	if (r != KErrNone)
+		return r;
 	static TUint8 ext[KA64BlkSector];
 	Sectors = ~0ull;										// let CMD8 through ReadBlocks' bounds
-	TInt r = ReadBlocks(8, 0, 1, ext);					// SEND_EXT_CSD
+	r = ReadBlocks(8, 0, 1, ext);						// SEND_EXT_CSD
 	if (r != KErrNone)
 		{
 		Log("EXT_CSD read -> %d", r);

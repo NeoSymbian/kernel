@@ -27,6 +27,8 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x0c40a000, 0x00001000, 1 },		// SPMI arbiter cnfg: the channel ownership table (writes)
 	{ 0x00118000, 0x00001000, 1 },		// GCC: QUP wrapper 1 AHB + SE1 clock branches and RCG (a64_touch.cpp)
 	{ 0x00152000, 0x00001000, 1 },		// GCC: APCS clock branch enable vote 1
+	{ 0x00126000, 0x00001000, 1 },		// GCC: sdcc1 (eMMC) clock branches and RCG (qcom_sdhci.cpp)
+	{ 0x17980000, 0x00001000, 1 },		// APSS watchdog (a64_reboot.cpp: the reset fallback)
 	{ 0x00a84000, 0x00004000, 1 },		// GENI serial engine 1 of QUP wrapper 1: the touchscreen's I2C
 	{ 0x03906000, 0x00002000, 1 },		// TLMM north tile: gpio6, gpio7 (I2C SDA/SCL)
 	{ 0x03963000, 0x00001000, 1 },		// TLMM north tile: gpio99 (touch reset)

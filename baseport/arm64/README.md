@@ -26,8 +26,10 @@ board (variant):
 
 ## Building
 
-The scripts run in the `symbian-a64dev` image (aarch64 GCC 14, arm-none-eabi binutils, QEMU). `KHS` defaults to
-this checkout.
+The easy way is [`neo`](https://github.com/NeoSymbian/build), from a `build` checkout next to this one:
+`neo kernel qemu`, `DTB=bonito.dtb neo kernel bonito`, `neo qemu 60`, `neo flash bonito`. It runs the scripts below in
+the pinned build image (`ghcr.io/neosymbian/toolchain`: aarch64 GCC 14, the Arm GNU toolchain, QEMU) with the user
+side's build volume mounted. By hand, inside that image (`KHS` defaults to this checkout):
 
 ```sh
 BOARD=qemu   baseport/arm64/tools/build-kernel.sh      # nanokernel test image (nkernsa)

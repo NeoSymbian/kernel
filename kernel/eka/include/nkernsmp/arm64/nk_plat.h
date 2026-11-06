@@ -19,6 +19,7 @@
 class TSubScheduler;
 class TScheduler;
 struct Gicv3Redist;			// this CPU's GICv3 redistributor frame (defined by the backend)
+struct SFullArmRegSet;		// a CPU's full register set in the AArch32 crash/exception layout (ekern)
 
 // --- Per-CPU / global arch extras: field layout of the 2010 ARM header where it still applies ------------
 struct TSubSchedulerX
@@ -33,7 +34,11 @@ struct TSubSchedulerX
 	volatile TInt		iIrqNestCount;			// IRQ nest count for this CPU (starts at -1)
 	TAny*				iExcInfo;				// pointer to exception info for crash debugger
 	volatile TInt		iCrashState;			// 0=normal, 1=this CPU faulted, 2=this CPU has received a crash IPI
-	TLinAddr			iSSXP5[3];
+	union {										// the ARM layout: ekern's kernel/arm/{ckernel,cutils}.cpp reach a
+		TLinAddr		iSSXP5_0;				// faulting CPU's saved register set through iRegs
+		SFullArmRegSet*	iRegs;
+		};
+	TLinAddr			iSSXP5[2];
 	TLinAddr			iIrqStackTop;			// Top of IRQ stack for this CPU
 	SRatioInv* volatile	iNewCpuFreqRI;			// set when CPU frequency has been changed
 	SRatioInv* volatile	iNewTimerFreqRI;		// set when CPU local timer frequency has been changed

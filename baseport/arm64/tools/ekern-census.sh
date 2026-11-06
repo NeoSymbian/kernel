@@ -56,18 +56,23 @@ $(cd $EKA && ls memmodel/epoc/*.cpp memmodel/epoc/flexible/*.cpp memmodel/epoc/f
 pass=0; fail=0; : > "$OUT/failed.txt"; : > "$OUT/errors.txt"
 for tu in $TUS; do
 	# not in ekern.mmp: crash logger, debug monitors, EABI-only helper, other binaries' entry points, exstart.exe
+	# kernel/arm/vfp.cpp is evfp.dll's (kernel/evfp.mmp): the ARM VFPv2 bounce library, not needed on ARMv8
 	case "$tu" in kernel/crash*|kernel/smon*|kernel/kdebug.cpp|kernel/array_eabi.cpp|kernel/arm/cmon*|*monitor.cpp|\
-		kernel/arm/*_entry*.cpp|kernel/exstart.cpp) continue;; esac
+		kernel/arm/*_entry*.cpp|kernel/exstart.cpp|kernel/arm/vfp.cpp) continue;; esac
 	n=$(echo "$tu" | tr '/' '_'); n=${n%.cpp}
 	src="$EKA/$tu"
 	# a marked-delta copy in port/arm64/mm (memory model) or port/arm64/ekern (kernel) replaces the baseline TU
 	[ -f "$HERE/mm/$(basename "$tu")" ] && case "$tu" in memmodel/*) src="$HERE/mm/$(basename "$tu")";; esac
+	[ -f "$HERE/ekern/$(basename "$tu")" ] && case "$tu" in kernel/arm/*) src="$HERE/ekern/$(basename "$tu")";; esac
 	# one-line patches, checked: a copy in $OUT with an "a64 port" marker that must appear exactly once
 	pat=""
 	case "$tu" in
 	# the demand-paging minimum is sized by the worst user instruction; the paged code is the AArch32 user side
 	memmodel/epoc/flexible/mmu/mpager.cpp)
 		pat='s|^#if defined(__CPU_ARM)$|#if defined(__CPU_ARM) \|\| defined(__CPU_ARM64)	// a64 port: AArch32 user code is paged|' ;;
+	# the PRRR/NMRR statics: the header declares them only for __CPU_ARM (the same text at 835/844 must stay)
+	kernel/arm/cache_maintenance.cpp)
+		pat='34s|^#if !defined(__CPU_MEMORY_TYPE_REMAPPING)$|#if !defined(__CPU_MEMORY_TYPE_REMAPPING) \&\& defined(__CPU_ARM)	// a64 port: header declares them for ARM only|' ;;
 	esac
 	if [ -n "$pat" ]; then
 		sed "$pat" "$src" > "$OUT/patched_$(basename "$tu")"

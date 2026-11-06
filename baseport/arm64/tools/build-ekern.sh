@@ -5,7 +5,7 @@
 # platform layer), plus the boot stub + bootstrap, the static variant and the board. Runs in the symbian-a64dev image.
 # Env: BOARD = a board under baseport/arm64 (<BOARD>_variant: qemu = default, bonito), KHS = the kernel tree
 #      (default: this checkout), OUT = output dir,
-#      USERSIDE = 1 (default: the 2010 user side from the symbian-2010 build volume mounted at S2010, see
+#      USERSIDE = 1 (default: the 2010 user side from the NeoSymbian/build volume mounted at S2010, see
 #      build-userrom.sh) | 0 (kernel only: boot/a32test.S is the secondary),
 #      DTB = the board's device tree blob where its boot image needs one (bonito: the phone's own, also taken
 #      from BONITO_DTB; never commit it). The board's own options are in its variant.conf.

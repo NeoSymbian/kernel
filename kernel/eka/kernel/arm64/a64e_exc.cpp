@@ -334,12 +334,27 @@ static void SyncException(SThreadExcStack* aF, TUint32 aGroup)
 
 // vectors.S: kind = (group << 2) | type; group 0 EL1/SP0, 1 EL1/SPx, 2 EL0 AArch64, 3 EL0 AArch32;
 // type 0 sync, 1 IRQ, 2 FIQ, 3 SError
+extern "C" void A64_ExecGate(SThreadExcStack* aF);		// a64e_exec.cpp
+extern "C" void A64_ReturnToUser();						// a64e_nkern.cpp: user-mode callbacks
+extern "C" TBool A64_A32Fixup(SThreadExcStack* aF);		// a64e_a32fix.cpp: instructions ARMv8 dropped
+
 extern "C" void A64_ExceptionDispatch(SThreadExcStack* aF, TUint64 aKind)
 	{
 	TUint32 type = (TUint32)aKind & 3, group = (TUint32)aKind >> 2;
+	if (group == 3 && type <= 1)						// AArch32 EL0: the user side
+		{
+		if (type == 1)
+			A64_Irq(aF);
+		else if ((aF->iEsr >> 26) == 0x11)				// SVC: an exec call
+			A64_ExecGate(aF);
+		else if (!A64_A32Fixup(aF))
+			SyncException(aF, group);
+		A64_ReturnToUser();								// interrupts off again here
+		return;
+		}
 	if (type == 1)
 		{ A64_Irq(aF); return; }
-	if (type == 0 && group != 2)						// no AArch64 user code
+	if (type == 0 && group < 2)							// EL1; there is no AArch64 user code
 		{ SyncException(aF, group); return; }
 	A64_DebugPuts("\n*** unexpected exception kind="); A64_DebugHex(aKind);
 	A64_DebugPuts(" esr="); A64_DebugHex(aF->iEsr);

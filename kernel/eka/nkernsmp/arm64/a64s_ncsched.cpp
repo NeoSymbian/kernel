@@ -417,9 +417,15 @@ void TScheduler::Reschedule()
             break;
         NThreadBase* me = ss.iCurrentThread;
         board_fpu_save(me);
+        /* the user side's thread-ID registers belong to the thread (AArch32 EL0 writes TPIDRURW itself) */
+        TUint64* tid = ((NThread*)me)->iUserTid;
+        tid[0] = A64_SYSREG_READ(tpidr_el0);
+        tid[1] = A64_SYSREG_READ(tpidrro_el0);
         __phore_resched_park((void**)&me->iSavedSP, (void* const*)&ss.iInitialThread->iSavedSP, &A64_ReschedSelect, &ss);
         /* Running again, interrupts off, as the thread that was parked -- possibly on ANOTHER cpu
          * (migration, idle pull), so nothing per-cpu may be carried across the park. */
+        A64_SYSREG_WRITE(tpidr_el0, tid[0]);
+        A64_SYSREG_WRITE(tpidrro_el0, tid[1]);
         board_fpu_restore(me);
         }
     TSubScheduler& ss = SubScheduler();

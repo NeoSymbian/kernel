@@ -161,11 +161,65 @@ TInt NKern::BootAP(volatile SAPBootInfo* aInfo)
 	return r == 0 ? KErrNone : KErrGeneral;
 	}
 
-// ncthrd.cpp: the user-mode register set of a thread.
-// shortcut: no user threads before M4.4, so "no registers available"; M4.4 reads the AArch32 frame from the stack
-EXPORT_C void NKern::ThreadGetUserContext(NThread*, TAny*, TUint32& aAvailRegistersMask)
+// ncthrd.cpp: the user-mode register set of a thread (DArmPlatThread::Context, RThread::Context). While a thread
+// is in the kernel on behalf of user code, the AArch32 EL0 state is the exception frame at the very top of its
+// supervisor stack (vectors.S pushes it there: SP_EL1 is the stack top whenever a thread runs at EL0).
+// shortcut: a thread running user code on another CPU reports its last frame; ARM interrupts it first
+// (send_resched_ipi_and_wait) -- add that when a debugger needs exact live registers.
+EXPORT_C void NKern::ThreadGetUserContext(NThread* aThread, TAny* aContext, TUint32& aAvailRegistersMask)
 	{
+	TUint32* regs = (TUint32*)aContext;				// TArmRegSet: r0-r15, flags, dacr
+	memclr(regs, 18 * sizeof(TUint32));
 	aAvailRegistersMask = 0;
+	const SThreadExcStack* f = (const SThreadExcStack*)((TLinAddr)aThread->iStackBase + aThread->iStackSize) - 1;
+	if ((f->iSpsr & 0x1F) != 0x10)						// not an AArch32 USR frame: never ran, or no user context
+		return;
+	for (TInt i = 0; i < 15; ++i)
+		regs[i] = (TUint32)f->iX[i];
+	regs[15] = (TUint32)f->iElr;
+	regs[16] = (TUint32)f->iSpsr;
+	aAvailRegistersMask = 0x1ffff;
+	}
+
+/******************************************************************************
+ * Return to user mode (nkernsmp/arm/vectors.cia run_user_mode_callbacks): called with interrupts off at the end of
+ * every exception, interrupt or exec call taken from EL0, on the thread that is about to resume user code.
+ ******************************************************************************/
+extern "C" void A64_ReturnToUser()
+	{
+	NThreadBase* t = NKern::CurrentThread();
+	if ((TLinAddr)t->iUserModeCallbacks < 3)			// 0 = none; 1, 2 = marker values, not a callback
+		return;
+	for (;;)
+		{
+		__asm__ __volatile__("msr daifclr, #3" ::: "memory");
+		t->iCsCount = 1;								// EnterCS(): the callbacks may not be killed halfway
+		TUserModeCallback* cb = (TUserModeCallback*)__e32_atomic_swp_ord_ptr(&t->iUserModeCallbacks, 0);
+		while (cb)
+			{
+			TUserModeCallback* next = cb->iNext;
+			TUserModeCallbackFunc f = cb->iFunc;
+			cb->iNext = KUserModeCallbackUnqueued;
+			__e32_memory_barrier();
+			(*f)(cb, EUserModeCallbackRun);
+			cb = next;
+			}
+		__asm__ __volatile__("msr daifset, #3" ::: "memory");
+		__e32_memory_barrier();
+		if (t->iCsFunction)								// a deferred suspend/kill: LeaveCS acts on it
+			{
+			__asm__ __volatile__("msr daifclr, #3" ::: "memory");
+			NKern::ThreadLeaveCS();
+			__asm__ __volatile__("msr daifset, #3" ::: "memory");
+			if (!t->iUserModeCallbacks)
+				return;
+			continue;
+			}
+		if (t->iUserModeCallbacks)
+			continue;									// more were queued meanwhile
+		t->iCsCount = 0;
+		return;
+		}
 	}
 
 // ARM ncthrd.cpp / Phorepoc x86-64: queue a callback the thread runs on its way back to user mode. CAS on the

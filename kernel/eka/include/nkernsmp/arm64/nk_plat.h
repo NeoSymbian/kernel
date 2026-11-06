@@ -94,6 +94,7 @@ public:
 	void CompleteContextSave();
 public:
 	TUint64	iCoprocessorState[34];	// AArch32 user VFP: D0-D31 + FPSR/FPCR (saved lazily from EL1)
+	TUint64	iUserTid[2];			// AArch32 TPIDRURW / TPIDRURO = TPIDR_EL0 / TPIDRRO_EL0, switched with the thread
 	};
 __ASSERT_COMPILE(!(_FOFF(NThread,iCoprocessorState)&7));
 

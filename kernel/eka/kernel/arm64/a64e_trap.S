@@ -155,3 +155,34 @@ A64_SafeWriteKern:
 
 	.global	A64_MagicEnd
 A64_MagicEnd:
+
+/* ---- first entry to user mode (ekern/a64e_exec.cpp DThread::EpocThreadFunction) ------------------------------
+ * A64_EnterUser(r4, sp_usr, pc, svc stack top): AArch32 EL0, USR mode, ARM state, interrupts on. The supervisor stack
+ * is emptied (sp = its top), so every exception from EL0 pushes its frame exactly at the top of the stack, where
+ * CallerIsUser and NKern::ThreadGetUserContext look. No kernel value leaks into r0-r14. */
+	.text
+	.global	A64_EnterUser
+A64_EnterUser:
+	msr		daifset, #0xf
+	mov		w3, w3
+	mov		sp, x3
+	mov		w2, w2
+	msr		elr_el1, x2
+	mov		x9, #0x10					/* SPSR: M[4]=1 AArch32, mode USR, DAIF clear */
+	msr		spsr_el1, x9
+	mov		w4, w0						/* r4 = entry reason */
+	mov		w13, w1						/* r13_usr = the create-info block */
+	mov		x0, xzr
+	mov		x1, xzr
+	mov		x2, xzr
+	mov		x3, xzr
+	mov		x5, xzr
+	mov		x6, xzr
+	mov		x7, xzr
+	mov		x8, xzr
+	mov		x9, xzr
+	mov		x10, xzr
+	mov		x11, xzr
+	mov		x12, xzr
+	mov		x14, xzr
+	eret

@@ -81,6 +81,7 @@ __attribute__((weak)) void A64BlkDump() {}
 __attribute__((weak)) void A64KeysDump() {}
 __attribute__((weak)) void A64_RebootToFastboot() { Say("fastboot: not on this board"); }
 __attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
+__attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
 __attribute__((weak)) int Spmi_Write(unsigned, unsigned, unsigned) { return KErrNotSupported; }
 void A64DumpThreads();										// below, needs scheduler internals
@@ -237,7 +238,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log peek poke spmi blk touch keys threads tap swipe key shot reboot fastboot");
+		Say("help log peek poke spmi blk touch keys threads usb tap swipe key shot reboot fastboot");
 	else if (Eq(c, "log"))
 		{
 		TUint32 pos = 0;
@@ -306,6 +307,12 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		NKern::Sleep(NKern::TimerTicks(30));
 		e.Set(TRawEvent::EKeyUp, (TInt)num[1]);
 		Kern::AddEvent(e);
+		}
+	else if (Eq(c, "usb"))
+		{
+		TBuf8<200> b;
+		A64UsbStatus(b);
+		Say("%S", &b);
 		}
 	else if (Eq(c, "shot"))
 		Shot();

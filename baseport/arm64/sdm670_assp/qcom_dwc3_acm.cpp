@@ -397,14 +397,32 @@ static void PollDfcFn(TAny*)
 		TUint8* p = (TUint8*)(Area + EOffIn);
 		TInt n = A64Log_Read(LogPos, p, KInMax - 1);
 		if (n > 0)
+			{
 			InBusy = Start(EPhysBulkIn, ETrbNormal, EOffIn, n) == KErrNone;
-		++InStarts;
-		InFail += !InBusy;
+			++InStarts;
+			InFail += !InBusy;
+			}
 		}
 	static TInt ticks;
 	if (++ticks % 3000 == 0 && !Dtr)						// until a host opens the port: status on the screen
 		A64UsbDump();
 	PollTimer.OneShot(1);								// not Again(): it refuses (KErrArgument) once a slow poll put its next expiry in the past
+	}
+
+static void Append(TDes8& aBuf, const char* aFmt, ...)
+	{
+	VA_LIST list;
+	VA_START(list, aFmt);
+	Kern::AppendFormat(aBuf, aFmt, list);
+	VA_END(list);
+	}
+
+void A64UsbStatus(TDes8& aBuf)							// the monitor's "usb" command
+	{
+	volatile STrb* t = Trb(EPhysBulkIn);
+	Append(aBuf, "ev %d rst %d setups %d ep0 %d cfg %d dtr %d in %d/%d/%d busy %d abort %d lines %d logpos %d "
+		"trb3 %08x %08x rsc3 %d", Events, Resets, Setups, Ep0, Configured, Dtr, InStarts, InDone, InFail, InBusy,
+		AbortIn, OutLines, LogPos, t->iSize, t->iCtrl, RscIdx[EPhysBulkIn]);
 	}
 
 void A64UsbDump()

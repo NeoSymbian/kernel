@@ -55,6 +55,7 @@ for spec in nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nke
 	ek "$src" "nk_${f%.cpp}"
 done
 for f in "$HERE"/a64smp/*.cpp; do b=$(basename "$f" .cpp); ek "$f" "be_$b"; done
+for f in "$HERE"/platform/*.cpp; do b=$(basename "$f" .cpp); ek "$f" "pf_$b"; done	# shared with the full kernel
 # NKSA_MAIN=groups: our a64_main_groups.cpp replaces the suite's main.cpp (focused reproduction)
 # NKSA_MAIN=select NKSA_TESTS="...": a64_main_select.cpp runs only the named groups (see that file)
 MAIN=main; TESTDFC=testdfc; SELDEFS=""

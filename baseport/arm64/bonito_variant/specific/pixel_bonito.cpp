@@ -19,6 +19,7 @@ const int A64_PsciSmc = 1;
 const int A64_HoldResults = 1;		// a human reads the result off the screen, maybe hours later
 const unsigned int A64_TimerPpi = 19;	// Qualcomm wires the virtual timer to PPI 3 (DTB: <1 3 8>), not the usual 11
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu << 8; }		// Aff1 = core
+int A64_CpuCount() { return 1; }	// shortcut: one CPU until the full kernel's BootAP exists (M4.2 step 6), then from the DTB
 }
 
 /* --- framebuffer text console ------------------------------------------------------------------------------- */

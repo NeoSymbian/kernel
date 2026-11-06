@@ -22,5 +22,6 @@ extern const int A64_HoldResults;							// 1: keep the final screen until the us
 extern const int A64_PsciSmc;								// PSCI conduit: 1 = SMC, 0 = HVC
 extern const unsigned int A64_TimerPpi;					// EL1 virtual timer INTID (DTB arm,armv8-timer, 3rd entry + 16)
 unsigned int A64_CpuMpidr(int aCpu);						// PSCI target_cpu affinity of logical CPU aCpu
+int A64_CpuCount();										// CPUs the full kernel boots (cinit.cpp A::InitAPs)
 }
 #endif

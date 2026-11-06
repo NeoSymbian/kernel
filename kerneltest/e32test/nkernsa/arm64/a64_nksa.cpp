@@ -13,6 +13,7 @@
 #include "../a64smp/a64_sysreg.h"
 #include "../board/gicv3.h"
 #include "../board/board.h"
+#include "../platform/a64_platform.h"
 
 extern "C" void KernelMain();
 extern "C" void generic_ipi_isr(TSubScheduler* aS);		// nkernsmp/nkern.cpp
@@ -28,47 +29,8 @@ static const TInt KTickUs = 1000;						// 1 ms nanokernel tick
  *  Exception / interrupt dispatch (called from vectors.S with an SThreadExcStack frame)
  * ====================================================================================================== */
 extern "C" { volatile int A64_BrkSeen; }
-static TUint64 TickPeriod;				// counter ticks per 1 ms system tick
 static volatile TBool TimerQReady;
 
-/* Each CPU's EL1 virtual timer serves two deadlines, programmed as an absolute CNTV_CVAL: the periodic system
- * tick and the current thread's timeslice. Indexed by MPIDR so a secondary CPU can start its tick before
- * NKern::Init has given it a TSubScheduler. */
-struct SCpuTimer { TUint64 iNextTick; TUint64 iSliceDeadline; TBool iSliceArmed; };
-static SCpuTimer CpuTimer[256];
-extern "C" TUint32 A64_MpidrIndex(TUint32 aMpidr);
-static inline SCpuTimer& ThisCpuTimer()	{ return CpuTimer[A64_MpidrIndex(A64_Mpidr()) & 0xFF]; }
-
-static void TimerProgram(SCpuTimer& c)
-	{
-	TUint64 cval = c.iNextTick;
-	if (c.iSliceArmed && c.iSliceDeadline < cval)
-		cval = c.iSliceDeadline;
-	A64_SYSREG_WRITE(cntv_cval_el0, cval);
-	A64_SYSREG_WRITE(cntv_ctl_el0, 1);
-	__asm__ __volatile__("isb" ::: "memory");
-	}
-
-extern "C" void A64_TimesliceSet(TInt aTicks)
-	{
-	TInt irq = NKern::DisableAllInterrupts();
-	SCpuTimer& c = ThisCpuTimer();
-	c.iSliceArmed = aTicks > 0;
-	if (c.iSliceArmed)
-		c.iSliceDeadline = NKern::Timestamp() + (TUint32)aTicks;
-	TimerProgram(c);
-	NKern::RestoreInterrupts(irq);
-	}
-
-extern "C" TInt A64_TimesliceRemaining()
-	{
-	TInt irq = NKern::DisableAllInterrupts();
-	SCpuTimer& c = ThisCpuTimer();
-	TUint64 now = NKern::Timestamp();
-	TInt r = (c.iSliceArmed && c.iSliceDeadline > now) ? (TInt)(c.iSliceDeadline - now) : 0;
-	NKern::RestoreInterrupts(irq);
-	return r;
-	}
 static volatile TUint32 TickCount;		// CPU 0 ticks, for the boot-time tick self-check
 
 /* stall detector: each CPU records its tick count and where its tick interrupted it; if the tests print
@@ -86,8 +48,9 @@ static const TInt KTickIrq = 0;
 static volatile TUint32 TickIrqHandle;		// nonzero while hijacked
 static void TickIsr(TAny*)	{ TheTimerQ.Tick(); }
 
-static void SystemTick(TSubScheduler& aSS)
+extern "C" void A64_TickHook(TSubScheduler& aSS, TUint64 aElr)	// the platform layer's per-tick hook
 	{
+	CpuLastElr[aSS.iCpuNum & (KMaxCpus - 1)] = aElr;
 	++CpuTicks[aSS.iCpuNum & (KMaxCpus - 1)];
 	if (aSS.iCpuNum == 0 && TimerQReady)
 		{
@@ -103,67 +66,6 @@ static void SystemTick(TSubScheduler& aSS)
 			NKern::Interrupt(KTickIrq);		// hijacked: the tied handler runs the tick where its thread/group is
 		else
 			TheTimerQ.Tick();				// the nanokernel millisecond tick (may queue the timer DFC)
-		}
-	}
-
-static void TimerIrq(TSubScheduler& aSS)
-	{
-	SCpuTimer& c = ThisCpuTimer();
-	TUint64 now = NKern::Timestamp();
-	if (now >= c.iNextTick)
-		{
-		do c.iNextTick += TickPeriod; while (c.iNextTick <= now);	// catch up, never fire twice for one tick
-		SystemTick(aSS);
-		}
-	if (c.iSliceArmed && now >= c.iSliceDeadline)
-		{
-		c.iSliceArmed = FALSE;				// expired: SaveTimesliceTimer will read 0
-		aSS.iRescheduleNeededFlag = TRUE;	// as the ARM do_timeslice_irq: just ask for a reschedule
-		}
-	TimerProgram(c);
-	}
-
-static void Irq(SThreadExcStack* aF)
-	{
-	TSubScheduler& ss = SubScheduler();
-	// release: a CPU in send_resched_ipi_and_wait that sees us inside an ISR also sees the interrupted thread's stores
-	__atomic_store_n(&ss.iSSX.iIrqNestCount, ss.iSSX.iIrqNestCount + 1, __ATOMIC_RELEASE);	// -1 = not in an ISR
-	++ss.iSSX.iIrqCount;
-	for (;;)
-		{
-		TUint32 id = Gicv3_Ack();
-		if (id >= 1020)
-			break;							// nothing (more) pending
-		Gicv3_Eoi(id);						// EOI first: a reschedule below may not return for a long time
-		if (id == A64_TimerPpi)
-			{
-			CpuLastElr[ss.iCpuNum & (KMaxCpus - 1)] = aF->iElr;
-			TimerIrq(ss);
-			}
-		else if (id == RESCHED_IPI_VECTOR)
-			{
-			ss.iRescheduleNeededFlag = TRUE;
-			resched_ipi_ack(&ss);			// after the flag: an acknowledged CPU reschedules on exit
-			}
-		else if (id == GENERIC_IPI_VECTOR)
-			generic_ipi_isr(&ss);
-		// TRANSFERRED_IRQ_VECTOR: the tail below runs the events
-		}
-	if (--ss.iSSX.iIrqNestCount >= 0)
-		return;
-	if (ss.iEventHandlersPending)
-		{
-		++ss.iSSX.iIrqNestCount;
-		run_event_handlers(&ss);
-		--ss.iSSX.iIrqNestCount;
-		}
-	if ((ss.iRescheduleNeededFlag || ss.iDfcPendingFlag || ss.iExIDfcPendingFlag) && ss.iKernLockCount == 0)
-		{
-		ss.iKernLockCount = 1;
-		TScheduler::Reschedule();			// returns (perhaps much later, perhaps on another CPU) unlocked, IRQs off
-		TUint32 ipis = __e32_atomic_swp_ord32(&SubScheduler().iReschedIPIs, 0);
-		if (ipis)
-			send_resched_ipis(ipis);
 		}
 	}
 
@@ -333,7 +235,7 @@ static void DumpCpus()
 extern "C" void A64_ExceptionDispatch(SThreadExcStack* aF, TUint64 aKind)
 	{
 	if ((aKind & 3) == 1)
-		{ Irq(aF); return; }
+		{ A64_Irq(aF); return; }
 	TUint32 ec = (TUint32)(aF->iEsr >> 26);
 	if ((aKind & 3) == 0 && ec == 0x3C && (aF->iEsr & 0xFFFF) == 0x1234)	// the boot self-test BRK
 		{ ++A64_BrkSeen; aF->iElr += 4; return; }
@@ -351,55 +253,26 @@ extern "C" void A64_ExceptionDispatch(SThreadExcStack* aF, TUint64 aKind)
  * ====================================================================================================== */
 extern "C" TInt __timer_period()		{ return KTickUs; }
 
-static void InitThisCpuGic()		// this CPU's redistributor: IPIs (SGI 0-7) and the tick (PPI 27)
-	{
-	TLinAddr sgi = Gicv3_InitCpu(A64_GicrBase, A64_Mpidr());
-	if (!sgi)
-		{ A64_DebugPuts("*** GICv3: no redistributor for this CPU\n"); return; }
-	for (TUint32 i = 0; i < 8; ++i)
-		Gicv3_EnablePpiSgi(sgi, i, 0x80);
-	Gicv3_EnablePpiSgi(sgi, A64_TimerPpi, 0xA0);
-	}
-
 extern "C" void Hw_Init1()
 	{
-	Gicv3_InitDist(A64_GicdBase);
-	InitThisCpuGic();
-	TickPeriod = (TUint64)NKern::TimestampFrequency() * KTickUs / 1000000;
+	A64_InitGic();
+	A64_TimerInit(KTickUs);
 	NKern::InterruptInit0();				// the NIrqHandler pool (ARM: NKern::Init's arch part)
 	NKern::InterruptInit(KTickIrq, NKern::EIrqInit_RisingEdge, 1023, 0);
 	}
 
-extern "C" void StartSystemTimer()		// this CPU: tick from now on, no timeslice deadline yet
+extern "C" void StartSystemTimer()		// this CPU: tick from now on, no timeslice deadline yet (nkernsa init.cpp)
 	{
-	SCpuTimer& c = ThisCpuTimer();
-	c.iNextTick = NKern::Timestamp() + TickPeriod;
-	c.iSliceArmed = FALSE;
-	TimerProgram(c);
+	A64_StartSystemTimer();
 	}
 
 extern "C" void ApMainGeneric(volatile SAPBootInfo* aInfo);	// nkernsa init.cpp
 extern "C" void A64_ApEntry();									// boot.S
 
-/* PSCI 0.2+ call through the board's conduit (QEMU virt: HVC, Pixel/TrustZone: SMC) */
-static TInt Psci(TUint64 aFn, TUint64 aA1, TUint64 aA2, TUint64 aA3)
-	{
-	register TUint64 x0 __asm__("x0") = aFn;
-	register TUint64 x1 __asm__("x1") = aA1;
-	register TUint64 x2 __asm__("x2") = aA2;
-	register TUint64 x3 __asm__("x3") = aA3;
-	if (A64_PsciSmc)
-		__asm__ __volatile__("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) :: "memory");
-	else
-		__asm__ __volatile__("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) :: "memory");
-	return (TInt)x0;
-	}
-static TInt PsciCpuOn(TUint64 aMpidr, TUint64 aEntry, TUint64 aContext)	{ return Psci(0xC4000003, aMpidr, aEntry, aContext); }
-
 /* a secondary CPU, on its own stack with the MMU on: its GIC, its tick, then join the nanokernel */
 extern "C" void A64_ApMain(volatile SAPBootInfo* aInfo)
 	{
-	InitThisCpuGic();
+	A64_InitThisCpuGic();
 	StartSystemTimer();
 	ApMainGeneric(aInfo);				// NKern::Init for this CPU's initial thread, then idles; never returns
 	}
@@ -423,7 +296,7 @@ extern "C" void Hw_InitAPs()
 		// and evict the stack from this core's cache (a dirty line written back later would corrupt it)
 		A64_DCacheRange((TLinAddr)info, sizeof(*info), FALSE);
 		A64_DCacheRange((TLinAddr)stack, KApStack, TRUE);
-		TInt r = PsciCpuOn(A64_CpuMpidr(cpu), (TLinAddr)&A64_ApEntry, (TLinAddr)info);
+		TInt r = A64_PsciCpuOn(A64_CpuMpidr(cpu), (TLinAddr)&A64_ApEntry, (TLinAddr)info);
 		if (r != 0)
 			{
 			KPrintf("PSCI CPU_ON(%d) = %d: %d CPU(s)", cpu, r, cpu);		// -2 INVALID_PARAMETERS: no such CPU
@@ -704,7 +577,7 @@ void __finish()
 	// the phone keeps the summary on screen until the user powers it off (a 2-minute hold lost an overnight run);
 	// shortcut: a static screen for hours on an OLED, add a dim/blank timer if this becomes routine
 	if (!A64_HoldResults)
-		Psci(0x84000008, 0, 0, 0);		// PSCI SYSTEM_OFF (QEMU exits)
+		A64_Psci(0x84000008, 0, 0, 0);		// PSCI SYSTEM_OFF (QEMU exits)
 	for (;;) { A64_CLI(); __asm__ __volatile__("wfi"); }
 	}
 

@@ -44,6 +44,19 @@ void PreprocessHandler()
 	NKFault("a64 PreprocessHandler: called through the table", 0);
 	}
 
+// Kernel-side callers of the HAL (kernel/arm/cexec.cia, kernel/win32/cexec.cpp): straight into the exec handler
+EXPORT_C TInt Kern::HalFunction(TInt aGroup, TInt aFunction, TAny* a1, TAny* a2)
+	{
+	CHECK_PRECONDITIONS(MASK_THREAD_STANDARD,"Kern::HalFunction(TInt, TInt, TAny*, TAny*)");
+	return ExecHandler::HalFunction(aGroup, aFunction, a1, a2);
+	}
+
+EXPORT_C TInt Kern::HalFunction(TInt aGroup, TInt aFunction, TAny* a1, TAny* a2, TInt aDeviceNumber)
+	{
+	CHECK_PRECONDITIONS(MASK_THREAD_STANDARD,"Kern::HalFunction(TInt, TInt, TAny*, TAny*, TInt)");
+	return ExecHandler::HalFunction(aGroup | (aDeviceNumber << 16), aFunction, a1, a2);
+	}
+
 // handle -> object for exec calls flagged "preprocess" (kernel/win32/cexec.cpp Win32PreprocessHandler; ARM's
 // cexec.cia does the same in assembler). Called with the system lock held.
 static void A64PreprocessHandler(TInt* aArgs, TUint32 aFlags)

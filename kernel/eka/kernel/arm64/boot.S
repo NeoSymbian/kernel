@@ -11,7 +11,8 @@ _start:
 	b	entry				// code0
 	.long	0				// code1
 	.quad	0x80000				// text_offset
-	.quad	0x400000			// image_size: 4 MB incl. .bss (kernel.ld asserts it fits); ILP32 objects have no 64-bit relocs
+	.long	__image_size			// image_size incl. .bss, from the linker script (ILP32 objects have no 64-bit relocs)
+	.long	0
 	.quad	0xa				// flags: LE, 4K pages, load anywhere
 	.quad	0, 0, 0
 	.ascii	"ARM\x64"

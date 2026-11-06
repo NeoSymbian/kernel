@@ -38,6 +38,7 @@ TAny* A64VariantInitialise(TInt aMode);
 TInt A64ExtensionEntry(TInt aReason);
 TInt A64ExstartShim(TInt aReason);								// ROM: board/a64_variant.cpp -> kernel/exstart.cpp
 extern char A32Test[], A32TestEnd[];							// ROM .utext: boot/a32test.S, AArch32 EL0 code
+extern char __uimage_base[], __uimage_size[];					// ekern.lds: the user-side ROM section, if any
 }
 #define SYMVAL(s)	((TUint32)(TLinAddr)(s))
 
@@ -357,7 +358,31 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	rec.iRootList.iRootDir[0].iHardwareVariant = 0x01000000u;
 	rec.iRootList.iRootDir[0].iAddressLin = REC_LIN(iRootDir);
 	rec.iRootDir.iSize = 0;
-	rh.iRomRootDirectoryList = REC_LIN(iRootList);
+	TLinAddr rootDirList = REC_LIN(iRootList);
+
+	// ---- the user side: a prelinked ROM SECTION (tools/build-userrom.sh, pdk rombuild.py --section) holds real
+	// TRomEntry + TRomImageHeader records for the 2010 user side, laid out for this address, and a Z: directory tree.
+	// Its header {magic 'PRSC', version 4, base, size, count, rootDirList, secondary TRomEntry, ROM DLL data size,
+	// built-in device table}: efile.exe there becomes the secondary, and its tree the ROM's root directory.
+	if (SYMVAL(__uimage_size))
+		{
+		const TUint32* uh = (const TUint32*)ROM_PHYS(__uimage_base);
+		if (uh[0] != 0x43535250u || uh[1] != 4)
+			Die("the ROM section is not a version 4 'PRSC' section (tools/build-userrom.sh)");
+		if (uh[2] != SYMVAL(__uimage_base))
+			Die("the ROM section was laid out for a different linear address");
+		if (uh[8] && *(const TUint32*)ROM_PHYS(uh[8]))
+			Die("the ROM section lists built-in device drivers: not supported by this kernel");
+		rh.iSecondaryFile = uh[6];
+		rootDirList = uh[5];
+		rh.iTotalUserDataSize = uh[7];						// ROM DLL static data below KUserLocalDataEnd
+		Trace("user-side section images", uh[4]);
+		Trace("ROM DLL static data", uh[7]);
+		Put("[a64boot] secondary = efile.exe from the user-side ROM section\n");
+		}
+	else
+		Put("[a64boot] no user-side section: secondary = boot/a32test.S\n");
+	rh.iRomRootDirectoryList = rootDirList;
 
 	// ---- super page
 	SSuperPageBase& sp = *(SSuperPageBase*)superPhys;
@@ -371,7 +396,7 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	sp.iPrimaryEntry = REC_LIN(iPrimaryEntry);
 	sp.iInitialHeapSize = heap;
 	sp.iDebugPort = 0;
-	sp.iRootDirList = REC_LIN(iRootList);
+	sp.iRootDirList = rootDirList;		// FindRomRootDirectory prefers this over the ROM header's
 	sp.iKernelLimit = rh.iKernelLimit;
 	sp.iRomHeaderPhys = romPhys;
 

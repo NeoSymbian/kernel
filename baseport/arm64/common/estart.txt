@@ -1,0 +1,4 @@
+#
+# estart.txt -- the AArch64 kernel's drives: the internal RAM drive (board/variantmediadef.h, local drive 0) as C:
+#
+C:  0  ELOCAL  FAT   0       FS_FORMAT_COLD,FS_SYNC_DRIVE       # IRAM

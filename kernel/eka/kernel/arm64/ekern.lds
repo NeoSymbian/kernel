@@ -89,9 +89,19 @@ SECTIONS
 		__svbss_end = .;
 		} >DATV
 	__svdata_size = __svbss_end - __data_run;					/* TRomHeader::iTotalSvDataSize */
-	__rom_size = (__data_load + SIZEOF(.data)) - __rom_lin;	/* bytes of ROM loaded */
-	/* boot.S's Image header promises 4 MB from _start */
-	ASSERT(__rom_phys + __rom_size - _start <= 0x400000, "image exceeds the 4 MB image_size in boot.S")
+
+	/* The user side: the ROM section built by tools/build-userrom.sh (prelinked for exactly this address), 2 MB into
+	 * the ROM. Empty in a kernel-only build: then the bootstrap starts boot/a32test.S as the secondary. */
+	.uimage (__rom_lin + 0x200000) : AT(__rom_phys + 0x200000)
+		{
+		__uimage_base = .;
+		KEEP(*(.uimage))
+		__uimage_end = .;
+		}
+	__uimage_size = __uimage_end - __uimage_base;
+	ASSERT(__data_load + SIZEOF(.data) <= __uimage_base, "the kernel ROM reaches the user-side section")
+	__rom_size = (__uimage_size ? __uimage_end : __data_load + SIZEOF(.data)) - __rom_lin;	/* bytes of ROM loaded */
+	__image_size = ALIGN(__rom_phys + __rom_size - _start, 0x1000);	/* boot.S Image header */
 
 	/DISCARD/ : { *(.note*) *(.comment) *(.eh_frame*) }
 	}

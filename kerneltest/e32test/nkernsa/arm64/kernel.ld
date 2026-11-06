@@ -13,6 +13,7 @@ SECTIONS
 	. = ALIGN(16);
 	__image_end = .;
 	.bss (NOLOAD) : { __bss_start = .; *(.bss .bss.* COMMON) . = ALIGN(16); __bss_end = .; }
-	ASSERT(__bss_end - _start <= 0x400000, "kernel image + .bss exceed the 4 MB image_size in boot.S")
+	__image_size = 0x400000;		/* boot.S Image header */
+	ASSERT(__bss_end - _start <= __image_size, "kernel image + .bss exceed the 4 MB image_size")
 	/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

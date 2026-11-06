@@ -4,6 +4,8 @@
 # SMP nanokernel from unmodified 2010 source (compiled by ekern-census.sh, which also builds our backend and the
 # platform layer), plus the boot stub + bootstrap, the static variant and the board. Runs in the symbian-a64dev image.
 # Env: BOARD = qemu (default) | bonito, KHS = kernelhwsrv checkout, OUT = output dir,
+#      USERSIDE = 1 (default: the 2010 user side from the symbian-2010 build volume mounted at S2010, see
+#      build-userrom.sh) | 0 (kernel only: boot/a32test.S is the secondary),
 #      BONITO_DTB = the Pixel's DTB (bonito: appended to boot.img; never commit it).
 set -eu
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -46,6 +48,15 @@ I=$OUT/img
 # the bootstrap runs with the MMU off: no unaligned accesses, and no calls a loop could turn into memset/memcpy
 $EKXX $DEFS $INCS $PRE $BDEF -mstrict-align -fno-tree-loop-distribute-patterns -c "$HERE/boot/a64boot.cpp" -o "$I/a64boot.o"
 $EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_variant.cpp" -o "$I/a64_variant.o"
+# the local-media stack as built-in extensions (a64_media.cpp): the unmodified ELOCD and internal RAM drive, entry
+# points renamed (each is its own DLL in a real ROM)
+MED="-I $EKA/drivers/locmedia -I $EKA/drivers/locmedia/traces -I $EKA/include/drivers -I $HERE/board"
+$EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_locmedia -DKernelModuleEntry=KernelModuleEntry_locmedia \
+	-DCreateLogicalDevice=CreateLogicalDevice_locmedia -c "$EKA/drivers/locmedia/locmedia.cpp" -o "$I/locmedia.o"
+$EKXX $DEFS $INCS $MED $PRE -c "$EKA/drivers/locmedia/dmasupport.cpp" -o "$I/dmasupport.o"
+$EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medint -DKernelModuleEntry=KernelModuleEntry_medint \
+	-DCreatePhysicalDevice=CreatePhysicalDevice_medint -c "$EKA/drivers/medint/iram.cpp" -o "$I/iram.o"
+$EKXX $DEFS $INCS $MED $PRE -c "$HERE/board/a64_media.cpp" -o "$I/a64_media.o"
 # the real exstart (starts the ROM secondary), statically linked: only its entry points are renamed
 $EKXX $DEFS $INCS $PRE -DKernelModuleEntry=A64ExstartEntry -DInitExtension=A64ExstartInit \
 	-c "$EKA/kernel/exstart.cpp" -o "$I/exstart.o"
@@ -60,12 +71,18 @@ printf '\t.section .utext, "ax"\n\t.balign 16\n\t.global A32Test, A32TestEnd\nA3
 $AS $BDEF -DA64_EKERN "$HERE/boot/boot.S" -o "$I/boot.o"
 $AS "$HERE/boot/vectors.S" -o "$I/vectors.o"
 $AS "$I/a32test_rom.S" -o "$I/a32test_rom.o"
+# the user-side ROM section, prelinked for its place 2 MB into the ROM (ekern.lds .uimage)
+if [ "${USERSIDE:-1}" != 0 ]; then
+	OUT="$OUT" BASE=$(printf '0x%08X' $((ROM_LIN + 0x200000))) sh "$HERE/tools/build-userrom.sh"
+	printf '\t.section .uimage, "a"\n\t.incbin "%s"\n' "$OUT/romsect.bin" > "$I/uimage.S"
+	$AS "$I/uimage.S" -o "$I/uimage.o"
+fi
 [ "$BOARD" = bonito ] && python3 "$HERE/tools/mkfont.py" "$I/font.h" >/dev/null
 $PLAIN -I "$I" -c "$HERE/board/$BOARD_SRC" -o "$I/board.o"
 $PLAIN -c "$HERE/board/gicv3.cpp" -o "$I/gicv3.o"
 $PLAIN -c "$HERE/board/console_io.cpp" -o "$I/console_io.o"
 # the boot stub may reach the ROM only by address, never by a call
-bad=$(${X}nm -u "$I/a64boot.o" | awk '{print $2}' | grep -vE '^(_start|_E32Startup|A64VariantEntry|A64VariantInitialise|A64ExtensionEntry|A64ExstartShim|A32Test|A32TestEnd|A64_IoRegions|A64_IoRegionCount|__(rom|code|data|svdata)_[a-z]*)$' || true)
+bad=$(${X}nm -u "$I/a64boot.o" | awk '{print $2}' | grep -vE '^(_start|_E32Startup|A64VariantEntry|A64VariantInitialise|A64ExtensionEntry|A64ExstartShim|A32Test|A32TestEnd|A64_IoRegions|A64_IoRegionCount|__(rom|code|data|svdata|uimage)_[a-z]*)$' || true)
 [ -z "$bad" ] || { echo "a64boot.o calls outside the boot stub: $bad"; exit 1; }
 
 # 3. link at the native addresses

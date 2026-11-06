@@ -32,4 +32,5 @@ void A64_DebugHex(unsigned long long v)
 // boards without a screen have no status bar or pinned lines
 __attribute__((weak)) void A64_ConsoleStatus(const char*, unsigned, unsigned, unsigned) {}
 __attribute__((weak)) void A64_ConsolePin(int, const char*) {}
+__attribute__((weak)) void A64_ConsoleReserveTop(int) {}		// serial consoles share nothing
 }

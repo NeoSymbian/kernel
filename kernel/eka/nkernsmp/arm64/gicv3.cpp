@@ -10,6 +10,7 @@ typedef unsigned long long TGicU64;
 #define ISB()		__asm__ __volatile__("isb" ::: "memory")
 
 enum { GICD_CTLR = 0x0, GICD_TYPER = 0x4, GICD_IGROUPR = 0x80, GICD_ISENABLER = 0x100, GICD_ICENABLER = 0x180,
+	   GICD_IPRIORITYR = 0x400, GICD_IROUTER = 0x6000,
 	   GICR_TYPER = 0x8, GICR_WAKER = 0x14, GICR_SGI = 0x10000, GICR_STRIDE = 0x20000,
 	   GICR_IGROUPR0 = 0x80, GICR_ISENABLER0 = 0x100, GICR_ICENABLER0 = 0x180, GICR_IPRIORITYR = 0x400 };
 
@@ -59,6 +60,13 @@ void Gicv3_EnablePpiSgi(unsigned long aRdSgi, unsigned int aIntId, unsigned char
 	{
 	*(volatile unsigned char*)(aRdSgi + GICR_IPRIORITYR + aIntId) = aPriority;
 	REG32(aRdSgi + GICR_ISENABLER0) = 1u << aIntId;
+	}
+
+void Gicv3_EnableSpi(unsigned long aGicd, unsigned int aIntId, unsigned char aPriority, TGicU64 aAffinity)
+	{
+	*(volatile unsigned char*)(aGicd + GICD_IPRIORITYR + aIntId) = aPriority;
+	REG64(aGicd + GICD_IROUTER + 8 * aIntId) = aAffinity;	// Interrupt_Routing_Mode 0: that one CPU
+	REG32(aGicd + GICD_ISENABLER + (aIntId / 32) * 4) = 1u << (aIntId % 32);
 	}
 
 TGicU32 Gicv3_Ack()					{ return (TGicU32)MRS(S3_0_C12_C12_0) & 0xFFFFFF; }	// ICC_IAR1_EL1

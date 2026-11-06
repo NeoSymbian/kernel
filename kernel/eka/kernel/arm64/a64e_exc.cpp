@@ -319,6 +319,9 @@ static void SyncException(SThreadExcStack* aF, TUint32 aGroup)
 	if (!(aF->iSpsr & 0xC0))
 		__asm__ __volatile__("msr daifclr, #3\n\tisb" ::: "memory");	// interrupts as the faulting code had them
 
+	if (fromUser && e.iExcCode != EArmExceptionUndefinedOpcode)	// bring-up aid: where a user fault really was
+		Kern::Printf("[exc] user %s abort: pc %08x far %08x esr %08x",
+			e.iExcCode == EArmExceptionDataAbort ? "data" : "prefetch", e.iR15, e.iFaultAddress, (TUint32)aF->iEsr);
 	Exc::Dispatch(&e, NKern::CurrentThread());			// may not return (TExcTrap::Exception, thread panic)
 
 	__asm__ __volatile__("msr daifset, #3" ::: "memory");

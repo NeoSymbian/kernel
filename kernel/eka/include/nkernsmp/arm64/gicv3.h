@@ -8,6 +8,7 @@ typedef unsigned int TGicU32;
 void Gicv3_InitDist(unsigned long aGicd);
 unsigned long Gicv3_InitCpu(unsigned long aGicrBase, unsigned int aMpidrPacked);	// this CPU's SGI_base, 0 if no match
 void Gicv3_EnablePpiSgi(unsigned long aRdSgi, unsigned int aIntId, unsigned char aPriority);	// INTID 0-31
+void Gicv3_EnableSpi(unsigned long aGicd, unsigned int aIntId, unsigned char aPriority, unsigned long long aAffinity);	// level, as reset left it
 TGicU32 Gicv3_Ack();												// ICC_IAR1_EL1 (1023 = spurious)
 void Gicv3_Eoi(TGicU32 aIntId);
 #endif

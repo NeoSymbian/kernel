@@ -104,6 +104,20 @@ static void TimerIrq(TSubScheduler& aSS, TUint64 aElr)
 	TimerProgram(c);
 	}
 
+/* ---- device interrupts --------------------------------------------------------------------------------- */
+struct SSpiBinding { TA64Isr iIsr; TAny* iPtr; };
+static SSpiBinding SpiBindings[256];
+
+extern "C" TInt A64_BindSpi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr)
+	{
+	if (aIntId < 32 || aIntId >= 256 || !aIsr)
+		return KErrArgument;
+	SpiBindings[aIntId].iPtr = aPtr;
+	__e32_atomic_store_rel_ptr(&SpiBindings[aIntId].iIsr, (TAny*)aIsr);
+	Gicv3_EnableSpi(A64_Io(A64_GicdBase), aIntId, 0xA0, A64_CpuMpidr(0));
+	return KErrNone;
+	}
+
 /* ---- IRQ ----------------------------------------------------------------------------------------------- */
 extern "C" void A64_Irq(SThreadExcStack* aF)
 	{
@@ -126,6 +140,8 @@ extern "C" void A64_Irq(SThreadExcStack* aF)
 			}
 		else if (id == GENERIC_IPI_VECTOR)
 			generic_ipi_isr(&ss);
+		else if (id >= 32 && id < 256 && SpiBindings[id].iIsr)
+			(*SpiBindings[id].iIsr)(SpiBindings[id].iPtr);
 		// TRANSFERRED_IRQ_VECTOR: the tail below runs the events
 		}
 	if (--ss.iSSX.iIrqNestCount >= 0)

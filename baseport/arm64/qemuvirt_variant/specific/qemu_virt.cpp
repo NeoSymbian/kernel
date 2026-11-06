@@ -20,6 +20,9 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x09000000, 0x00001000, 1 },		// PL011
 	};
 const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
+// no display device: a RAM framebuffer the display driver allocates (run-qemu.sh FBDUMP= takes it via the monitor)
+const unsigned long A64_FbPhys = 0;
+const int A64_FbWidth = 800, A64_FbHeight = 600, A64_FbStride = 800 * 4;
 }
 
 extern "C" void A64_DebugPutc(char c)

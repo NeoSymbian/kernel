@@ -71,14 +71,20 @@ for tu in $TUS; do
 	memmodel/epoc/flexible/mmu/mpager.cpp)
 		pat='s|^#if defined(__CPU_ARM)$|#if defined(__CPU_ARM) \|\| defined(__CPU_ARM64)	// a64 port: AArch32 user code is paged|' ;;
 	# the PRRR/NMRR statics: the header declares them only for __CPU_ARM (the same text at 835/844 must stay)
+	# a release kernel prints nothing when a thread panics: print the category and reason (bring-up)
+	kernel/sthread.cpp)
+		pat='s|^\t\t__KTRACE_OPT2(KPANIC,KSCHED,\(Kern::Printf("Thread %O [PTK].*\)));$|\t\t\1);	// a64 port: always|' ;;
 	kernel/arm/cache_maintenance.cpp)
 		pat='34s|^#if !defined(__CPU_MEMORY_TYPE_REMAPPING)$|#if !defined(__CPU_MEMORY_TYPE_REMAPPING) \&\& defined(__CPU_ARM)	// a64 port: header declares them for ARM only|' ;;
 	esac
 	# Kern::Printf straight to the board console from the kernel's first line (the variant defines DebugOutputChar)
 	extra=""; [ "$tu" = kernel/arm/cutils.cpp ] && extra="-D__EARLY_DEBUG__"
+	# DThread::Exit's exit report sits under #ifdef KPANIC, a debug-build trace bit: keep it (and the patch below)
+	[ "$tu" = kernel/sthread.cpp ] && extra="-DKPANIC=31"
 	if [ -n "$pat" ]; then
 		sed "$pat" "$src" > "$OUT/patched_$(basename "$tu")"
-		[ "$(grep -c 'a64 port:' "$OUT/patched_$(basename "$tu")")" = 1 ] || echo "PATCH NOT APPLIED: $tu"
+		want=1; [ "$tu" = kernel/sthread.cpp ] && want=3			# the exit-print patch changes three lines
+		[ "$(grep -c 'a64 port:' "$OUT/patched_$(basename "$tu")")" = $want ] || echo "PATCH NOT APPLIED: $tu"
 		src="$OUT/patched_$(basename "$tu")"
 	fi
 	if $CXX $extra $DEFS $INCS $PRE -c "$src" -o "$OUT/obj/$n.o" 2>"$OUT/$n.log"; then

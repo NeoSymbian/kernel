@@ -195,12 +195,17 @@ static TInt ProbeThread(TAny*)
 	}
 
 void A64StartMedia();									// a64_media.cpp
+void A64StartDisplay();									// a64_display.cpp
+// a64_serialkbd.cpp on QEMU virt; boards without a serial keyboard keep this
+__attribute__((weak)) void A64StartSerialKeyboard() {}
 
 // The one kernel extension the ROM must carry (P::StartExtensions sizes an RArray by the count: zero panics).
 extern "C" TInt A64ExtensionEntry(TInt aReason)
 	{
 	if (aReason != KModuleEntryReasonExtensionInit1)
 		return KErrNone;
+	A64StartDisplay();									// the screen's HAL, for the window server
+	A64StartSerialKeyboard();
 	A64StartMedia();									// ELOCD + the RAM drive, before exstart starts F32
 	TInt r = StartThread(KProbeName, ProbeThread, NULL, -1);
 	Kern::Printf("[probe] Kern::ThreadCreate -> %d", r);

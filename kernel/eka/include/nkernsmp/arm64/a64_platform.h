@@ -28,6 +28,11 @@ void A64_Irq(SThreadExcStack* aFrame);
 /* defined by the image: work for one tick on this CPU (aElr = where the tick interrupted it) */
 void A64_TickHook(TSubScheduler& aSS, TUint64 aElr);
 
+/* device interrupts (SPIs): an ISR runs in A64_Irq, interrupt context, after the GIC EOI; the line is enabled and
+ * routed to CPU 0 */
+typedef void (*TA64Isr)(TAny* aPtr);
+TInt A64_BindSpi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr);
+
 /* PSCI 0.2+ through the board's conduit (QEMU virt: HVC, Pixel/TrustZone: SMC) */
 TInt A64_Psci(TUint64 aFn, TUint64 aA1, TUint64 aA2, TUint64 aA3);
 TInt A64_PsciCpuOn(TUint64 aMpidr, TUint64 aEntry, TUint64 aContext);

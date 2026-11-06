@@ -57,6 +57,9 @@ $EKXX $DEFS $INCS $MED $PRE -c "$EKA/drivers/locmedia/dmasupport.cpp" -o "$I/dma
 $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medint -DKernelModuleEntry=KernelModuleEntry_medint \
 	-DCreatePhysicalDevice=CreatePhysicalDevice_medint -c "$EKA/drivers/medint/iram.cpp" -o "$I/iram.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$HERE/board/a64_media.cpp" -o "$I/a64_media.o"
+$EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_display.cpp" -o "$I/a64_display.o"
+[ "$BOARD" = qemu ] && $EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
+	-c "$HERE/board/a64_serialkbd.cpp" -o "$I/a64_serialkbd.o"	# its thread dump reads scheduler internals
 # the real exstart (starts the ROM secondary), statically linked: only its entry points are renamed
 $EKXX $DEFS $INCS $PRE -DKernelModuleEntry=A64ExstartEntry -DInitExtension=A64ExstartInit \
 	-c "$EKA/kernel/exstart.cpp" -o "$I/exstart.o"

@@ -24,6 +24,9 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x9c000000, 0x00900000, 2 },		// the framebuffer's 4320 x 2160 bytes (in RAM: the bank must stop below it)
 	};
 const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
+// ABL's continuous-splash framebuffer: the user side gets the top 1800 rows, the kernel console the 360 below
+const unsigned long A64_FbPhys = 0x9c000000;
+const int A64_FbWidth = 1080, A64_FbHeight = 1800, A64_FbStride = 4320;
 }
 
 /* --- framebuffer text console ------------------------------------------------------------------------------- */
@@ -32,6 +35,7 @@ static const int KFbW = 1080, KFbH = 2160, KFbStride = 4320;
 static const int KCols = KFbW / FONT_W, KRows = KFbH / FONT_H;
 static const int KPinRows = 8;		// rows 1..8: pinned failure lines; the console scrolls in the rows below
 static int gCol, gRow;
+static int gFirstRow = 1 + KPinRows;	// the console scrolls from here down (A64_ConsoleReserveTop moves it)
 
 static void DrawGlyph(int aCol, int aRow, char c, TUint32 aFg, TUint32 aBg = 0xFF000000)
 	{
@@ -51,15 +55,15 @@ static void ClearRow(int aRow)
 static void NewLine()
 	{
 	gCol = 0;
-	if (++gRow == KRows) gRow = 1 + KPinRows;	// shortcut: wrap below the status + pin rows instead of scrolling
+	if (++gRow == KRows) gRow = gFirstRow;		// shortcut: wrap to the top of the console area instead of scrolling
 	ClearRow(gRow);						// the next line starts clean; the one below the cursor shows where we are
-	ClearRow(gRow + 1 < KRows ? gRow + 1 : 1 + KPinRows);
+	ClearRow(gRow + 1 < KRows ? gRow + 1 : gFirstRow);
 	}
 
 extern "C" void A64_DebugPutc(char c)
 	{
 	static int started;
-	if (!started) { started = 1; gRow = 1 + KPinRows; for (int r = 0; r <= gRow; ++r) ClearRow(r); }
+	if (!started) { started = 1; gRow = gFirstRow; for (int r = 0; r <= gRow; ++r) ClearRow(r); }
 	if (c == '\r') return;
 	if (c == '\n') { NewLine(); return; }
 	DrawGlyph(gCol, gRow, c, 0xFF00FF66);
@@ -78,6 +82,19 @@ extern "C" void A64_ConsoleStatus(const char* aTest, unsigned aLines, unsigned a
 	TUint32 bg = aFails ? 0xFF8B0000 : 0xFF103060;		// dark red if anything failed, else dark blue
 	for (int i = 0; i < KCols; ++i)
 		DrawGlyph(i, 0, buf[i], 0xFFFFE066, bg);
+	}
+
+// the full kernel's display driver gave the top of the screen to the user side: keep the kernel log below it
+extern "C" void A64_ConsoleReserveTop(int aPixels)
+	{
+	int first = (aPixels + FONT_H - 1) / FONT_H;
+	if (first >= KRows - 2)
+		return;
+	gFirstRow = first;
+	gCol = 0;
+	gRow = first;
+	for (int r = first; r < KRows; ++r)
+		ClearRow(r);
 	}
 
 extern "C" void A64_ConsolePin(int aSlot, const char* aText)

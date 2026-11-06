@@ -176,6 +176,12 @@ void DThread::EpocThreadFunction(TAny* aPtr)
 	kumemput((TAny*)usp, &info, size);
 	TBool first = t->iFlags & KThreadFlagOriginal;
 	DProcess* p = t->iOwningProcess;
+	if (first)												// bring-up aid: the boot chain, process by process
+		{
+		TFullName name;
+		p->Name(name);
+		Kern::Printf("[proc] %S starts", &name);
+		}
 	TLinAddr pc = first ? p->iCodeSeg->iEntryPtVeneer : p->iReentryPoint;
 	TUint32 reason = first ? KModuleEntryReasonProcessInit : KModuleEntryReasonThreadInit;
 	t->iUserThreadState = EUserThreadRunning;

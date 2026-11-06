@@ -32,5 +32,12 @@ extern const SA64IoRegion A64_IoRegions[];
 extern const int A64_IoRegionCount;
 extern unsigned long A64_IoWindow;
 unsigned long A64_Io(unsigned long aPhys);
+
+// The framebuffer the full kernel's display HAL hands the user side (board/a64_display.cpp): physical address (0 = a
+// RAM framebuffer the driver allocates), the user side's width x height, the line stride in bytes; 32 bpp a8r8g8b8.
+extern const unsigned long A64_FbPhys;
+extern const int A64_FbWidth, A64_FbHeight, A64_FbStride;
+// The user side has taken the top aPixels rows of the screen: the kernel's own screen console keeps below them
+void A64_ConsoleReserveTop(int aPixels);
 }
 #endif

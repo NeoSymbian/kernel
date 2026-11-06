@@ -11,9 +11,9 @@
 #include <nk_irq.h>
 #include <arm.h>
 #include <mmboot.h>
-#include "../a64smp/a64_sysreg.h"
-#include "../board/board.h"
-#include "../platform/a64_platform.h"
+#include "a64_sysreg.h"
+#include "board.h"
+#include "a64_platform.h"
 
 TSubScheduler& SubScheduler();
 extern "C" void send_resched_ipi(TInt aCpu);				// a64s_ncsched.cpp

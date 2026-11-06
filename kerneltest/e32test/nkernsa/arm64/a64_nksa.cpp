@@ -10,10 +10,10 @@
 #include <nktest/nkutils.h>
 #include <e32rom.h>
 #include <kernboot.h>
-#include "../a64smp/a64_sysreg.h"
-#include "../board/gicv3.h"
-#include "../board/board.h"
-#include "../platform/a64_platform.h"
+#include "a64_sysreg.h"
+#include "gicv3.h"
+#include "board.h"
+#include "a64_platform.h"
 
 extern "C" void KernelMain();
 extern "C" void generic_ipi_isr(TSubScheduler* aS);		// nkernsmp/nkern.cpp

@@ -23,7 +23,7 @@
 #include <e32rom.h>
 #include <kernel/kernboot.h>
 #include <mmboot.h>
-#include "../board/board.h"
+#include "board.h"
 
 typedef TUint64 TEntry;
 

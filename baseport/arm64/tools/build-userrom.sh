@@ -21,7 +21,7 @@ mkdir -p "$OUT/user"; rm -f "$OUT"/user/*
 ARGS=$OUT/user/rombuild.args
 # --xip/--data "<Z: path>=<path in the volume>" pairs, re-rooted at the mount; our estart.txt; --xinfo dropped (the
 # section takes its layout from its own options)
-python3 -I - "$SRCARGS" "$S2010" "$HERE/boot/estart.txt" "$ARGS" "${USERROM_SKIP-}" <<'PY'
+python3 -I - "$SRCARGS" "$S2010" "$HERE/common/estart.txt" "$ARGS" "${USERROM_SKIP-}" <<'PY'
 import sys
 src, root, estart, out = sys.argv[1:5]
 words = [w.rstrip("\n") for w in open(src) if w.strip()]

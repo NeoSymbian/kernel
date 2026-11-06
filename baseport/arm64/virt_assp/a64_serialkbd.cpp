@@ -11,7 +11,7 @@
 #include <kernel/kern_priv.h>
 #include <e32keys.h>
 #include "board.h"
-#include "../platform/a64_platform.h"
+#include "a64_platform.h"
 #include "a64_dbgmon.h"
 
 const TUint32 KUartPhys = 0x09000000;					// PL011 (qemu_virt.cpp's console)

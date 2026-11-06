@@ -10,7 +10,7 @@
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "qcom_spmi.h"
-#include "../platform/a64_platform.h"
+#include "a64_platform.h"
 
 const TUint32 KPonSoftRbSpare = 0x088f;				// PM660 (SID 0) PON 0x800 + 0x8F
 const TUint32 KReasonBootloader = 2, KReasonShift = 1;

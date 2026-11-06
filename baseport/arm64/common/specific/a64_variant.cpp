@@ -11,7 +11,7 @@
 #include <assp.h>
 #include <mmboot.h>
 #include "board.h"
-#include "../platform/a64_platform.h"
+#include "a64_platform.h"
 
 const TInt KTickUs = 1000;			// system tick period: 1 ms, as every EKA2 port
 

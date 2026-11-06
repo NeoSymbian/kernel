@@ -15,7 +15,7 @@
 #include "a64_blk.h"
 #include "qcom_spmi.h"
 #include "a64_dbgmon.h"
-#include "../platform/a64_platform.h"
+#include "a64_platform.h"
 
 // ---- the log ring
 const TUint32 KLogSize = 64 * 1024;

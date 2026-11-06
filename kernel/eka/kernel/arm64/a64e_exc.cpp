@@ -19,8 +19,8 @@
 #include <kernel/kern_priv.h>
 #include <arm.h>
 #include <mmboot.h>
-#include "../board/board.h"
-#include "../platform/a64_platform.h"
+#include "board.h"
+#include "a64_platform.h"
 
 TSubScheduler& SubScheduler();
 

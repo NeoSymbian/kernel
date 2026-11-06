@@ -6,13 +6,12 @@
 # Never stops on a failing TU; prints OK/FAIL counts and the top error classes. LINK=1 also links the objects with
 # the nanokernel + arm64 backend (compiled here with the ekern flags) and lists the UNDEFINED symbols = the ekern
 # backend still to write.
-# Shadow headers win over the baseline: port/arm64/ekern (kernel arch) and port/arm64/mm (memory model) come first.
-# Runs in the symbian-a64dev image. Env: KHS = kernelhwsrv checkout, OUT = output dir, LINK=0|1.
+# The arm64 headers (INC64, tools/paths.sh) are searched before the baseline's ARM ones.
+# Runs in the symbian-a64dev image. Env: KHS = the kernel tree (default: this checkout), OUT = output dir, LINK=0|1.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-KHS=${KHS:-/DATA/AppData/symbian-build/src/core/symbian/kernelhwsrv}
+. "$HERE/tools/paths.sh"
 OUT=${OUT:-$HERE/../../out/ekern-census}
-EKA=$KHS/kernel/eka
 X=${CROSS:-aarch64-linux-gnu-}
 LINK=${LINK:-0}
 mkdir -p "$OUT/kinc/kernel" "$OUT/obj"; rm -f "$OUT"/*.log "$OUT"/obj/*.o
@@ -39,12 +38,11 @@ CXX="${X}g++-14 -mabi=ilp32 -march=armv8.2-a -mno-outline-atomics -ffreestanding
 DEFS="-D__GCC32__ -D__EPOC32__ -D__SYMBIAN32__ -D__KERNEL_MODE__ -D__IN_KERNEL__ -D_UNICODE -D__SMP__ \
       -D__MEMMODEL_FLEXIBLE__ -DMM_FLEXIBLE -D__CPU_ARMV7"
 FLX=$EKA/memmodel/epoc/flexible
-INCS="-I $HERE/a64smp -I $HERE/ekern -I $HERE/mm \
+INCS="$INC64 \
       -I $EKA/include/nkernsmp -I $EKA/include -I $EKA/include/kernel -I $EKA/include/kernel/arm \
       -I $EKA/include/memmodel/epoc -I $EKA/include/memmodel/epoc/flexible -I $EKA/include/memmodel/epoc/flexible/arm \
       -I $FLX -I $FLX/mmu -I $FLX/mmu/arm -I $EKA/include/memmodel/epoc/mmubase -I $EKA/memmodel/epoc/mmubase \
       -I $EKA/memmodel/epoc -I $EKA/klib -I $EKA/common -I $KHS/halservices/hal/inc -I $KINC -I $KINC/kernel"
-PRE="-include $HERE/prelude/port_prelude.h -include $HERE/prelude/arm64_prelude.h -include $EKA/include/e32def.h"
 
 TUS="$(cd $EKA && ls kernel/*.cpp kernel/arm/*.cpp klib/*.cpp klib/arm/*.cpp 2>/dev/null)
 common/alloc.cpp common/array.cpp common/des8.cpp common/mem.cpp common/heap_hybrid.cpp
@@ -61,9 +59,9 @@ for tu in $TUS; do
 		kernel/arm/*_entry*.cpp|kernel/exstart.cpp|kernel/arm/vfp.cpp) continue;; esac
 	n=$(echo "$tu" | tr '/' '_'); n=${n%.cpp}
 	src="$EKA/$tu"
-	# a marked-delta copy in port/arm64/mm (memory model) or port/arm64/ekern (kernel) replaces the baseline TU
-	[ -f "$HERE/mm/$(basename "$tu")" ] && case "$tu" in memmodel/*) src="$HERE/mm/$(basename "$tu")";; esac
-	[ -f "$HERE/ekern/$(basename "$tu")" ] && case "$tu" in kernel/arm/*) src="$HERE/ekern/$(basename "$tu")";; esac
+	# an arm64 sibling replaces the baseline TU: <dir>/arm/x.cpp -> <dir>/arm64/x.cpp, <dir>/x.cpp -> <dir>/arm64/x.cpp
+	d=$(dirname "$tu"); case "$d" in */arm) a64="$EKA/${d%/arm}/arm64/$(basename "$tu")";; *) a64="$EKA/$d/arm64/$(basename "$tu")";; esac
+	[ -f "$a64" ] && { src="$a64"; echo "arm64 replaces $tu"; }
 	# Kern::Printf straight to the board console from the kernel's first line (the variant defines DebugOutputChar)
 	extra=""; [ "$tu" = kernel/arm/cutils.cpp ] && extra="-D__EARLY_DEBUG__"
 	# DThread::Exit's exit report sits under #ifdef KPANIC, a debug-build trace bit: keep it (the fork prints it always)
@@ -93,20 +91,20 @@ if [ "$LINK" = 1 ]; then
 		$CXX $DEFS $INCS $PRE -c "$EKA/${spec##*:}/$f" -o "$OUT/nk/nk_${f%.cpp}.o" 2>"$OUT/nk_${f%.cpp}.log" \
 			|| { echo "FAIL nanokernel $f"; grep -m3 'error:' "$OUT/nk_${f%.cpp}.log"; }
 	done
-	for b in "$HERE"/a64smp/*.cpp; do
+	for b in "$NK64"/a64s_*.cpp "$EKA"/common/arm64/*.cpp; do
 		n=$(basename "$b" .cpp)
 		$CXX $DEFS $INCS $PRE -c "$b" -o "$OUT/nk/be_$n.o" 2>"$OUT/be_$n.log" \
 			|| { echo "FAIL backend $n"; grep -m3 'error:' "$OUT/be_$n.log"; }
 	done
-	${X}gcc-14 -mabi=ilp32 -c "$HERE/a64smp/a64_ctxsw.S" -o "$OUT/nk/a64_ctxsw.o"
-	# the ekern backend (port/arm64/ekern/a64e_*) and the shared platform layer
-	for b in "$HERE"/ekern/a64e_*.cpp "$HERE"/platform/*.cpp; do
+	${X}gcc-14 -mabi=ilp32 -c "$NK64/a64_ctxsw.S" -o "$OUT/nk/a64_ctxsw.o"
+	# the ekern backend (the a64e_* files) and the shared platform layer
+	for b in "$K64"/a64e_*.cpp "$NK64"/a64e_*.cpp "$FLX"/arm64/a64e_*.cpp "$NK64"/a64_platform.cpp; do
 		[ -e "$b" ] || continue
 		n=$(basename "$b" .cpp)
 		$CXX $DEFS $INCS $PRE -c "$b" -o "$OUT/nk/x_$n.o" 2>"$OUT/x_$n.log" \
 			&& echo "  backend $n OK" || { echo "FAIL backend $n"; grep -m6 'error' "$OUT/x_$n.log" | sed 's/^/      /'; }
 	done
-	for b in "$HERE"/ekern/a64e_*.S; do
+	for b in "$K64"/a64e_*.S; do
 		[ -e "$b" ] || continue
 		n=$(basename "$b" .S)
 		${X}gcc-14 -mabi=ilp32 -c "$b" -o "$OUT/nk/x_$n.o" 2>"$OUT/x_$n.log" \

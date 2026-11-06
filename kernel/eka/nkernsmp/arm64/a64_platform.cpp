@@ -5,9 +5,9 @@
 // tied-event tail, preemption when leaving the outermost interrupt).
 #include <nkern.h>
 #include <nk_priv.h>
-#include "../a64smp/a64_sysreg.h"
-#include "../board/gicv3.h"
-#include "../board/board.h"
+#include "a64_sysreg.h"
+#include "gicv3.h"
+#include "board.h"
 #include "a64_platform.h"
 
 extern "C" void generic_ipi_isr(TSubScheduler* aS);		// nkernsmp/nkern.cpp

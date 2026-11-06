@@ -3,12 +3,11 @@
 # census.sh -- compile the arch-NEUTRAL nkernsmp core UNMODIFIED for AArch64 ILP32, plus whatever arm64 backend
 # exists, and list the symbols still undefined: the backend surface left to write. Modelled on Phorepoc's
 # adaptation-x86-64 port/build_nkernsmp_link.sh. Never stops on a failing TU; prints a summary.
-# Runs in the symbian-a64dev image. Env: KHS = kernelhwsrv checkout, OUT = output dir.
+# Runs in the symbian-a64dev image. Env: KHS = the kernel tree (default: this checkout), OUT = output dir.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-KHS=${KHS:-/DATA/AppData/symbian-build/src/core/symbian/kernelhwsrv}
+. "$HERE/tools/paths.sh"
 OUT=${OUT:-$HERE/../../out/census}
-EKA=$KHS/kernel/eka
 X=${CROSS:-aarch64-linux-gnu-}
 mkdir -p "$OUT"; rm -f "$OUT"/*.o "$OUT"/*.log
 
@@ -16,8 +15,7 @@ CXX="${X}g++-14 -mabi=ilp32 -march=armv8.2-a -mno-outline-atomics -ffreestanding
      -std=gnu++03 -fno-exceptions -fno-rtti -fno-lifetime-dse -fno-strict-aliasing -fno-delete-null-pointer-checks \
      -Wall -Wno-unused -O2 -fpermissive"   # -fpermissive: EKA2 declares operator new(TUint), ILP32 size_t is unsigned long (Phorepoc ARM build uses it too)
 DEFS="-D__GCC32__ -D__EPOC32__ -D__SYMBIAN32__ -D__KERNEL_MODE__ -D__SMP__ -D__STANDALONE_NANOKERNEL__"
-INCS="-I $HERE/a64smp -I $EKA/include -I $EKA/include/nkernsmp"
-PRE="-include $HERE/prelude/port_prelude.h -include $HERE/prelude/arm64_prelude.h -include $EKA/include/e32def.h"
+INCS="-I $EKA/include/nkernsmp/arm64 -I $EKA/include -I $EKA/include/nkernsmp -I $EKA/include/kernel/arm64"
 
 NEUTRAL="nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nkernsmp \
          dfcs.cpp:nkernsmp nk_timer.cpp:nkernsmp nk_irq.cpp:nkernsmp nk_bal.cpp:nkernsmp"
@@ -35,7 +33,7 @@ for spec in $NEUTRAL; do
 done
 
 echo "== arm64 backend"
-for src in "$HERE"/a64smp/*.cpp "$HERE"/a64smp/*.S; do
+for src in "$NK64"/a64s_*.cpp "$EKA"/common/arm64/*.cpp "$NK64"/a64_ctxsw.S; do
 	[ -e "$src" ] || continue
 	b=$(basename "$src"); o=$OUT/backend_${b%.*}.o
 	case $src in *.S) cc="${X}gcc-14 -mabi=ilp32 -c" ;; *) cc="$CXX $DEFS $INCS $PRE -c" ;; esac   # asm: no C++ prelude

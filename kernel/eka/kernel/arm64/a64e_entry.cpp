@@ -8,7 +8,7 @@
 #include <kernel/kern_priv.h>
 #include <plat_priv.h>
 #include <mmboot.h>
-#include "../board/board.h"
+#include "board.h"
 
 extern "C" void KernelMain();
 extern "C" char _start[];									// the boot stub (ekern.lds), identity-mapped

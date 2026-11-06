@@ -10,6 +10,8 @@
 #include <nk_priv.h>
 #include <nk_irq.h>
 #include <arm.h>
+#include <mmboot.h>
+#include "../a64smp/a64_sysreg.h"
 #include "../board/board.h"
 #include "../platform/a64_platform.h"
 
@@ -85,12 +87,78 @@ void NKern::NotifyCrash(const TAny* /*a0*/, TInt /*a1*/)
 	for (;;) { __asm__ __volatile__("msr daifset, #3\n\twfi"); }
 	}
 
-// nccpu.cpp: start one application processor.
-// shortcut: the first full-kernel boot runs one CPU (board A64_CpuCount()==1, so A::InitAPs never calls this);
-// the PSCI CPU_ON version with a physical boot block is M4.2 step 6
-TInt NKern::BootAP(volatile SAPBootInfo*)
+/******************************************************************************
+ * Application processors (nkernsmp/arm/nccpu.cpp, PSCI style). A::InitAPs boots them one at a time: K::InitAP
+ * creates the CPU's idle thread, calls NKern::BootAP, and waits for ApMainGeneric to set iArgs[1].
+ *
+ * PSCI CPU_ON starts the core with the MMU off, at a physical address, while everything the kernel hands it is
+ * linear. The boot stub (boot.S, below the RAM bank, physical = linear) has the entry; it switches the MMU on with a
+ * PRIVATE boot root: OS ASID 0's level-1 entries, except that the 1 GB slot holding the stub points at a copy of the
+ * kernel's level-2 table there plus a 2 MB identity block over the stub (the bootstrap's window, which _E32Startup
+ * removed from the live tables). The kernel's own tables are never touched.
+ ******************************************************************************/
+struct SA64ApBoot					// boot.S A64_ApEntry reads it with the MMU off: offsets fixed
 	{
-	return KErrNotSupported;
+	TUint64 iMair, iTcr, iTtbr0, iSctlr;
+	TUint64 iSp;					// top of the idle thread's supervisor stack (linear)
+	TUint64 iEntry;					// A64_ApStart (linear)
+	TUint64 iInfo;					// the SAPBootInfo (linear)
+	};
+static SA64ApBoot ApBoot __attribute__((aligned(64)));
+static TUint64 ApRoot[4] __attribute__((aligned(64)));
+static TUint64 ApL2[KPageSize / sizeof(TUint64)] __attribute__((aligned(4096)));
+extern "C" void A64_ApEntry();						// boot.S
+extern "C" char A64_Vectors[];						// boot/vectors.S
+extern TPhysAddr A64RootTablePhys;					// mm/mpdalloc.cpp: OS ASID 0's root
+
+static TUint64 PhysOf(const volatile TAny* aLin)	// a mapped kernel address -> physical (stage 1 translation)
+	{
+	TUint64 par;
+	__asm__ __volatile__("at s1e1r, %1\n\tisb\n\tmrs %0, par_el1" : "=r"(par) : "r"((TUint64)(TLinAddr)aLin) : "memory");
+	__NK_ASSERT_ALWAYS(!(par & 1));
+	return (par & KA64OutAddrMask) | ((TLinAddr)aLin & KPageMask);
+	}
+
+// the AP's first C++, linear, on its idle thread's stack: onto the kernel's own root (dropping the identity entry
+// from this core's TLB), the kernel's vectors, then the generic AP start (NKern::Init, M::Init2AP, A::Init2AP)
+extern "C" void A64_ApStart(volatile SAPBootInfo* aInfo)
+	{
+	__asm__ __volatile__("msr ttbr0_el1, %0\n\tisb\n\ttlbi vmalle1\n\tdsb nsh\n\tisb\n\tmsr vbar_el1, %1\n\tisb"
+		:: "r"((TUint64)A64RootTablePhys), "r"((TUint64)(TLinAddr)A64_Vectors) : "memory");
+	(*aInfo->iMain)(aInfo);							// ApMainGeneric: never returns
+	for (;;)
+		__asm__ __volatile__("wfi");
+	}
+
+TInt NKern::BootAP(volatile SAPBootInfo* aInfo)
+	{
+	volatile SArmAPBootInfo& a = *(volatile SArmAPBootInfo*)aInfo;
+	const TUint32 stub = (TUint32)(TLinAddr)&A64_ApEntry;
+	const TUint gi = stub >> 30;					// the stub's 1 GB slot in the level-1 root
+	memcpy(ApL2, (const TAny*)(KPageDirectoryBase + gi * KPageSize), sizeof(ApL2));	// OS ASID 0's level-2 table
+	TUint64& id = ApL2[(stub >> KChunkShift) & (KPageSize / sizeof(TUint64) - 1)];
+	__NK_ASSERT_ALWAYS(id == 0);					// the stub's 2 MB is unused by the kernel (QEMU: local; Pixel: below the ROM)
+	id = (stub & ~(TUint64)KChunkMask) | KA64DescBlock | KA64AF | (3 << KA64AttrIndxShift) | KA64SHInner | KA64UXN;
+	const TUint64* root = (const TUint64*)KRootTableBase;
+	for (TInt i = 0; i < 4; ++i)
+		ApRoot[i] = root[i];
+	ApRoot[gi] = PhysOf(ApL2) | KA64DescTable;
+
+	ApBoot.iMair = A64_SYSREG_READ(mair_el1);
+	ApBoot.iTcr = A64_SYSREG_READ(tcr_el1);
+	ApBoot.iSctlr = A64_SYSREG_READ(sctlr_el1);
+	ApBoot.iTtbr0 = PhysOf(ApRoot);
+	ApBoot.iSp = a.iInitStackBase + a.iInitStackSize;
+	ApBoot.iEntry = (TLinAddr)&A64_ApStart;
+	ApBoot.iInfo = (TLinAddr)aInfo;
+	// the core reads the block, and walks the private tables, before its caches are on: put them in RAM
+	A64_DCacheRange((TLinAddr)&ApBoot, sizeof(ApBoot), FALSE);
+	A64_DCacheRange((TLinAddr)ApRoot, sizeof(ApRoot), FALSE);
+	A64_DCacheRange((TLinAddr)ApL2, sizeof(ApL2), FALSE);
+	TInt r = A64_PsciCpuOn(a.iMpidr, stub, PhysOf(&ApBoot));
+	if (r != 0)
+		Kern::Printf("NKern::BootAP: PSCI CPU_ON(cpu %d, mpidr %x) = %d", a.iCpu, (TUint32)a.iMpidr, r);
+	return r == 0 ? KErrNone : KErrGeneral;
 	}
 
 // ncthrd.cpp: the user-mode register set of a thread.

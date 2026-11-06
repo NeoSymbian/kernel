@@ -120,11 +120,53 @@ extern "C" TAny* A64VariantInitialise(TInt aMode)
 
 // Self-test, as Phorepoc's ProbeThread: on the real kernel, a supervisor thread proves DThread creation, a fault
 // under an exception trap (data abort -> Exc::Dispatch -> TExcTrap::Exception longjmps back with KErrBadDescriptor),
-// blocking on the nanokernel timer queue (NKern::Sleep -> tick -> timer DFC -> wake) and thread exit.
+// blocking on the nanokernel timer queue (NKern::Sleep -> tick -> timer DFC -> wake) and thread exit. Then one
+// sleeper thread pinned to each CPU: every core's GIC, IPIs and timer path, and the SMP scheduler.
+static TInt StartThread(const TDesC& aName, TThreadFunction aFunction, TAny* aPtr, TInt aCpu)
+	{
+	SThreadCreateInfo info;
+	info.iType = EThreadSupervisor;
+	info.iFunction = aFunction;
+	info.iPtr = aPtr;
+	info.iSupervisorStack = NULL;
+	info.iSupervisorStackSize = 0;		// default
+	info.iInitialThreadPriority = 24;
+	info.iName.Set(aName);
+	info.iTotalSize = sizeof(info);
+	TInt r = Kern::ThreadCreate(info);
+	if (r != KErrNone)
+		return r;
+	DThread* t = (DThread*)info.iHandle;
+	if (aCpu >= 0)
+		NKern::ThreadSetCpuAffinity(&t->iNThread, aCpu);
+	Kern::ThreadResume(*t);
+	return KErrNone;
+	}
+
+static volatile TUint32 SleepersDone;
+static TInt SleeperThread(TAny* aCpu)
+	{
+	TInt cpu = (TInt)aCpu;
+	TInt t0 = NKern::TickCount();
+	TBool onCpu = ETrue;
+	for (TInt i = 0; i < 4; ++i)
+		{
+		NKern::Sleep(100);
+		onCpu = onCpu && NKern::CurrentCpu() == cpu;
+		}
+	Kern::Printf("[probe] sleeper on cpu %d: 4 x Sleep(100) took %d ticks%s", cpu, NKern::TickCount() - t0,
+		onCpu ? "" : " (ran on another CPU!)");
+	if (onCpu)
+		__e32_atomic_add_ord32(&SleepersDone, 1);
+	return KErrNone;
+	}
+
 _LIT(KProbeName, "A64Probe");
+_LIT(KSleeperName, "A64Sleeper");
 static TInt ProbeThread(TAny*)
 	{
-	Kern::Printf("[probe] thread running, tick %d", NKern::TickCount());
+	TInt ncpus = NKern::NumberOfCpus();
+	Kern::Printf("[probe] thread running, tick %d, %d CPU(s) up of %d present", NKern::TickCount(), ncpus, A64_CpuCount());
 	TInt r = 12345;
 	XTRAP(r, XT_DEFAULT, { volatile TInt v = *(volatile TInt*)0x0BAD0000u; (void)v; });	// unmapped local address
 	Kern::Printf("[probe] XTRAP around a read of 0x0BAD0000 -> %d (KErrBadDescriptor = %d)", r, KErrBadDescriptor);
@@ -135,8 +177,20 @@ static TInt ProbeThread(TAny*)
 		Kern::Printf("[probe] woke #%d at tick %d (slept 100)", i, NKern::TickCount());
 		}
 	TInt dt = NKern::TickCount() - t0;
-	TBool ok = r == KErrBadDescriptor && dt >= 400 && dt < 600;
-	Kern::Printf("[probe] %s: XTRAP %d, 4 x Sleep(100) took %d ticks", ok ? "PASS" : "FAIL", r, dt);
+	for (TInt c = 0; c < ncpus; ++c)
+		{
+		TBuf<16> name(KSleeperName);					// thread names are unique within a process
+		name.AppendNum(c);
+		TInt e = StartThread(name, SleeperThread, (TAny*)c, c);
+		if (e != KErrNone)
+			Kern::Printf("[probe] sleeper for cpu %d: create -> %d", c, e);
+		}
+	for (TInt w = 0; w < 40 && __e32_atomic_load_acq32(&SleepersDone) < (TUint32)ncpus; ++w)
+		NKern::Sleep(50);
+	TInt done = (TInt)__e32_atomic_load_acq32(&SleepersDone);
+	TBool ok = r == KErrBadDescriptor && dt >= 400 && dt < 600 && ncpus == A64_CpuCount() && done == ncpus;
+	Kern::Printf("[probe] %s: XTRAP %d, 4 x Sleep(100) took %d ticks, %d/%d CPUs, %d sleepers back",
+		ok ? "PASS" : "FAIL", r, dt, ncpus, A64_CpuCount(), done);
 	return KErrNone;
 	}
 
@@ -145,18 +199,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	{
 	if (aReason != KModuleEntryReasonExtensionInit1)
 		return KErrNone;
-	SThreadCreateInfo info;
-	info.iType = EThreadSupervisor;
-	info.iFunction = ProbeThread;
-	info.iPtr = NULL;
-	info.iSupervisorStack = NULL;
-	info.iSupervisorStackSize = 0;		// default
-	info.iInitialThreadPriority = 24;
-	info.iName.Set(KProbeName);
-	info.iTotalSize = sizeof(info);
-	TInt r = Kern::ThreadCreate(info);
+	TInt r = StartThread(KProbeName, ProbeThread, NULL, -1);
 	Kern::Printf("[probe] Kern::ThreadCreate -> %d", r);
-	if (r == KErrNone)
-		Kern::ThreadResume(*(DThread*)info.iHandle);
 	return KErrNone;
 	}

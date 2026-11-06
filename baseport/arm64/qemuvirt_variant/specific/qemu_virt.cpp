@@ -15,7 +15,6 @@ const int A64_PsciSmc = 0;
 const int A64_HoldResults = 0;		// serial log: power off (QEMU exits) at once
 const unsigned int A64_TimerPpi = 27;
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu; }			// Aff0 = CPU number
-int A64_CpuCount() { return 1; }	// shortcut: one CPU until the full kernel's BootAP exists (M4.2 step 6), then from the DTB
 const SA64IoRegion A64_IoRegions[] = {
 	{ 0x08000000, 0x00200000, 1 },		// GICv3 distributor + 8 redistributor frames
 	{ 0x09000000, 0x00001000, 1 },		// PL011

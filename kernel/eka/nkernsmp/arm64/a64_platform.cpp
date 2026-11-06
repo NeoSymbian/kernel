@@ -164,3 +164,13 @@ extern "C" TInt A64_PsciCpuOn(TUint64 aMpidr, TUint64 aEntry, TUint64 aContext)
 	{
 	return A64_Psci(0xC4000003, aMpidr, aEntry, aContext);
 	}
+
+// CPUs present: logical CPU i exists while PSCI AFFINITY_INFO(A64_CpuMpidr(i)) answers a state (ON, OFF, ON_PENDING)
+// rather than an error (-2 INVALID_PARAMETERS: no such core). QEMU -smp N and the Pixel's 8 need no constant.
+extern "C" int A64_CpuCount()
+	{
+	int n = 1;
+	while (n < KMaxCpus && A64_Psci(0xC4000004, A64_CpuMpidr(n), 0, 0) >= 0)
+		++n;
+	return n;
+	}

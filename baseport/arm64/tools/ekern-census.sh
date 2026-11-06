@@ -4,10 +4,10 @@
 # from UNMODIFIED kernelhwsrv source, the way Phorepoc's adaptation-x86-64 port/ekern_census_x32.sh sized the x32
 # port: the same TU set (ekern.mmp + memmodel.mmp), with the ARM arch C++ (kernel/arm, memmodel/.../arm) selected.
 # Never stops on a failing TU; prints OK/FAIL counts and the top error classes. LINK=1 also links the objects with
-# the nanokernel + arm64 backend and lists the UNDEFINED symbols = the ekern backend still to write.
+# the nanokernel + arm64 backend (compiled here with the ekern flags) and lists the UNDEFINED symbols = the ekern
+# backend still to write.
 # Shadow headers win over the baseline: port/arm64/ekern (kernel arch) and port/arm64/mm (memory model) come first.
-# Runs in the symbian-a64dev image. Env: KHS = kernelhwsrv checkout, OUT = output dir, LINK=0|1, NKOBJ = a
-# build-kernel.sh output dir whose nanokernel/backend objects LINK=1 uses.
+# Runs in the symbian-a64dev image. Env: KHS = kernelhwsrv checkout, OUT = output dir, LINK=0|1.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 KHS=${KHS:-/DATA/AppData/symbian-build/src/core/symbian/kernelhwsrv}
@@ -96,8 +96,21 @@ echo "--- .cia files not compiled (AArch32 asm; need AArch64 C++/asm siblings) -
 	memmodel/epoc/flexible/mmu/arm/*.cia 2>/dev/null) | sed 's/^/  /'
 
 if [ "$LINK" = 1 ]; then
-	NKOBJ=${NKOBJ:?NKOBJ = a build-kernel.sh output dir (its nk_*.o and be_*.o)}
-	${X}ld -m aarch64linux32 -r -o "$OUT/ekern_all.o" "$OUT"/obj/*.o "$NKOBJ"/nk_*.o "$NKOBJ"/be_*.o "$NKOBJ"/a64_ctxsw.o \
+	# the nanokernel the full kernel links: the neutral nkernsmp core (not the standalone test build) + our backend
+	mkdir -p "$OUT/nk"; rm -f "$OUT"/nk/*.o
+	for spec in nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nkernsmp dfcs.cpp:nkernsmp \
+	            nk_timer.cpp:nkernsmp nk_irq.cpp:nkernsmp nk_bal.cpp:nkernsmp; do
+		f=${spec%%:*}
+		$CXX $DEFS $INCS $PRE -c "$EKA/${spec##*:}/$f" -o "$OUT/nk/nk_${f%.cpp}.o" 2>"$OUT/nk_${f%.cpp}.log" \
+			|| { echo "FAIL nanokernel $f"; grep -m3 'error:' "$OUT/nk_${f%.cpp}.log"; }
+	done
+	for b in "$HERE"/a64smp/*.cpp; do
+		n=$(basename "$b" .cpp)
+		$CXX $DEFS $INCS $PRE -c "$b" -o "$OUT/nk/be_$n.o" 2>"$OUT/be_$n.log" \
+			|| { echo "FAIL backend $n"; grep -m3 'error:' "$OUT/be_$n.log"; }
+	done
+	${X}gcc-14 -mabi=ilp32 -c "$HERE/a64smp/a64_ctxsw.S" -o "$OUT/nk/a64_ctxsw.o"
+	${X}ld -m aarch64linux32 -r -o "$OUT/ekern_all.o" "$OUT"/obj/*.o "$OUT"/nk/*.o \
 		2>"$OUT/ld-r.log" || { echo "ld -r FAILED:"; head -20 "$OUT/ld-r.log"; }
 	${X}nm -u "$OUT/ekern_all.o" | awk '{print $2}' | ${X}c++filt | sort -u > "$OUT/undefined.txt"
 	echo "=== relocatable link: $(wc -l < "$OUT/undefined.txt") UNDEFINED symbols -> $OUT/undefined.txt ==="

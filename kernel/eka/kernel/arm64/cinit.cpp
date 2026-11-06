@@ -128,8 +128,7 @@ void A::Init2()
 	}
 
 #ifdef __SMP__
-// a64 port: imported by every ARM .def file but defined nowhere in the tree; 0 = no limit (patchable in a ROM)
-EXPORT_D extern const TInt KSMPNumCpus = 0;
+IMPORT_D extern const TInt KSMPNumCpus;
 
 void A::InitAPs()
 	{

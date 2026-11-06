@@ -60,6 +60,10 @@ $EKXX $DEFS $INCS $MED $PRE -c "$HERE/board/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_display.cpp" -o "$I/a64_display.o"
 [ "$BOARD" = qemu ] && $EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
 	-c "$HERE/board/a64_serialkbd.cpp" -o "$I/a64_serialkbd.o"	# its thread dump reads scheduler internals
+if [ "$BOARD" = bonito ]; then	# the power and volume keys, over the PMIC's SPMI bus
+	$EKXX $DEFS $INCS $PRE -c "$HERE/board/qcom_spmi.cpp" -o "$I/qcom_spmi.o"
+	$EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_keys.cpp" -o "$I/a64_keys.o"
+fi
 # the real exstart (starts the ROM secondary), statically linked: only its entry points are renamed
 $EKXX $DEFS $INCS $PRE -DKernelModuleEntry=A64ExstartEntry -DInitExtension=A64ExstartInit \
 	-c "$EKA/kernel/exstart.cpp" -o "$I/exstart.o"

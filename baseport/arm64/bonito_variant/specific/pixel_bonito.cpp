@@ -22,6 +22,8 @@ unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu << 8; }		// Aff1
 const SA64IoRegion A64_IoRegions[] = {
 	{ 0x17a00000, 0x00200000, 1 },		// GICv3 distributor + redistributors
 	{ 0x9c000000, 0x00900000, 2 },		// the framebuffer's 4320 x 2160 bytes (in RAM: the bank must stop below it)
+	{ 0x0c440000, 0x00002000, 1 },		// SPMI PMIC arbiter core: version + the apid map (qcom_spmi.cpp)
+	{ 0x0e600000, 0x00010000, 1 },		// SPMI arbiter observer channels, ee 0: 512 x 0x80
 	};
 const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
 // ABL's continuous-splash framebuffer: the user side gets the top 1800 rows, the kernel console the 360 below

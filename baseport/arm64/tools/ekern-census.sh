@@ -62,6 +62,18 @@ for tu in $TUS; do
 	src="$EKA/$tu"
 	# a marked-delta copy in port/arm64/mm (memory model) or port/arm64/ekern (kernel) replaces the baseline TU
 	[ -f "$HERE/mm/$(basename "$tu")" ] && case "$tu" in memmodel/*) src="$HERE/mm/$(basename "$tu")";; esac
+	# one-line patches, checked: a copy in $OUT with an "a64 port" marker that must appear exactly once
+	pat=""
+	case "$tu" in
+	# the demand-paging minimum is sized by the worst user instruction; the paged code is the AArch32 user side
+	memmodel/epoc/flexible/mmu/mpager.cpp)
+		pat='s|^#if defined(__CPU_ARM)$|#if defined(__CPU_ARM) \|\| defined(__CPU_ARM64)	// a64 port: AArch32 user code is paged|' ;;
+	esac
+	if [ -n "$pat" ]; then
+		sed "$pat" "$src" > "$OUT/patched_$(basename "$tu")"
+		[ "$(grep -c 'a64 port:' "$OUT/patched_$(basename "$tu")")" = 1 ] || echo "PATCH NOT APPLIED: $tu"
+		src="$OUT/patched_$(basename "$tu")"
+	fi
 	if $CXX $DEFS $INCS $PRE -c "$src" -o "$OUT/obj/$n.o" 2>"$OUT/$n.log"; then
 		pass=$((pass+1)); rm -f "$OUT/$n.log"
 	else

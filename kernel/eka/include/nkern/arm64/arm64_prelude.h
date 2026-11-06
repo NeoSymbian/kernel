@@ -19,6 +19,8 @@
 #define __CPU_HAS_CACHE
 #define __CPU_SUPPORTS_FAST_PROCESS_SWITCH	/* ASIDs: no TLB flush on process switch */
 #define __CPU_PAGE_TABLES_FULLY_CACHED		/* VMSAv8 walks are cache-coherent (TCR_EL1 IRGN/ORGN) */
+#define __CPU_SUPPORTS_PAGE_TABLE_WALK_TO_L1_CACHE	/* ...so a PTE/PDE update needs a DSB, not a cache clean
+												 * (cache_maintenance.inl; its clean is AArch32 MCR) */
 
 /* spin-wait hints (nk_cpu.h x86 section: pause) */
 #define __chill()	__asm__ __volatile__("yield" ::: "memory")

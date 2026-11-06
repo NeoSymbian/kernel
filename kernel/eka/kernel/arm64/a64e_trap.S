@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: EPL-1.0
+/* SPDX-License-Identifier: EPL-2.0
  *
  * a64e_trap.S -- the setjmp-style exception traps and the "magic" fault-tolerant accessors of the ARM kernel
  * (kernel/arm/ckernel.cia, csched.cia) for AArch64. The C++ members (TExcTrap::Trap, ...) are naked forwarders in

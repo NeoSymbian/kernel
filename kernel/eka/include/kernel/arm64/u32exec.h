@@ -1,5 +1,5 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
 // u32exec.h -- shadow of kernel/eka/include/u32exec.h for the AArch64 ILP32 kernel.
 // The baseline has an executive-call section per CPU (WINS, X86, ARM) and #errors on anything else. That section
@@ -46,7 +46,7 @@
 #define KSLOW_EXEC4(n)		__A64_NO_EXEC_STUB(n)
 
 #else
-#error "port/arm64/ekern/u32exec.h is the arm64 kernel's shadow: build with the arm64 prelude"
+#error "include/kernel/arm64/u32exec.h is the arm64 kernel's shadow: build with the arm64 prelude"
 #endif
 
 #ifdef __LEAVE_EQUALS_THROW__

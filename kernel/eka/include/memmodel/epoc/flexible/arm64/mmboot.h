@@ -1,7 +1,7 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
-// mmboot.h -- shadow of include/memmodel/epoc/flexible/arm/mmboot.h for the AArch64 ILP32 kernel (port/arm64/mm
+// mmboot.h -- shadow of include/memmodel/epoc/flexible/arm/mmboot.h for the AArch64 ILP32 kernel (its arm64 dir
 // first on -I).
 //
 // The LINEAR MAP is the ARM flexible model's, unchanged: the AArch32 user side is laid out by rombuild for it (ROM at

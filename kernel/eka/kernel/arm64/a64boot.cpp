@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: EPL-2.0
 //
 // a64boot.cpp -- the BOOTSTRAP of the AArch64 full kernel, for the flexible memory model. A port of Phorepoc's
-// x86-64 bootstrap (adaptation-x86-64 ekern/xboot.cpp) to VMSAv8-64 tables (port/arm64/mm/mmboot.h).
+// x86-64 bootstrap (adaptation-x86-64 ekern/xboot.cpp) to VMSAv8-64 tables (arm64/mmboot.h).
 //
 // boot.S calls A64_BootMain at EL1 with the MMU and caches off, at the image's physical (= link) address. It
 // leaves the machine as EKA2's kernel entry expects:

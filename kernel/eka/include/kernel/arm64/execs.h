@@ -1,8 +1,8 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
 // execs.h -- shadow of kernel/eka/include/kernel/execs.h for the AArch64 ILP32 kernel (every user includes it as
-// "execs.h", so port/arm64/ekern first on -I wins). The baseline builds the fast/slow executive tables per CPU and
+// "execs.h", so include/kernel/arm64 first on -I wins). The baseline builds the fast/slow executive tables per CPU and
 // #errors on anything else; the ARM branch emits them with AArch32 inline asm (.word lists in a naked function).
 // The arm64 branch is the X86 branch's portable C++ arrays: EpocFastExecTable = {count, fn...}, EpocSlowExecTable
 // = {count, invalid handler, preprocess handler, {flags, fn}...}, laid out exactly as genexec.pl's exec_kernel.h
@@ -77,7 +77,7 @@ class DShBuf;
 #define	DECLARE_SLOW_EXEC_INVALID			0, DECLARE_FUNC(InvalidExecHandler)
 
 #else
-#error "port/arm64/ekern/execs.h is the arm64 kernel's shadow: build with the arm64 prelude"
+#error "include/kernel/arm64/execs.h is the arm64 kernel's shadow: build with the arm64 prelude"
 #endif
 
 #include <kernel/exec_kernel.h>

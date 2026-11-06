@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: EPL-1.0
+/* SPDX-License-Identifier: EPL-2.0
  *
  * arm64_prelude.h -- force-included (after port_prelude.h) for every kernel-side TU of the AArch64 ILP32 port.
  *

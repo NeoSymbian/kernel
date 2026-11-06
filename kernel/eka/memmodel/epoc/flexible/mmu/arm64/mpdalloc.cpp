@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// AArch64 port: marked-delta copy (port/arm64/mm/mpdalloc.cpp); changes are marked "a64 port".
+// AArch64 port: marked-delta copy of memmodel/epoc/flexible/mmu/mpdalloc.cpp; changes are marked "a64 port".
 //
 // Description:
 //

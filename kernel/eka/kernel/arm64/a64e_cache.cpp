@@ -1,5 +1,5 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
 // a64e_cache.cpp -- the InternalCache primitives of kernel/arm/cache_maintenance{,v7}.cia for AArch64. The C++
 // policy above them (kernel/arm/cache_maintenance.cpp, compiled unmodified) uses the ARMv7 model, which ARMv8 keeps:

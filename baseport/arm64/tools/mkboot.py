@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Write an Android boot.img (header v0) for the Pixel 3a XL ABL: kernel with the DTB appended, no ramdisk.
 
 Usage: python3 mkboot.py KERNEL DTB OUT

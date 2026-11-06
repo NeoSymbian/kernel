@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 // a64_main_select.cpp -- nkernsa Main that runs only the test groups chosen at build time, in the order of the
 // suite's own main.cpp, so a fix can be retried without the tests before it:
 //   NKSA_MAIN=select NKSA_TESTS="bench pipe sem ipi basic dfc|dfcquick tied rwspin fmutex skm|skmpar" build-kernel.sh

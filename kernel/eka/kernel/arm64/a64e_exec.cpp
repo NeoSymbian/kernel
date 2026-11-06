@@ -1,9 +1,9 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
 // a64e_exec.cpp -- the executive tables, the exec-call gate and thread entry for the AArch64 ekern
 // (kernel/arm/cexec.cia, nkernsmp/arm/vectors.cia __ArmVectorSwi, kernel/arm/ckernel.cia
-// DThread::EpocThreadFunction). port/arm64/ekern/execs.h emits the tables as C arrays (EpocFastExecTable /
+// DThread::EpocThreadFunction). include/kernel/arm64/execs.h emits the tables as C arrays (EpocFastExecTable /
 // EpocSlowExecTable, genexec.pl's layout); entries are 32-bit addresses, valid under ILP32.
 //
 // The user side is unchanged 32-bit ARM code at AArch32 EL0: r0-r14 are x0-x14 of the exception frame, the pc is

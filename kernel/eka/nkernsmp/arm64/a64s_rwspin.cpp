@@ -1,5 +1,5 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
 // a64s_rwspin.cpp -- TRWSpinLock and NKern::KernelLocked for the AArch64 backend: C++ ports of
 // nkernsmp/arm/ncutilf.cia (TRWSpinLock) and nkernsmp/arm/ncsched.cia (KernelLocked), same algorithm.

@@ -3,7 +3,7 @@
  *
  * ekern.lds -- the AArch64 full kernel as ONE arm64 Image (after Phorepoc's adaptation-x86-64 ekern/ekern.lds):
  *   - the throw-away boot stub (boot.S + a64boot.cpp), at its load address (MMU off, then an identity window);
- *   - the EKA2 kernel at the flexible memory model's native linear addresses (port/arm64/mm/mmboot.h): "ROM" from
+ *   - the EKA2 kernel at the flexible memory model's native linear addresses (arm64/mmboot.h): "ROM" from
  *     KRomLinearBase 0x80000000, kernel .data/.bss at KKernelDataBase 0xC8000000, whose load image stays inside the
  *     ROM, as in a real XIP ROM (the bootstrap copies it out).
  * The loader places the file by physical (load) address; a64boot.cpp builds the tables that make the linear

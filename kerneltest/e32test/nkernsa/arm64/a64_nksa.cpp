@@ -1,5 +1,5 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
 // a64_nksa.cpp -- AArch64 / QEMU virt glue for the standalone nanokernel tests (kerneltest/e32test/nkernsa):
 // the AArch64 counterpart of nkernsa/arm/armutils.{cpp,cia} plus the board hooks (Hw_Init1/InitAPs/Init3,

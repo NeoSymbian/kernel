@@ -1,7 +1,7 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
-// xmmu.h -- shadow of memmodel/epoc/flexible/mmu/arm/xmmu.h for the AArch64 kernel (port/arm64/mm first on -I;
+// xmmu.h -- shadow of memmodel/epoc/flexible/mmu/arm/xmmu.h for the AArch64 kernel (mmu/arm64 first on -I;
 // the generic memory model includes "xmmu.h" from mmu.h). Same interface as the ARM header -- barrier helpers, TLB
 // maintenance, page-directory access, PTE permission edits, the TPdeType/TPteType enums -- implemented for VMSAv8-64
 // descriptors (layout and geometry: mmboot.h).

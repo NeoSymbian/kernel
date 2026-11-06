@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 // a64_main_groups.cpp -- alternative nkernsa Main (build with NKSA_MAIN=groups instead of the suite's main.cpp):
 // only the thread-group tests from threadbasic.cpp, which hung on the phone in the migrate case, so the
 // failure reproduces in seconds instead of after 10 minutes of the full suite.

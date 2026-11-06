@@ -1,9 +1,9 @@
 /* Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
- * SPDX-License-Identifier: EPL-1.0
+ * SPDX-License-Identifier: EPL-2.0
  *
- * port/arm64/a64smp/nk_plat.h -- AArch64 (ILP32) SMP nanokernel platform header.
+ * include/nkernsmp/arm64/nk_plat.h -- AArch64 (ILP32) SMP nanokernel platform header.
  *
- * Shadows e32/include/nkernsmp/arm/nk_plat.h (selected by -I port/arm64/a64smp ahead of the baseline includes,
+ * Shadows e32/include/nkernsmp/arm/nk_plat.h (selected by -I include/nkernsmp/arm64 ahead of the baseline includes,
  * so the baseline tree is untouched). Modelled on Phorepoc's x64smp/nk_plat.h: under ILP32 pointers are 4 bytes,
  * so the per-CPU extras keep the 2010 ARM field layout and the neutral core's size asserts (256 / 128) hold.
  * Register frames are AArch64: 64-bit slots. A thread's user side is AArch32 at EL0 (r0-r14 = x0-x14).

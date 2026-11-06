@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Rasterise DejaVu Sans Mono (Bitstream Vera / DejaVu license) into a C header of 1-bit glyphs, ASCII 32-126.
 
 Usage: python3 mkfont.py OUT.h [TTF] [CELL_W] [CELL_H]

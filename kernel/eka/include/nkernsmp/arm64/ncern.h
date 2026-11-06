@@ -1,7 +1,7 @@
 /* Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
- * SPDX-License-Identifier: EPL-1.0
+ * SPDX-License-Identifier: EPL-2.0
  *
- * port/arm64/a64smp/ncern.h -- AArch64 variant interface: shadows e32/include/nkernsmp/arm/ncern.h.
+ * include/nkernsmp/arm64/ncern.h -- AArch64 variant interface: shadows e32/include/nkernsmp/arm/ncern.h.
  * Same shape as the 2010 ARM header, with the GICv2/SCU/A9-timer addresses replaced by GICv3 + generic timer.
  * The __ASM_CLI/__ASM_STI macros of the ARM header are AArch32 asm and have no users in the C++ backend.
  */

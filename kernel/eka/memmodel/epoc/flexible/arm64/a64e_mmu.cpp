@@ -1,5 +1,5 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
 // a64e_mmu.cpp -- address-space switching for the AArch64 ekern: memmodel/epoc/flexible/arm/xsched.cia
 // (DoProcessSwitch, DMemModelThread::RestoreAddressSpace) in C++.

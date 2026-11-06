@@ -1,5 +1,5 @@
 // Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
-// SPDX-License-Identifier: EPL-1.0
+// SPDX-License-Identifier: EPL-2.0
 //
 // a64e_nkern.cpp -- the nanokernel API tail only the FULL kernel (ekern) references, plus small runtime pieces, for
 // the AArch64 port. The nkernsa image never needed these. Sources: ARM nkernsmp/arm/{ncutils.cpp,ncutils.cia,

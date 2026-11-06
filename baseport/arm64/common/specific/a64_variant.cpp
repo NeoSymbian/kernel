@@ -200,6 +200,8 @@ void A64StartDisplay();									// a64_display.cpp
 __attribute__((weak)) void A64StartSerialKeyboard() {}
 // a64_keys.cpp on the Pixel: power and volume keys
 __attribute__((weak)) void A64StartKeys() {}
+// a64_touch.cpp on the Pixel: the touchscreen
+__attribute__((weak)) void A64StartTouch() {}
 
 // The one kernel extension the ROM must carry (P::StartExtensions sizes an RArray by the count: zero panics).
 extern "C" TInt A64ExtensionEntry(TInt aReason)
@@ -209,6 +211,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	A64StartDisplay();									// the screen's HAL, for the window server
 	A64StartSerialKeyboard();
 	A64StartKeys();
+	A64StartTouch();
 	A64StartMedia();									// ELOCD + the RAM drive, before exstart starts F32
 	TInt r = StartThread(KProbeName, ProbeThread, NULL, -1);
 	Kern::Printf("[probe] Kern::ThreadCreate -> %d", r);

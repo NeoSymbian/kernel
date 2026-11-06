@@ -24,6 +24,14 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x9c000000, 0x00900000, 2 },		// the framebuffer's 4320 x 2160 bytes (in RAM: the bank must stop below it)
 	{ 0x0c440000, 0x00002000, 1 },		// SPMI PMIC arbiter core: version + the apid map (qcom_spmi.cpp)
 	{ 0x0e600000, 0x00010000, 1 },		// SPMI arbiter observer channels, ee 0: 512 x 0x80
+	{ 0x0c40a000, 0x00001000, 1 },		// SPMI arbiter cnfg: the channel ownership table (writes)
+	{ 0x00118000, 0x00001000, 1 },		// GCC: QUP wrapper 1 AHB + SE1 clock branches and RCG (a64_touch.cpp)
+	{ 0x00152000, 0x00001000, 1 },		// GCC: APCS clock branch enable vote 1
+	{ 0x00a84000, 0x00004000, 1 },		// GENI serial engine 1 of QUP wrapper 1: the touchscreen's I2C
+	{ 0x03906000, 0x00002000, 1 },		// TLMM north tile: gpio6, gpio7 (I2C SDA/SCL)
+	{ 0x03963000, 0x00001000, 1 },		// TLMM north tile: gpio99 (touch reset)
+	{ 0x0397d000, 0x00001000, 1 },		// TLMM north tile: gpio125 (touch attention)
+	{ 0x03587000, 0x00001000, 1 },		// TLMM west tile: gpio135 (ts-switch)
 	};
 const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
 // ABL's continuous-splash framebuffer: the user side gets the top 1800 rows, the kernel console the 360 below

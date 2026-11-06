@@ -33,6 +33,8 @@ static void Post(TRawEvent::TType aType, TInt aScanCode)
 	Kern::AddEvent(e);
 	}
 
+__attribute__((weak)) void A64TouchDump() {}				// a64_touch.cpp: its probe, again on Volume Up
+
 static void PollDfcFn(TAny*)
 	{
 	for (TInt i = 0; i < KKeys; ++i)
@@ -46,6 +48,8 @@ static void PollDfcFn(TAny*)
 		Down[i] = down;
 		Kern::Printf("[keys] %s %s", Keys[i].iName, down ? "down" : "up");
 		Post(down ? TRawEvent::EKeyDown : TRawEvent::EKeyUp, Keys[i].iScanCode);
+		if (down && Keys[i].iScanCode == EStdKeyIncVolume)
+			A64TouchDump();
 		}
 	PollTimer.Again(NKern::TimerTicks(KPollMs));
 	}

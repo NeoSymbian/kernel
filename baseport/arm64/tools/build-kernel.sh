@@ -120,6 +120,7 @@ $AS "$HERE/boot/vectors.S" -o "$OUT/vectors.o"
 $PLAIN -I "$OUT/inc" -c "$HERE/board/$BOARD_SRC" -o "$OUT/board.o"
 $PLAIN -c "$HERE/board/boot_common.cpp" -o "$OUT/boot_common.o"
 $PLAIN -c "$HERE/board/gicv3.cpp" -o "$OUT/gicv3.o"
+$PLAIN -c "$HERE/board/console_io.cpp" -o "$OUT/console_io.o"
 
 if ! ${X}ld -m aarch64linux32 -nostdlib --no-warn-rwx-segments --defsym=KERNEL_BASE=$BASE -T "$HERE/boot/kernel.ld" -o "$OUT/kernel.elf" \
 		"$OUT"/*.o 2>"$OUT/link.log"; then

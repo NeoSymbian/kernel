@@ -16,15 +16,19 @@ const int A64_HoldResults = 0;		// serial log: power off (QEMU exits) at once
 const unsigned int A64_TimerPpi = 27;
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu; }			// Aff0 = CPU number
 int A64_CpuCount() { return 1; }	// shortcut: one CPU until the full kernel's BootAP exists (M4.2 step 6), then from the DTB
+const SA64IoRegion A64_IoRegions[] = {
+	{ 0x08000000, 0x00200000, 1 },		// GICv3 distributor + 8 redistributor frames
+	{ 0x09000000, 0x00001000, 1 },		// PL011
+	};
+const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
 }
-
-static volatile TUint32* const KUart = (volatile TUint32*)0x09000000;	// PL011 UARTDR, UARTFR at +0x18
 
 extern "C" void A64_DebugPutc(char c)
 	{
+	volatile TUint32* uart = (volatile TUint32*)A64_Io(0x09000000);	// PL011 UARTDR, UARTFR at +0x18
 	if (c == '\n') A64_DebugPutc('\r');
-	while (KUart[0x18 / 4] & (1u << 5)) {}	// TXFF
-	KUart[0] = (TUint32)c;
+	while (uart[0x18 / 4] & (1u << 5)) {}	// TXFF
+	uart[0] = (TUint32)c;
 	}
 
 /* VA = PA, 1 GB blocks. 0-1 GB devices (GIC, PL011): Device-nGnRnE, XN. 1-4 GB RAM: Normal WB, inner shareable.

@@ -1,0 +1,162 @@
+// Portions Copyright (c) Nokia Corporation and/or its subsidiary(-ies).
+// Portions Copyright The Phorepoc Authors
+// SPDX-License-Identifier: EPL-2.0
+//
+// a64_variant.cpp -- the minimal static variant of the AArch64 full kernel, linked into the image (the bootstrap's
+// fabricated ROM records point at the entry points below). Modelled on Phorepoc's DX64Variant (adaptation-x86-64
+// ekern/xk_entry.cpp): an Asic over the shared platform layer (GICv3, generic timer), the variant interface block
+// NKern::Init0 consumes, and one kernel extension, which for now hosts a kernel-thread self-test.
+#include <kernel/kern_priv.h>
+#include <nk_priv.h>
+#include <assp.h>
+#include <mmboot.h>
+#include "board.h"
+#include "../platform/a64_platform.h"
+
+const TInt KTickUs = 1000;			// system tick period: 1 ms, as every EKA2 port
+
+// cutils.cpp is built with __EARLY_DEBUG__: Kern::Printf reaches the board console from the first line of the kernel,
+// before the variant exists
+void DebugOutputChar(TUint aChar)
+	{
+	A64_DebugPutc((char)aChar);
+	}
+
+class DA64Variant : public Asic
+	{
+public:
+	virtual TMachineStartupType StartupReason()				{ return EStartupColdReset; }
+	virtual void Init1()									{ A64_InitGic(); A64_TimerInit(KTickUs); }
+	virtual void Init2AP()									{ A64_InitThisCpuGic(); A64_StartSystemTimer(); }
+	virtual void Init3()									{ A64_StartSystemTimer(); }
+	virtual void DebugOutput(TUint aChar)					{ A64_DebugPutc((char)aChar); }
+	virtual void Idle()										{ __asm__ __volatile__("dsb sy\n\twfi" ::: "memory"); }
+	virtual TInt MsTickPeriod()								{ return KTickUs; }
+	// no RTC driver yet: P::DefaultInitialTime then starts the clock from the ROM header's build time
+	virtual TInt SystemTimeInSecondsFrom2000(TInt&)			{ return KErrNotSupported; }
+	virtual TInt SetSystemTimeInSecondsFrom2000(TInt)		{ return KErrNone; }
+	// K::DoNanoWait counts the generic timer (a64e_nkern.cpp), so the calibration is never used
+	virtual TUint32 NanoWaitCalibration()					{ return 1; }
+	virtual TInt VariantHal(TInt aFunction, TAny* a1, TAny* a2);
+	virtual TPtr8 MachineConfiguration()					{ return TPtr8((TUint8*)KMachineConfigLinAddr, 0x400, 0x400); }
+	};
+
+// EHalGroupVariant. EVariantHalVariantInfo is the one UserHal::MachineInfo() requires (us_exec.cpp); Phorepoc's shape
+TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny*)
+	{
+	switch (aFunction)
+		{
+	case EVariantHalVariantInfo:
+		{
+		TVariantInfoV01Buf infoBuf;
+		TVariantInfoV01& info = infoBuf();
+		const TUint clockKHz = 1800000;				// shortcut: nominal Cortex-A55 clock, until a cpufreq driver reads it
+		info.iRomVersion = Epoc::RomHeader().iVersion;
+		info.iMachineUniqueId = TInt64(0x10005152) << 32;
+		info.iLedCapabilities = 0;
+		info.iProcessorClockInKHz = clockKHz;
+		info.iSpeedFactor = clockKHz / 25;
+		Kern::InfoCopy(*(TDes8*)a1, infoBuf);
+		return KErrNone;
+		}
+	case EVariantHalDebugPortSet:
+		{
+		TUint32 port = (TUint32)a1;					// the board console only
+		if (port != 0 && port != (TUint32)KNullDebugPort)
+			return KErrNotSupported;
+		Kern::SuperPage().iDebugPort = port;
+		return KErrNone;
+		}
+	case EVariantHalDebugPortGet:
+		{
+		TUint32 port = Kern::SuperPage().iDebugPort;
+		kumemput32(a1, &port, sizeof(port));
+		return KErrNone;
+		}
+	default:
+		return KErrNotSupported;
+		}
+	}
+
+static DA64Variant TheVariant;		// constructed by _E32Startup's static-constructor walk, before KernelMain
+static SVariantInterfaceBlock TheVib;
+// per-CPU power bookkeeping NKern::Init0 points each TSubScheduler at (ARM's default is the AP boot page, which a
+// PSCI boot doesn't have); cores are coherent and never powered down by this port, so ordinary memory serves
+static UPerCpuUncached TheUncached[KMaxCpus] __attribute__((aligned(64)));
+
+// the system tick: CPU 0 drives the nanokernel timer queue (NTimerQ::Init1 ran in A::Init1, before Init3 starts it)
+extern "C" void A64_TickHook(TSubScheduler& aSS, TUint64)
+	{
+	if (aSS.iCpuNum == 0)
+		TheTimerQ.Tick();
+	}
+
+// The variant image's entry point (KModuleEntryReasonVariantInit0): bit 0 = also call VariantInitialise(1)
+extern "C" TInt A64VariantEntry(TInt)
+	{
+	return 1;
+	}
+
+// The variant's export 1 (A::CreateVariant): 0 = the Asic, 1 = the interface block for NKern::Init0
+extern "C" TAny* A64VariantInitialise(TInt aMode)
+	{
+	if (aMode == 0)
+		return (TAny*)(Asic*)&TheVariant;
+	if (aMode != 1)
+		return NULL;
+	TUint64 cntfrq;
+	__asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+	TheVib.iVer = 0;
+	TheVib.iSize = sizeof(SVariantInterfaceBlock);
+	TheVib.iMaxCpuClock = UI64LIT(1800000000);		// shortcut: nominal, see VariantHal
+	TheVib.iMaxTimerClock = (TUint32)cntfrq;
+	TheVib.iGicDistAddr = A64_Io(A64_GicdBase);
+	TheVib.iGicRedistAddr = A64_Io(A64_GicrBase);
+	TheVib.iPsciConduit = A64_PsciSmc ? 0 : 1;
+	for (TInt i = 0; i < KMaxCpus; ++i)
+		TheVib.iUncached[i] = &TheUncached[i];
+	return &TheVib;
+	}
+
+// Self-test, as Phorepoc's ProbeThread: on the real kernel, a supervisor thread proves DThread creation, a fault
+// under an exception trap (data abort -> Exc::Dispatch -> TExcTrap::Exception longjmps back with KErrBadDescriptor),
+// blocking on the nanokernel timer queue (NKern::Sleep -> tick -> timer DFC -> wake) and thread exit.
+_LIT(KProbeName, "A64Probe");
+static TInt ProbeThread(TAny*)
+	{
+	Kern::Printf("[probe] thread running, tick %d", NKern::TickCount());
+	TInt r = 12345;
+	XTRAP(r, XT_DEFAULT, { volatile TInt v = *(volatile TInt*)0x0BAD0000u; (void)v; });	// unmapped local address
+	Kern::Printf("[probe] XTRAP around a read of 0x0BAD0000 -> %d (KErrBadDescriptor = %d)", r, KErrBadDescriptor);
+	TInt t0 = NKern::TickCount();
+	for (TInt i = 1; i <= 4; ++i)
+		{
+		NKern::Sleep(100);
+		Kern::Printf("[probe] woke #%d at tick %d (slept 100)", i, NKern::TickCount());
+		}
+	TInt dt = NKern::TickCount() - t0;
+	TBool ok = r == KErrBadDescriptor && dt >= 400 && dt < 600;
+	Kern::Printf("[probe] %s: XTRAP %d, 4 x Sleep(100) took %d ticks", ok ? "PASS" : "FAIL", r, dt);
+	return KErrNone;
+	}
+
+// The one kernel extension the ROM must carry (P::StartExtensions sizes an RArray by the count: zero panics).
+extern "C" TInt A64ExtensionEntry(TInt aReason)
+	{
+	if (aReason != KModuleEntryReasonExtensionInit1)
+		return KErrNone;
+	SThreadCreateInfo info;
+	info.iType = EThreadSupervisor;
+	info.iFunction = ProbeThread;
+	info.iPtr = NULL;
+	info.iSupervisorStack = NULL;
+	info.iSupervisorStackSize = 0;		// default
+	info.iInitialThreadPriority = 24;
+	info.iName.Set(KProbeName);
+	info.iTotalSize = sizeof(info);
+	TInt r = Kern::ThreadCreate(info);
+	Kern::Printf("[probe] Kern::ThreadCreate -> %d", r);
+	if (r == KErrNone)
+		Kern::ThreadResume(*(DThread*)info.iHandle);
+	return KErrNone;
+	}

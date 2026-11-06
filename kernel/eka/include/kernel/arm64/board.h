@@ -23,5 +23,14 @@ extern const int A64_PsciSmc;								// PSCI conduit: 1 = SMC, 0 = HVC
 extern const unsigned int A64_TimerPpi;					// EL1 virtual timer INTID (DTB arm,armv8-timer, 3rd entry + 16)
 unsigned int A64_CpuMpidr(int aCpu);						// PSCI target_cpu affinity of logical CPU aCpu
 int A64_CpuCount();										// CPUs the full kernel boots (cinit.cpp A::InitAPs)
+
+// Device memory. Board code reaches its registers through A64_Io(physical address). The nanokernel test image runs
+// identity-mapped (A64_IoWindow = 0: A64_Io returns its argument). The full kernel's bootstrap maps the regions below
+// back to back from KPrimaryIOBase (sizes are page multiples), and _E32Startup sets A64_IoWindow to that base.
+struct SA64IoRegion { unsigned long iPhys, iSize, iAttr; };	// iAttr: MAIR index (1 Device-nGnRE, 2 Normal NC)
+extern const SA64IoRegion A64_IoRegions[];
+extern const int A64_IoRegionCount;
+extern unsigned long A64_IoWindow;
+unsigned long A64_Io(unsigned long aPhys);
 }
 #endif

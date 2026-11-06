@@ -20,10 +20,15 @@ const int A64_HoldResults = 1;		// a human reads the result off the screen, mayb
 const unsigned int A64_TimerPpi = 19;	// Qualcomm wires the virtual timer to PPI 3 (DTB: <1 3 8>), not the usual 11
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu << 8; }		// Aff1 = core
 int A64_CpuCount() { return 1; }	// shortcut: one CPU until the full kernel's BootAP exists (M4.2 step 6), then from the DTB
+const SA64IoRegion A64_IoRegions[] = {
+	{ 0x17a00000, 0x00200000, 1 },		// GICv3 distributor + redistributors
+	{ 0x9c000000, 0x00900000, 2 },		// the framebuffer's 4320 x 2160 bytes (in RAM: the bank must stop below it)
+	};
+const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
 }
 
 /* --- framebuffer text console ------------------------------------------------------------------------------- */
-static const unsigned long KFb = 0x9c000000;
+#define KFb A64_Io(0x9c000000)
 static const int KFbW = 1080, KFbH = 2160, KFbStride = 4320;
 static const int KCols = KFbW / FONT_W, KRows = KFbH / FONT_H;
 static const int KPinRows = 8;		// rows 1..8: pinned failure lines; the console scrolls in the rows below

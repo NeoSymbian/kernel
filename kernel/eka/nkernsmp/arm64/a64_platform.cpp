@@ -20,7 +20,7 @@ TSubScheduler& SubScheduler();
 /* ---- GIC ----------------------------------------------------------------------------------------------- */
 extern "C" void A64_InitThisCpuGic()		// this CPU's redistributor: IPIs (SGI 0-7) and the tick PPI
 	{
-	TLinAddr sgi = Gicv3_InitCpu(A64_GicrBase, A64_Mpidr());
+	TLinAddr sgi = Gicv3_InitCpu(A64_Io(A64_GicrBase), A64_Mpidr());
 	if (!sgi)
 		{ A64_DebugPuts("*** GICv3: no redistributor for this CPU\n"); return; }
 	for (TUint32 i = 0; i < 8; ++i)
@@ -30,7 +30,7 @@ extern "C" void A64_InitThisCpuGic()		// this CPU's redistributor: IPIs (SGI 0-7
 
 extern "C" void A64_InitGic()
 	{
-	Gicv3_InitDist(A64_GicdBase);
+	Gicv3_InitDist(A64_Io(A64_GicdBase));
 	A64_InitThisCpuGic();
 	}
 

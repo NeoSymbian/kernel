@@ -41,7 +41,7 @@ for opt, val in zip(words[0::2], words[1::2]):
         host = root + "/emitter/econswserv.dll"
     res += [opt, z + "=" + host]
     n += 1
-# the window server's font, which symbian-2010 keeps on C: (its ROM placed it so fntstore's in-place path faulted); in
+# the window server's font, which NeoSymbian/build keeps on C: (its ROM placed it so fntstore's in-place path faulted); in
 # this section data files are word-aligned and fbserv uses it from Z: as is
 res += ["--data", r"Resource\Fonts\ceurope.gdr=" + root + "/src/oss.FCL.sf.os.graphics/graphicstest/uibench/data/CEUROPE.GDR"]
 open(out, "w").write("\n".join(res) + "\n")

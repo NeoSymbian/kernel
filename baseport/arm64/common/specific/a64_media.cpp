@@ -5,7 +5,7 @@
 // (drivers/locmedia) and local drive 0 -- the persistent block drive (a64_medblk.cpp: QEMU virtio-blk, Pixel eMMC
 // userdata) when the board has one, else the internal RAM drive (drivers/medint/iram.cpp) -- are linked in as
 // built-in extensions, their entry points renamed by build-ekern.sh. In a real ROM each is its own DLL; the user side's loader (the
-// symbian-2010 efile.exe) answers KErrAlreadyExists when F32 asks for them.
+// NeoSymbian/build efile.exe) answers KErrAlreadyExists when F32 asks for them.
 #include <kernel/kern_priv.h>
 #include "a64_blk.h"
 

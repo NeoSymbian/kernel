@@ -7,7 +7,7 @@
 # the nanokernel + arm64 backend (compiled here with the ekern flags) and lists the UNDEFINED symbols = the ekern
 # backend still to write.
 # The arm64 headers (INC64, tools/paths.sh) are searched before the baseline's ARM ones.
-# Runs in the symbian-a64dev image. Env: KHS = the kernel tree (default: this checkout), OUT = output dir, LINK=0|1.
+# Runs in the build image (NeoSymbian/build docker/toolchain). Env: KHS = the kernel tree (default: this checkout), OUT = output dir, LINK=0|1.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/tools/paths.sh"

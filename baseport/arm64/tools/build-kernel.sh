@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # build-kernel.sh -- build the AArch64 EKA2 nanokernel test image (arm64 "Image") for QEMU virt:
 #   the arch-neutral 2010 nkernsmp core + the standalone nanokernel tests (kerneltest/e32test/nkernsa), both
-#   UNMODIFIED, + our arm64 backend, boot code, GICv3 driver and board glue. Runs in the symbian-a64dev image.
+#   UNMODIFIED, + our arm64 backend, boot code, GICv3 driver and board glue. Runs in the build image (`neo nkernsa`, NeoSymbian/build).
 # Env: BOARD = a board under baseport/arm64 (<BOARD>_variant: qemu = default, bonito), KHS = the kernel tree
 #      (default: this checkout), OUT = output dir, DTB = the board's device tree blob where its boot image needs
 #      one (bonito: the phone's own, also taken from BONITO_DTB; never commit it).

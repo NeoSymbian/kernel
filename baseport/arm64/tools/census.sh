@@ -3,7 +3,7 @@
 # census.sh -- compile the arch-NEUTRAL nkernsmp core UNMODIFIED for AArch64 ILP32, plus whatever arm64 backend
 # exists, and list the symbols still undefined: the backend surface left to write. Modelled on Phorepoc's
 # adaptation-x86-64 port/build_nkernsmp_link.sh. Never stops on a failing TU; prints a summary.
-# Runs in the symbian-a64dev image. Env: KHS = the kernel tree (default: this checkout), OUT = output dir.
+# Runs in the build image (NeoSymbian/build docker/toolchain). Env: KHS = the kernel tree (default: this checkout), OUT = output dir.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/tools/paths.sh"

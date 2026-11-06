@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # build-ekern.sh -- build the AArch64 FULL kernel image (arm64 "Image"): the EKA2 kernel, flexible memory model and
 # SMP nanokernel from unmodified 2010 source (compiled by ekern-census.sh, which also builds our backend and the
-# platform layer), plus the boot stub + bootstrap, the static variant and the board. Runs in the symbian-a64dev image.
+# platform layer), plus the boot stub + bootstrap, the static variant and the board. Runs in the build image (`neo kernel`, NeoSymbian/build).
 # Env: BOARD = a board under baseport/arm64 (<BOARD>_variant: qemu = default, bonito), KHS = the kernel tree
 #      (default: this checkout), OUT = output dir,
 #      USERSIDE = 1 (default: the 2010 user side from the NeoSymbian/build volume mounted at S2010, see

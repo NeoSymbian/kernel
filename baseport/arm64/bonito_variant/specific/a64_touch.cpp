@@ -353,7 +353,7 @@ static void PollDfcFn(TAny*)
 				}
 			}
 		}
-	PollTimer.Again(NKern::TimerTicks(next));
+	PollTimer.OneShot(NKern::TimerTicks(next));			// not Again(): it stops for good after a slow poll
 	}
 
 static void BringUpDfcFn(TAny*)

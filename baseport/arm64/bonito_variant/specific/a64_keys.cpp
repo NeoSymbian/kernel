@@ -60,7 +60,7 @@ static void PollDfcFn(TAny*)
 	ComboPolls = Down[1] && Down[2] ? ComboPolls + 1 : 0;	// VolDown and VolUp (Keys[] order)
 	if (ComboPolls == 2000 / KPollMs)
 		A64_RebootToFastboot();
-	PollTimer.Again(NKern::TimerTicks(KPollMs));
+	PollTimer.OneShot(NKern::TimerTicks(KPollMs));		// not Again(): it stops for good after a slow poll
 	}
 
 void A64StartKeys()

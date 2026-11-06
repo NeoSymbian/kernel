@@ -73,6 +73,7 @@ if [ "$BOARD" = bonito ]; then	# the power and volume keys over the PMIC's SPMI 
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_touch.cpp" -o "$I/a64_touch.o"
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/qcom_geni_i2c.cpp" -o "$I/qcom_geni_i2c.o"
 	$EKXX $DEFS $INCS $PRE ${EMMC_C:+-DA64_EMMC_C} -c "$HERE/board/qcom_sdhci.cpp" -o "$I/qcom_sdhci.o"	# EMMC_C=1: C: on userdata
+	$EKXX $DEFS $INCS $PRE -c "$HERE/board/qcom_dwc3_acm.cpp" -o "$I/qcom_dwc3_acm.o"	# the USB debug console
 fi
 # the real exstart (starts the ROM secondary), statically linked: only its entry points are renamed
 $EKXX $DEFS $INCS $PRE -DKernelModuleEntry=A64ExstartEntry -DInitExtension=A64ExstartInit \

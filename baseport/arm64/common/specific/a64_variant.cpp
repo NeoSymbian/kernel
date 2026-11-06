@@ -206,6 +206,8 @@ __attribute__((weak)) void A64StartKeys() {}
 __attribute__((weak)) void A64StartTouch() {}
 // a64_reboot.cpp on the Pixel: the AUTOFASTBOOT timer of debug builds
 __attribute__((weak)) void A64StartReboot() {}
+// qcom_dwc3_acm.cpp on the Pixel: the USB debug console (tools/phone.py)
+__attribute__((weak)) void A64StartUsbConsole() {}
 
 // The one kernel extension the ROM must carry (P::StartExtensions sizes an RArray by the count: zero panics).
 extern "C" TInt A64ExtensionEntry(TInt aReason)
@@ -217,6 +219,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	A64StartKeys();
 	A64StartTouch();
 	A64StartReboot();
+	A64StartUsbConsole();
 	A64StartMedia();									// ELOCD + the RAM drive, before exstart starts F32
 	TInt r = StartThread(KProbeName, ProbeThread, NULL, -1);
 	Kern::Printf("[probe] Kern::ThreadCreate -> %d", r);

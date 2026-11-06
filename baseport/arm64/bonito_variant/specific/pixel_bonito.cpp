@@ -32,6 +32,7 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x03963000, 0x00001000, 1 },		// TLMM north tile: gpio99 (touch reset)
 	{ 0x0397d000, 0x00001000, 1 },		// TLMM north tile: gpio125 (touch attention)
 	{ 0x03587000, 0x00001000, 1 },		// TLMM west tile: gpio135 (ts-switch)
+	{ 0x007c4000, 0x00002000, 1 },		// eMMC host (sdhci-msm v5): SDHCI registers + CQHCI (qcom_sdhci.cpp)
 	};
 const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
 // ABL's continuous-splash framebuffer: the user side gets the top 1800 rows, the kernel console the 360 below

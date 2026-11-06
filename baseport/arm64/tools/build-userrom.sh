@@ -36,6 +36,10 @@ for opt, val in zip(words[0::2], words[1::2]):
     if z.lower() in SKIP:
         continue
     host = estart if z.lower() == r"sys\data\estart.txt" else root + "/" + path
+    # without SYSSTART (the eshell ROM) nothing serves econs_twin's !E32WindowServer, which the UI ROM maps as
+    # ECONS.DLL: give eshell the window server's console instead
+    if z.lower() == r"sys\bin\econs.dll" and r"sys\bin\sysstart.exe" in SKIP:
+        host = root + "/emitter/econswserv.dll"
     res += [opt, z + "=" + host]
     n += 1
 # the window server's font, which symbian-2010 keeps on C: (its ROM placed it so fntstore's in-place path faulted); in

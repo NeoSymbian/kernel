@@ -34,6 +34,7 @@ static void Post(TRawEvent::TType aType, TInt aScanCode)
 	}
 
 __attribute__((weak)) void A64TouchDump() {}				// a64_touch.cpp: its probe, again on Volume Up
+__attribute__((weak)) void A64BlkDump() {}					// qcom_sdhci.cpp: the eMMC report, again on Volume Up
 
 static void PollDfcFn(TAny*)
 	{
@@ -49,7 +50,10 @@ static void PollDfcFn(TAny*)
 		Kern::Printf("[keys] %s %s", Keys[i].iName, down ? "down" : "up");
 		Post(down ? TRawEvent::EKeyDown : TRawEvent::EKeyUp, Keys[i].iScanCode);
 		if (down && Keys[i].iScanCode == EStdKeyIncVolume)
+			{
+			A64BlkDump();
 			A64TouchDump();
+			}
 		}
 	PollTimer.Again(NKern::TimerTicks(KPollMs));
 	}

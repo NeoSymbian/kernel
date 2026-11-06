@@ -56,6 +56,10 @@ $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_locmedia -DKernelModul
 $EKXX $DEFS $INCS $MED $PRE -c "$EKA/drivers/locmedia/dmasupport.cpp" -o "$I/dmasupport.o"
 $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medint -DKernelModuleEntry=KernelModuleEntry_medint \
 	-DCreatePhysicalDevice=CreatePhysicalDevice_medint -c "$EKA/drivers/medint/iram.cpp" -o "$I/iram.o"
+$EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medblk -DKernelModuleEntry=KernelModuleEntry_medblk \
+	-DCreatePhysicalDevice=CreatePhysicalDevice_medblk -c "$HERE/board/a64_medblk.cpp" -o "$I/a64_medblk.o"
+$EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_blk.cpp" -o "$I/a64_blk.o"
+[ "$BOARD" = qemu ] && $EKXX $DEFS $INCS $PRE -c "$HERE/board/virtio_blk.cpp" -o "$I/virtio_blk.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$HERE/board/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_display.cpp" -o "$I/a64_display.o"
 [ "$BOARD" = qemu ] && $EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
@@ -65,6 +69,7 @@ if [ "$BOARD" = bonito ]; then	# the power and volume keys over the PMIC's SPMI 
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_keys.cpp" -o "$I/a64_keys.o"
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_touch.cpp" -o "$I/a64_touch.o"
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/qcom_geni_i2c.cpp" -o "$I/qcom_geni_i2c.o"
+	$EKXX $DEFS $INCS $PRE ${EMMC_C:+-DA64_EMMC_C} -c "$HERE/board/qcom_sdhci.cpp" -o "$I/qcom_sdhci.o"	# EMMC_C=1: C: on userdata
 fi
 # the real exstart (starts the ROM secondary), statically linked: only its entry points are renamed
 $EKXX $DEFS $INCS $PRE -DKernelModuleEntry=A64ExstartEntry -DInitExtension=A64ExstartInit \

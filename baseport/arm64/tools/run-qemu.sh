@@ -5,6 +5,7 @@
 # Env: SMP (default 4), OUT, MON (a monitor socket path),
 #      INPUT=<text> (printf escapes, e.g. "dir\r"; each "~" waits 5 s): typed into the serial console after INPUT_DELAY
 #      seconds (default 15); Ctrl-T ("\024") makes the full kernel dump its threads,
+#      DISK=<file>: a virtio-blk disk (the persistent C:, board/virtio_blk.cpp), created 256 MB if missing,
 #      FBDUMP=<file.png>: a moment before the timeout, save the full kernel's RAM framebuffer (the address its display
 #      driver prints: "[display] WxH 32 bpp, framebuffer phys P") through the monitor and convert it to a PNG.
 set -u
@@ -14,8 +15,13 @@ SECS=${1:-10}; EXPECT=${2:-}
 FBDUMP=${FBDUMP:-}
 [ -n "$FBDUMP" ] && MON=${MON:-$OUT/qemu-mon.sock}
 [ -n "${MON:-}" ] && rm -f "$MON"
+DISKARGS=""
+if [ -n "${DISK:-}" ]; then
+	[ -f "$DISK" ] || truncate -s 256M "$DISK"
+	DISKARGS="-global virtio-mmio.force-legacy=true -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
+fi
 qemu() { timeout "$SECS" qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a55 -smp "${SMP:-4}" -m 512 \
-	-nographic -no-reboot -nic none ${MON:+-monitor unix:$MON,server,nowait} -kernel "$OUT/Image" > "$OUT/serial.log" 2>&1; }
+	-nographic -no-reboot -nic none $DISKARGS ${MON:+-monitor unix:$MON,server,nowait} -kernel "$OUT/Image" > "$OUT/serial.log" 2>&1; }
 if [ -n "${INPUT:-}" ]; then
 	{ sleep "${INPUT_DELAY:-15}"
 	  rest=$INPUT

@@ -107,6 +107,11 @@ static TInt DisplayHal(TAny*, TInt aFunction, TAny* a1, TAny* a2)
 		}
 	}
 
+TLinAddr A64_FbLinear()								// a64_dbgmon.cpp "shot"
+	{
+	return TheFbChunk ? TheFbChunk->LinearAddress() : 0;
+	}
+
 void A64StartDisplay()
 	{
 	TInt size = A64_FbStride * A64_FbHeight;

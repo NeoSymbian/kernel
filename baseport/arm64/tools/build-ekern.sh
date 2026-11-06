@@ -62,6 +62,8 @@ $EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_blk.cpp" -o "$I/a64_blk.o"
 [ "$BOARD" = qemu ] && $EKXX $DEFS $INCS $PRE -c "$HERE/board/virtio_blk.cpp" -o "$I/virtio_blk.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$HERE/board/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_display.cpp" -o "$I/a64_display.o"
+$EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
+	-c "$HERE/board/a64_dbgmon.cpp" -o "$I/a64_dbgmon.o"	# the debug monitor; its thread dump reads scheduler internals
 [ "$BOARD" = qemu ] && $EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
 	-c "$HERE/board/a64_serialkbd.cpp" -o "$I/a64_serialkbd.o"	# its thread dump reads scheduler internals
 if [ "$BOARD" = bonito ]; then	# the power and volume keys over the PMIC's SPMI bus; the touchscreen

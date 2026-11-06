@@ -4,13 +4,15 @@
 // server (Kern::AddEvent EKeyDown/EKeyUp with EPOC standard scan codes, translated by EKDATA like a real keyboard's),
 // so eshell can be driven over the serial line. The shape of Phorepoc's xk_keyboard.cpp: the ISR drains the FIFO
 // into a ring, a DFC posts the events (Kern::AddEvent needs a thread).
-// Ctrl-T (0x14) dumps every thread's state instead (bring-up aid for hangs).
+// Ctrl-T (0x14) dumps every thread's state instead (bring-up aid for hangs); Ctrl-B (0x02) sends the rest of the
+// line (up to Enter) to the debug monitor (a64_dbgmon.cpp), which answers on the serial port.
 // shortcut: ASCII letters, digits, space, Enter, Backspace, Escape and the punctuation a shell needs; no cursor
 // keys (VT100 escape sequences) and no EHalGroupKeyboard info -- add them when an app needs them.
 #include <kernel/kern_priv.h>
 #include <e32keys.h>
 #include "board.h"
 #include "../platform/a64_platform.h"
+#include "a64_dbgmon.h"
 
 const TUint32 KUartPhys = 0x09000000;					// PL011 (qemu_virt.cpp's console)
 const TUint32 KUartIntId = 33;							// SPI 1
@@ -78,47 +80,12 @@ static void Post(TRawEvent::TType aType, TInt aScanCode)
 		NKern::Sleep(1);
 	}
 
-// Ctrl-T: every thread's state (after Phorepoc's xk_threaddump.cpp) -- for a hang, who waits on what; a user thread's
-// AArch32 pc and lr from its exception frame at the top of its supervisor stack
-static void DumpThreads()
+static TBool MonMode;
+static TBuf8<128> MonLine;
+static void SerialWrite(const TUint8* aData, TInt aLen)
 	{
-	DObjectCon& c = *K::Containers[EThread];
-	c.Wait();
-	Kern::Printf("[dump] ===== %d threads at tick %d =====", c.Count(), NKern::TickCount());
-	Kern::Printf("[dump] event queue: %d queued, request %08x status %08x ready %d, event thread %O",
-		(TInt)((K::EventHeadPtr - K::EventTailPtr + (K::EventBufferEnd - K::EventBufferStart)) % (K::EventBufferEnd - K::EventBufferStart)),
-		(TUint32)(TLinAddr)K::EventRequest, (TUint32)K::EventRequest->iStatus, K::EventRequest->IsReady(), K::EventThread);
-	for (TInt i = 0; i < c.Count(); ++i)
-		{
-		DThread* t = (DThread*)c[i];
-		NThreadBase& n = t->iNThread;
-		const NThreadWaitState::S& w = n.iWaitState.iWtC;
-		Kern::Printf("[dump] %O wait %02x type %d obj %08x waitobj %08x pri %d cs %d umcb %08x", t, w.iWtStFlags,
-			w.iWtObjType, (TUint32)(TLinAddr)w.iWtObj, (TUint32)(TLinAddr)t->iWaitObj, n.iPriority, n.iCsCount,
-			(TUint32)(TLinAddr)n.iUserModeCallbacks);
-		if (t->iThreadType == EThreadUser && n.iStackBase)
-			{
-			const SThreadExcStack* f = (const SThreadExcStack*)((TLinAddr)n.iStackBase + n.iStackSize) - 1;
-			if ((f->iSpsr & 0x1F) == 0x10)
-				{
-				TInt word = 0x0BADBAD0;					// the word r0 points at (a TRequestStatus, for WaitForRequest)
-				Kern::ThreadRawRead(t, (const TAny*)(TLinAddr)(TUint32)f->iX[0], &word, sizeof(word));
-				Kern::Printf("[dump]   user pc %08x lr %08x sp %08x r0 %08x [r0] %08x reqsem %d", (TUint32)f->iElr,
-					(TUint32)f->iX[14], (TUint32)f->iX[13], (TUint32)f->iX[0], word, n.iRequestSemaphore.iCount);
-				TUint32 st[96], hit[16];
-				TInt found = 0;
-				if (Kern::ThreadRawRead(t, (const TAny*)(TLinAddr)((TUint32)f->iX[13] & ~3u), st, sizeof(st)) == KErrNone)
-					for (TInt k = 0; k < 96 && found < 16; ++k)
-						if ((st[k] & ~1u) >= 0x80200000u && st[k] < 0x80800000u)	// return addresses into the ROM section
-							hit[found++] = st[k];
-				for (TInt k = 0; k < found; k += 8)
-					Kern::Printf("[dump]   stack code: %08x %08x %08x %08x %08x %08x %08x %08x", hit[k], hit[k+1],
-						hit[k+2], hit[k+3], hit[k+4], hit[k+5], hit[k+6], hit[k+7]);
-				}
-			}
-		}
-	c.Signal();
-	Kern::Printf("[dump] ===== end =====");
+	for (TInt i = 0; i < aLen; ++i)
+		A64_DebugPutc((char)aData[i]);
 	}
 
 static void RxDfcFn(TAny*)
@@ -130,7 +97,24 @@ static void RxDfcFn(TAny*)
 		TUint8 ch = Ring[RingTail++ % sizeof(Ring)];
 		if (ch == 0x14)
 			{
-			DumpThreads();
+			A64DumpThreads();
+			continue;
+			}
+		if (ch == 0x02)
+			{
+			MonMode = ETrue;
+			MonLine.Zero();
+			continue;
+			}
+		if (MonMode)
+			{
+			if (ch == '\r' || ch == '\n')
+				{
+				MonMode = EFalse;
+				A64Mon_Line(MonLine, SerialWrite);
+				}
+			else if (MonLine.Length() < MonLine.MaxLength())
+				MonLine.Append(ch);
 			continue;
 			}
 		TInt code = ScanCode(ch, shift);

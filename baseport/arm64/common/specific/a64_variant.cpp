@@ -17,8 +17,10 @@ const TInt KTickUs = 1000;			// system tick period: 1 ms, as every EKA2 port
 
 // cutils.cpp is built with __EARLY_DEBUG__: Kern::Printf reaches the board console from the first line of the kernel,
 // before the variant exists
+void A64Log_Putc(char aChar);								// a64_dbgmon.cpp: the log ring the debug console replays
 void DebugOutputChar(TUint aChar)
 	{
+	A64Log_Putc((char)aChar);
 	A64_DebugPutc((char)aChar);
 	}
 
@@ -29,7 +31,7 @@ public:
 	virtual void Init1()									{ A64_InitGic(); A64_TimerInit(KTickUs); }
 	virtual void Init2AP()									{ A64_InitThisCpuGic(); A64_StartSystemTimer(); }
 	virtual void Init3()									{ A64_StartSystemTimer(); }
-	virtual void DebugOutput(TUint aChar)					{ A64_DebugPutc((char)aChar); }
+	virtual void DebugOutput(TUint aChar)					{ DebugOutputChar(aChar); }
 	virtual void Idle()										{ __asm__ __volatile__("dsb sy\n\twfi" ::: "memory"); }
 	virtual TInt MsTickPeriod()								{ return KTickUs; }
 	// no RTC driver yet: P::DefaultInitialTime then starts the clock from the ROM header's build time

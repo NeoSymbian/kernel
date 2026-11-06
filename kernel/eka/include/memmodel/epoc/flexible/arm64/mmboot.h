@@ -147,6 +147,15 @@ const TUint64 KA64UXN				=1ull<<54;		// unprivileged execute never
 const TUint64 KA64OutAddrMask		=0x0000fffffffff000ull;	// output address [47:12]
 const TUint64 KA64APTableNoEL0		=1ull<<61;		// table descriptor APTable[0]: no EL0 access at any level below
 
+// MAIR_EL1: attribute index = EKA2 TMemoryType (BlankPte puts the type in AttrIndx); the bootstrap programs this value.
+//   0 EMemAttStronglyOrdered  Device-nGnRnE			0x00
+//   1 EMemAttDevice           Device-nGnRE				0x04
+//   2 EMemAttNormalUncached   Normal non-cacheable		0x44
+//   3 EMemAttNormalCached     Normal WB RA/WA			0xFF
+//   4 EMemAttKernelInternal4  Normal WB RA/WA			0xFF
+//   5-7 platform specific     Normal WT RA (5), WB RA no-WA (6), WB RA/WA (7)	0xAA 0xEE 0xFF
+const TUint64 KA64MairValue			=0xFFEEAAFFFF440400ull;
+
 // ARM domains don't exist: generic code that tags PDEs with a domain (__USER_MEMORY_GUARDS_ENABLED__) leaves them as is
 #define	PDE_IN_DOMAIN(aPde, aDomain)	(aPde)
 

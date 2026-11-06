@@ -91,7 +91,7 @@ for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fast
 	fi
 	# NKSA_RWTRACE=1: the DoRWTest reader reports the writer's state at each bad block read (race diagnostics)
 	if [ $f = fastmutex ] && [ -n "${NKSA_RWTRACE:-}" ]; then
-		pat="${pat:+$pat;}"'s/^				++info.iFails\[i\];$/				{ ++info.iFails[i]; extern void A64_RWFail(TInt, NThread*); A64_RWFail(i, info.iWriter); }	\/\/ a64 port: trace/'
+		pat="${pat:+$pat;}"'s/^				++info.iFails\[i\];$/				{ ++info.iFails[i]; extern void A64_RWFail(TInt, TInt, NThread*, TUint32, TUint32); A64_RWFail(info.iTestType, i, info.iWriter, winfo.iInSeq, winfo.iOutSeq); }	\/\/ a64 port: trace/'
 	fi
 	if [ -n "$pat" ]; then
 		sed "$pat" "$src" > "$OUT/$f.cpp"

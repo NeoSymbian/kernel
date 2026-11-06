@@ -220,14 +220,30 @@ extern "C" void A64_SchedCheck(NThreadBase* aOld, NThreadBase* aNew, TSubSchedul
 	}
 
 /* NKSA_RWTRACE: DoRWTest's reader found block aBuf of the writer's buffers inconsistent; show how the writer was
- * stopped (only buffers 1-4, which some cases protect; the first 16) */
+ * stopped. Only the interlocked suspend/kill cases (types 4, 5: buffers 1-4 hold a critical section there, so any
+ * bad read is a real failure; in the other types some of them are legitimately unprotected); the first 16. */
 static volatile TUint32 RWFails;
-void A64_RWFail(TInt aBuf, NThread* aW)
+static volatile TUint32 PrintLock;			// one line at a time across CPUs (skmpar prints from four)
+void A64_RWFail(TInt aType, TInt aBuf, NThread* aW, TUint32 aInSeq, TUint32 aOutSeq)
 	{
-	if (aBuf < 1 || aBuf > 4 || !aW || __e32_atomic_add_ord32(&RWFails, 1) >= 16)
+	// is buffer aBuf written inside a critical section or a fast mutex (in-ops 1/3/4 nest, out-ops 1/3/4 unnest)?
+	// Only then can a suspend/kill not stop the writer there; anything else is an allowed bad read.
+	TInt level = 0;
+	for (TInt k = 0; k <= aBuf; ++k)
+		{
+		TUint32 op = k <= 2 ? (aInSeq >> (4 * k)) & 0xF : (aOutSeq >> (4 * (k - 3))) & 0xF;
+		if (op == 1 || op == 3 || op == 4)
+			level += k <= 2 ? 1 : -1;
+		}
+	if ((aType != 4 && aType != 5) || level <= 0 || !aW || __e32_atomic_add_ord32(&RWFails, 1) >= 16)
 		return;
 	NThreadBase* w = aW;
-	A64_DebugPuts("\n*** RWFAIL buf="); A64_DebugHex(aBuf);
+	TInt irq = NKern::DisableAllInterrupts();
+	while (__e32_atomic_swp_acq32(&PrintLock, 1))
+		A64_PAUSE();
+	A64_DebugPuts("\n*** RWFAIL type="); A64_DebugHex(aType);
+	A64_DebugPuts(" buf="); A64_DebugHex(aBuf);
+	A64_DebugPuts(" seq="); A64_DebugHex(aInSeq); A64_DebugPuts("/"); A64_DebugHex(aOutSeq);
 	A64_DebugPuts(" rdcpu="); A64_DebugHex(NKern::CurrentCpu());
 	A64_DebugPuts(" w="); A64_DebugHex((TLinAddr)w);
 	A64_DebugPuts(" pri="); A64_DebugHex(w->iPriority);
@@ -246,6 +262,8 @@ void A64_RWFail(TInt aBuf, NThread* aW)
 	A64_DebugPuts(" par="); A64_DebugHex((TLinAddr)w->iParent);
 	A64_DebugPuts(" lnk="); A64_DebugHex(w->iLinkedObjType);
 	A64_DebugPuts("\n");
+	__e32_atomic_store_rel32(&PrintLock, 0);
+	NKern::RestoreInterrupts(irq);
 	}
 
 static void DumpSched(const char* aWhat, NSchedulable* aS)
@@ -574,8 +592,6 @@ static TBool Contains(const char* s, TInt l, const char* w)
 		}
 	return FALSE;
 	}
-
-static volatile TUint32 PrintLock;			// one line at a time across CPUs (skmpar prints from four)
 
 void DebugPrint(const char* s, int l)
 	{

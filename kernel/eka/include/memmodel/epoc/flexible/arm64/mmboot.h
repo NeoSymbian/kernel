@@ -19,8 +19,14 @@
 // global and kernel memory) are the SAME physical pages in every address space. Mapped back to back at
 // PageDirectory(asid) they still look like one contiguous 16 KB directory to the generic code.
 //
-// ARM domains don't exist in VMSAv8. The only domain user was the IPC alias region (domain 2); it stays at
-// 0x7F000000 but is mapped EL1-only (AP[1]=0), which keeps user code out of it the way the domain did.
+// ARM domains don't exist in VMSAv8. The only domain user was the IPC alias region (domain 2). It stays at
+// 0x7F000000, but an alias PDE points at the TARGET process's page table, whose PTEs grant EL0 access -- so the
+// alias PDE carries APTable[0] (KA64APTableNoEL0: no EL0 access anywhere below it), which keeps other threads of the
+// current process out of it the way domain 2 did (xmmu.cpp, DMemModelThread::Alias). Consequence: the kernel's
+// user-memory copies must reach alias addresses with privileged loads/stores, not LDTR/STTR.
+//
+// The per-address-space level-1 roots live in the fixed bootstrap area, in the slot ARM used for its AArch32 AP boot
+// page directory (PSCI enters the kernel directly, so the AP boot page/trampoline pages are not used).
 #ifndef __MMBOOT_H__
 #define __MMBOOT_H__
 
@@ -61,11 +67,8 @@ const TLinAddr KKernelSectionEnd		=0xF0000000u;
 
 const TLinAddr KSuperPageLinAddr		=0xF0000000u;
 const TLinAddr KMachineConfigLinAddr	=0xF0000800u;
-#ifdef __SMP__
-const TLinAddr KAPBootPageDirLin		=0xF0004000u;
-const TLinAddr KAPBootPageTableLin		=0xF0008000u;
-const TLinAddr KAPBootPageLin			=0xF0009000u;
-#endif
+const TLinAddr KRootTableBase			=0xF0004000u;	// AArch64: 256 x 32-byte level-1 roots = 8 KB (bootstrap-mapped)
+const TLinAddr KRootTableEnd			=0xF0006000u;
 const TLinAddr KDummyUncachedAddr		=0xF000F000u;
 const TLinAddr KPageInfoMap				=0xF0010000u;
 const TLinAddr KExcptStacksLinearBase	=0xF0040000u;
@@ -83,7 +86,6 @@ const TLinAddr KPageInfoLinearBase		=0xF2000000u;
 const TLinAddr KPageInfoLinearEnd		=0xF4000000u;
 
 const TLinAddr KPageDirectoryBase		=0xF4000000u;	// 256 x 16 KB directories = 4 MB
-const TLinAddr KRootTableBase			=0xF4400000u;	// AArch64: 256 x 32-byte level-1 roots = 8 KB
 const TLinAddr KPageDirectoryEnd		=0xF8000000u;
 
 const TLinAddr KPageTableBase			=0xF8000000u;
@@ -143,6 +145,10 @@ const TUint64 KA64Contiguous		=1ull<<52;
 const TUint64 KA64PXN				=1ull<<53;		// privileged execute never
 const TUint64 KA64UXN				=1ull<<54;		// unprivileged execute never
 const TUint64 KA64OutAddrMask		=0x0000fffffffff000ull;	// output address [47:12]
+const TUint64 KA64APTableNoEL0		=1ull<<61;		// table descriptor APTable[0]: no EL0 access at any level below
+
+// ARM domains don't exist: generic code that tags PDEs with a domain (__USER_MEMORY_GUARDS_ENABLED__) leaves them as is
+#define	PDE_IN_DOMAIN(aPde, aDomain)	(aPde)
 
 const TUint64 KPdePresentMask		=KA64DescValid;
 const TUint64 KPdeTypeMask			=KA64DescTypeMask;
@@ -173,7 +179,7 @@ const TInt KExcStackAddressSpace = KIrqStackSize + KFiqStackSize + KUndStackSize
 
 const TInt KMaxCPUs = 8;
 __ASSERT_COMPILE(KExcptStacksLinearEnd-KExcptStacksLinearBase >= (TLinAddr)KExcStackAddressSpace * (TUint)KMaxCPUs);
-__ASSERT_COMPILE(KRootTableBase+KNumOsAsids*KRootTableSize <= KPageDirectoryEnd);
-__ASSERT_COMPILE(KPageDirectoryBase+(KNumOsAsids<<KPageDirectoryShift) <= KRootTableBase);
+__ASSERT_COMPILE(KRootTableBase+KNumOsAsids*KRootTableSize <= KRootTableEnd);
+__ASSERT_COMPILE(KRootTableEnd <= KDummyUncachedAddr);
 
 #endif	// __MMBOOT_H__

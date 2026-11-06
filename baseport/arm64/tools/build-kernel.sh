@@ -3,18 +3,14 @@
 # build-kernel.sh -- build the AArch64 EKA2 nanokernel test image (arm64 "Image") for QEMU virt:
 #   the arch-neutral 2010 nkernsmp core + the standalone nanokernel tests (kerneltest/e32test/nkernsa), both
 #   UNMODIFIED, + our arm64 backend, boot code, GICv3 driver and board glue. Runs in the symbian-a64dev image.
-# Env: BOARD = qemu (default) | bonito, KHS = the kernel tree (default: this checkout), OUT = output dir,
-#      BONITO_DTB = the Pixel's DTB (bonito: the boot.img needs it appended; ABL rejects an image without one).
+# Env: BOARD = a board under baseport/arm64 (<BOARD>_variant: qemu = default, bonito), KHS = the kernel tree
+#      (default: this checkout), OUT = output dir, DTB = the board's device tree blob where its boot image needs
+#      one (bonito: the phone's own, also taken from BONITO_DTB; never commit it).
 set -eu
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/tools/paths.sh"
-BOARD=${BOARD:-qemu}
 OUT=${OUT:-$HERE/../../out/kernel-$BOARD}
-case $BOARD in
-	qemu)   BASE=0x40080000; BOARD_SRC=qemuvirt_variant/specific/qemu_virt.cpp ;;
-	bonito) BASE=0x80080000; BOARD_SRC=bonito_variant/specific/pixel_bonito.cpp ;;
-	*) echo "unknown BOARD=$BOARD" >&2; exit 2 ;;
-esac
+BASE=$KERNEL_BASE
 NKSA=$KHS/kerneltest/e32test/nkernsa
 X=${CROSS:-aarch64-linux-gnu-}
 mkdir -p "$OUT/inc"; rm -f "$OUT"/*.o "$OUT"/*.log
@@ -53,7 +49,7 @@ case "${NKSA_MAIN:-}" in
 	        for t in ${NKSA_TESTS:?NKSA_TESTS lists the tests to run}; do SELDEFS="$SELDEFS -DSEL_$(echo $t | tr a-z A-Z)"; done
 	        case " $NKSA_TESTS " in *" dfcquick "*) TESTDFC="" ;; esac	# dfcquick compiles testdfc.cpp into the selector
 	        # skmpar passes DoRWTest the same read count as the (scaled or original) fastmutex.cpp
-	        if [ "$BOARD" = bonito ] || [ -n "${NKSA_SCALE:-}" ]; then SELDEFS="$SELDEFS -DSKM_READS=10000"; else SELDEFS="$SELDEFS -DSKM_READS=100000"; fi ;;
+	        if [ -n "$NKSA_FAST_CPU${NKSA_SCALE:-}" ]; then SELDEFS="$SELDEFS -DSKM_READS=10000"; else SELDEFS="$SELDEFS -DSKM_READS=100000"; fi ;;
 esac
 for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fastmutex debug testipi $TESTDFC fastbuf \
          benchmark rwspinlock tiedevents; do
@@ -66,7 +62,7 @@ for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fast
 	# Two statistical checks were tuned on ~400 MHz ARM11 boards; on the phone they run scaled for 2 GHz cores
 	# (NKSA_FAST_CPU in tiedevents.cpp / fastmutex.cpp; QEMU's emulated cores are slow enough for the originals).
 	# NKSA_SCALE=1 does the same on QEMU; NKSA_RWTRACE=1 makes the DoRWTest reader report each bad block read.
-	if [ "$BOARD" = bonito ] || [ -n "${NKSA_SCALE:-}" ]; then extra="$extra -DNKSA_FAST_CPU"; fi
+	if [ -n "$NKSA_FAST_CPU${NKSA_SCALE:-}" ]; then extra="$extra -DNKSA_FAST_CPU"; fi
 	[ -n "${NKSA_RWTRACE:-}" ] && extra="$extra -DNKSA_RWTRACE"
 	ek "$src" "sa_$f" "$extra"
 done
@@ -83,10 +79,10 @@ awk '/^void TestSuspendKillMigrate/,/^\t}/' "$NKSA/fastmutex.cpp" \
 [ $fail = 0 ] || exit 1
 
 $AS "$NK64/a64_ctxsw.S" -o "$OUT/a64_ctxsw.o"
-$AS -DBOARD_$(echo "$BOARD" | tr a-z A-Z) "$K64/boot.S" -o "$OUT/boot.o"
+$AS $BOOT_DEFS "$K64/boot.S" -o "$OUT/boot.o"
 $AS "$NK64/vectors.S" -o "$OUT/vectors.o"
-[ "$BOARD" = bonito ] && python3 "$HERE/tools/mkfont.py" "$OUT/inc/font.h" >/dev/null
-$PLAIN -I "$OUT/inc" -c "$BSP/$BOARD_SRC" -o "$OUT/board.o"
+[ -n "$FONT" ] && python3 "$HERE/tools/mkfont.py" "$OUT/inc/font.h" >/dev/null
+$PLAIN -I "$OUT/inc" -c "$VDIR/$BOARD_SRC" -o "$OUT/board.o"
 $PLAIN -c "$BSP/common/specific/boot_common.cpp" -o "$OUT/boot_common.o"
 $PLAIN -c "$NK64/gicv3.cpp" -o "$OUT/gicv3.o"
 $PLAIN -c "$BSP/common/specific/console_io.cpp" -o "$OUT/console_io.o"
@@ -99,7 +95,4 @@ if ! ${X}ld -m aarch64linux32 -nostdlib --no-warn-rwx-segments --defsym=KERNEL_B
 fi
 ${X}objcopy -O binary "$OUT/kernel.elf" "$OUT/Image"
 echo "built $OUT/Image ($(wc -c < "$OUT/Image") bytes, $BOARD at $BASE)"
-if [ "$BOARD" = bonito ]; then	# fastboot boot image: gzip(Image) + DTB, as the ztOS/Linux boot.img ABL accepts
-	gzip -9nc "$OUT/Image" > "$OUT/Image.gz"
-	python3 -I "$HERE/tools/mkboot.py" "$OUT/Image.gz" "${BONITO_DTB:?set BONITO_DTB to the Pixel DTB}" "$OUT/boot.img"
-fi
+make_bootimg "$OUT/Image" "$OUT"

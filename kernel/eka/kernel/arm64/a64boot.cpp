@@ -43,21 +43,21 @@ extern char __uimage_base[], __uimage_size[];					// ekern.lds: the user-side RO
 #define SYMVAL(s)	((TUint32)(TLinAddr)(s))
 
 // RAM the kernel may use: from above the image to the board's limit
-#if defined(BOARD_QEMU)
-const TUint32 KRamEnd = 0x60000000u;			// run-qemu.sh: -m 512 from 0x40000000
-#elif defined(BOARD_BONITO)
-const TUint32 KRamEnd = 0x85700000u;			// shortcut: below hyp-mem@85700000 (DTB); the M4.3 RAM map adds the rest
-#else
-#error "BOARD_QEMU or BOARD_BONITO"
+// The boot stub runs with the MMU off and may not call into the board: the board's variant.conf passes its
+// constants (BOOT_DEFS): A64_BOOT_RAM_END, and optionally A64_BOOT_PL011 (an early UART) and A64_BOOT_FB,
+// A64_BOOT_FB_W (a boot framebuffer for boards without one).
+#ifndef A64_BOOT_RAM_END
+#error "the board's variant.conf sets A64_BOOT_RAM_END in BOOT_DEFS"
 #endif
+const TUint32 KRamEnd = A64_BOOT_RAM_END;
 
 /******************************************************************************
  * Console (physical; boards without a UART stay silent until the kernel's console)
  ******************************************************************************/
 static void PutC(char c)
 	{
-#ifdef BOARD_QEMU
-	volatile TUint32* uart = (volatile TUint32*)0x09000000u;	// PL011
+#ifdef A64_BOOT_PL011
+	volatile TUint32* uart = (volatile TUint32*)A64_BOOT_PL011;	// PL011
 	while (uart[0x18 / 4] & (1u << 5)) {}
 	uart[0] = (TUint8)c;
 #else
@@ -73,9 +73,9 @@ static void Trace(const char* aWhat, TUint32 aVal)
 // Boards without a UART show progress as a colour band across the top of the boot framebuffer
 static void Band(TUint32 aArgb)
 	{
-#ifdef BOARD_BONITO
-	volatile TUint32* fb = (volatile TUint32*)0x9c000000u;		// 1080 x 2160, stride 4320 (board/pixel_bonito.cpp)
-	for (TInt i = 0; i < 1080 * 64; ++i)
+#ifdef A64_BOOT_FB
+	volatile TUint32* fb = (volatile TUint32*)A64_BOOT_FB;		// 32 bpp, A64_BOOT_FB_W pixels a line
+	for (TInt i = 0; i < A64_BOOT_FB_W * 64; ++i)
 		fb[i] = aArgb;
 	__asm__ __volatile__("dsb sy" ::: "memory");
 #else

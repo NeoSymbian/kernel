@@ -13,7 +13,6 @@
 #include <mmboot.h>
 #include "board.h"
 #include "a64_blk.h"
-#include "qcom_spmi.h"
 #include "a64_dbgmon.h"
 #include "a64_platform.h"
 

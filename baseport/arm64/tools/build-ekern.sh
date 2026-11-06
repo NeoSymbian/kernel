@@ -3,22 +3,19 @@
 # build-ekern.sh -- build the AArch64 FULL kernel image (arm64 "Image"): the EKA2 kernel, flexible memory model and
 # SMP nanokernel from unmodified 2010 source (compiled by ekern-census.sh, which also builds our backend and the
 # platform layer), plus the boot stub + bootstrap, the static variant and the board. Runs in the symbian-a64dev image.
-# Env: BOARD = qemu (default) | bonito, KHS = the kernel tree (default: this checkout), OUT = output dir,
+# Env: BOARD = a board under baseport/arm64 (<BOARD>_variant: qemu = default, bonito), KHS = the kernel tree
+#      (default: this checkout), OUT = output dir,
 #      USERSIDE = 1 (default: the 2010 user side from the symbian-2010 build volume mounted at S2010, see
 #      build-userrom.sh) | 0 (kernel only: boot/a32test.S is the secondary),
-#      BONITO_DTB = the Pixel's DTB (bonito: appended to boot.img; never commit it).
+#      DTB = the board's device tree blob where its boot image needs one (bonito: the phone's own, also taken
+#      from BONITO_DTB; never commit it). The board's own options are in its variant.conf.
 set -eu
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/tools/paths.sh"
-BOARD=${BOARD:-qemu}
 OUT=${OUT:-$HERE/../../out/ekern-$BOARD}
-case $BOARD in
-	qemu)   BASE=0x40080000; ROM_LIN=0x80000000; BOARD_SRC=qemuvirt_variant/specific/qemu_virt.cpp ;;
-	bonito) BASE=0x80080000; ROM_LIN=0x80200000; BOARD_SRC=bonito_variant/specific/pixel_bonito.cpp ;;	# the load window owns 0x80000000-0x801FFFFF
-	*) echo "unknown BOARD=$BOARD" >&2; exit 2 ;;
-esac
+BASE=$KERNEL_BASE
 X=${CROSS:-aarch64-linux-gnu-}
-BDEF=-DBOARD_$(echo "$BOARD" | tr a-z A-Z)
+BDEF=$BOOT_DEFS
 mkdir -p "$OUT/img"; rm -f "$OUT"/img/*
 
 # 1. kernel + memory model + nanokernel + our backend + platform layer: the census build, which must be complete
@@ -39,7 +36,7 @@ INCS="$INC64 \
       -I $EKA/include/nkernsmp -I $EKA/include -I $EKA/include/kernel -I $EKA/include/kernel/arm \
       -I $EKA/include/memmodel/epoc -I $EKA/include/memmodel/epoc/flexible -I $EKA/include/memmodel/epoc/flexible/arm \
       -I $FLX -I $FLX/mmu -I $FLX/mmu/arm -I $EKA/include/memmodel/epoc/mmubase -I $EKA/memmodel/epoc/mmubase \
-      -I $EKA/memmodel/epoc -I $EKA/klib -I $EKA/common -I $KHS/halservices/hal/inc -I $C/kinc -I $C/kinc/kernel -I $BSP/common/inc -I $BSP/sdm670_assp"
+      -I $EKA/memmodel/epoc -I $EKA/klib -I $EKA/common -I $KHS/halservices/hal/inc -I $C/kinc -I $C/kinc/kernel -I $BSP/common/inc -I $ASSPDIR"
 PLAIN="${X}g++-14 $CFLAGS -std=gnu++17 -Wall -Wno-unused -I $EKA/include/kernel/arm64 -I $EKA/include/nkernsmp/arm64"
 AS="${X}gcc-14 $ARCH -c"
 I=$OUT/img
@@ -57,22 +54,13 @@ $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medint -DKernelModuleE
 $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medblk -DKernelModuleEntry=KernelModuleEntry_medblk \
 	-DCreatePhysicalDevice=CreatePhysicalDevice_medblk -c "$BSP/common/specific/a64_medblk.cpp" -o "$I/a64_medblk.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_blk.cpp" -o "$I/a64_blk.o"
-[ "$BOARD" = qemu ] && $EKXX $DEFS $INCS $PRE -c "$BSP/virt_assp/virtio_blk.cpp" -o "$I/virtio_blk.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$BSP/common/specific/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_display.cpp" -o "$I/a64_display.o"
 $EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
 	-c "$BSP/common/specific/a64_dbgmon.cpp" -o "$I/a64_dbgmon.o"	# the debug monitor; its thread dump reads scheduler internals
-[ "$BOARD" = qemu ] && $EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
-	-c "$BSP/virt_assp/a64_serialkbd.cpp" -o "$I/a64_serialkbd.o"	# its thread dump reads scheduler internals
-if [ "$BOARD" = bonito ]; then	# the power and volume keys over the PMIC's SPMI bus; the touchscreen
-	$EKXX $DEFS $INCS $PRE -c "$BSP/sdm670_assp/qcom_spmi.cpp" -o "$I/qcom_spmi.o"
-	$EKXX $DEFS $INCS $PRE -c "$BSP/bonito_variant/specific/a64_keys.cpp" -o "$I/a64_keys.o"
-	$EKXX $DEFS $INCS $PRE ${AUTOFASTBOOT:+-DA64_AUTOFASTBOOT=$AUTOFASTBOOT} -c "$BSP/bonito_variant/specific/a64_reboot.cpp" -o "$I/a64_reboot.o"	# AUTOFASTBOOT=<s>: back to fastboot after s seconds
-	$EKXX $DEFS $INCS $PRE -c "$BSP/bonito_variant/specific/a64_touch.cpp" -o "$I/a64_touch.o"
-	$EKXX $DEFS $INCS $PRE -c "$BSP/sdm670_assp/qcom_geni_i2c.cpp" -o "$I/qcom_geni_i2c.o"
-	$EKXX $DEFS $INCS $PRE ${EMMC_C:+-DA64_EMMC_C} -c "$BSP/sdm670_assp/qcom_sdhci.cpp" -o "$I/qcom_sdhci.o"	# EMMC_C=1: C: on userdata
-	$EKXX $DEFS $INCS $PRE -c "$BSP/sdm670_assp/qcom_dwc3_acm.cpp" -o "$I/qcom_dwc3_acm.o"	# the USB debug console
-fi
+# the board's own kernel extensions and drivers (its variant.conf: variant_drivers)
+ekc() { src=$1; shift; $EKXX $DEFS $INCS $PRE "$@" -c "$src" -o "$I/$(basename "$src" .cpp).o"; }
+variant_drivers
 # the real exstart (starts the ROM secondary), statically linked: only its entry points are renamed
 $EKXX $DEFS $INCS $PRE -DKernelModuleEntry=A64ExstartEntry -DInitExtension=A64ExstartInit \
 	-c "$EKA/kernel/exstart.cpp" -o "$I/exstart.o"
@@ -93,8 +81,8 @@ if [ "${USERSIDE:-1}" != 0 ]; then
 	printf '\t.section .uimage, "a"\n\t.incbin "%s"\n' "$OUT/romsect.bin" > "$I/uimage.S"
 	$AS "$I/uimage.S" -o "$I/uimage.o"
 fi
-[ "$BOARD" = bonito ] && python3 "$HERE/tools/mkfont.py" "$I/font.h" >/dev/null
-$PLAIN -I "$I" -c "$BSP/$BOARD_SRC" -o "$I/board.o"
+[ -n "$FONT" ] && python3 "$HERE/tools/mkfont.py" "$I/font.h" >/dev/null
+$PLAIN -I "$I" -c "$VDIR/$BOARD_SRC" -o "$I/board.o"
 $PLAIN -c "$NK64/gicv3.cpp" -o "$I/gicv3.o"
 $PLAIN -c "$BSP/common/specific/console_io.cpp" -o "$I/console_io.o"
 # the boot stub may reach the ROM only by address, never by a call
@@ -113,7 +101,4 @@ grep -i "warning" "$OUT/link.log" | grep -vE "orphan section .(\.rela\.|\.iplt|\
 ${X}objcopy -O binary "$OUT/ekern.elf" "$OUT/Image"
 ${X}size -A "$OUT/ekern.elf" | grep -E "^\.(boot|text|rodata|data|bss) "
 echo "built $OUT/Image ($(wc -c < "$OUT/Image") bytes, $BOARD at $BASE)"
-if [ "$BOARD" = bonito ]; then	# fastboot boot image: gzip(Image) + DTB, as build-kernel.sh
-	gzip -9nc "$OUT/Image" > "$OUT/Image.gz"
-	python3 -I "$HERE/tools/mkboot.py" "$OUT/Image.gz" "${BONITO_DTB:?set BONITO_DTB to the Pixel DTB}" "$OUT/boot.img"
-fi
+make_bootimg "$OUT/Image" "$OUT"

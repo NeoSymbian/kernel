@@ -66,13 +66,14 @@ at_el1:
 	b	3b
 
 load_mismatch:
-#ifdef BOARD_BONITO
-	/* no console yet: paint the boot framebuffer magenta so a wrong load address is visible on the phone */
-	movz	x1, #0x9c00, lsl #16
+#ifdef A64_BOOT_FB
+	/* no console yet: paint the boot framebuffer magenta so a wrong load address is visible on the screen
+	 * (the board's variant.conf: A64_BOOT_FB, 64 KB aligned, and A64_BOOT_FB_BYTES) */
+	movz	x1, #(A64_BOOT_FB >> 16), lsl #16
 	movz	w2, #0xff00
 	movk	w2, #0xffff, lsl #16		// 0xffff00ff = magenta (a8r8g8b8)
-	movz	x3, #0x6200
-	movk	x3, #0x8e, lsl #16		// 4320 * 2160 bytes
+	movz	x3, #(A64_BOOT_FB_BYTES & 0xffff)
+	movk	x3, #(A64_BOOT_FB_BYTES >> 16), lsl #16
 4:	str	w2, [x1], #4
 	subs	x3, x3, #4
 	b.ne	4b

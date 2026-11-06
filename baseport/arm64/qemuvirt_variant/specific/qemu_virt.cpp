@@ -12,6 +12,7 @@ const char* const A64_BoardName = "QEMU virt";
 const unsigned long A64_GicdBase = 0x08000000, A64_GicrBase = 0x080A0000;
 const unsigned long A64_HeapBase = 0x41000000, A64_HeapSize = 0x06000000;	// below the DTB QEMU puts at 0x48000000
 const int A64_PsciSmc = 0;
+const int A64_HoldResults = 0;		// serial log: power off (QEMU exits) at once
 const unsigned int A64_TimerPpi = 27;
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu; }			// Aff0 = CPU number
 }

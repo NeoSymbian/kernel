@@ -16,6 +16,7 @@ const char* const A64_BoardName = "Pixel 3a XL (bonito)";
 const unsigned long A64_GicdBase = 0x17a00000, A64_GicrBase = 0x17a60000;
 const unsigned long A64_HeapBase = 0xA2000000, A64_HeapSize = 0x06000000;	// free RAM above debug-info@a1800000
 const int A64_PsciSmc = 1;
+const int A64_HoldResults = 1;		// a human reads the result off the screen, maybe hours later
 const unsigned int A64_TimerPpi = 19;	// Qualcomm wires the virtual timer to PPI 3 (DTB: <1 3 8>), not the usual 11
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu << 8; }		// Aff1 = core
 }

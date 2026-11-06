@@ -41,17 +41,7 @@ ek() {	# ek <src> <obj> [extra flags]
 for spec in nklib.cpp:nkern nkern.cpp:nkernsmp nkerns.cpp:nkernsmp sched.cpp:nkernsmp dfcs.cpp:nkernsmp \
             nk_timer.cpp:nkernsmp nk_irq.cpp:nkernsmp nk_bal.cpp:nkernsmp; do
 	f=${spec%%:*}; src="$EKA/${spec##*:}/$f"
-	# a64 port fix in the 2010 kernel (keep it in the ekern build too, see docs/port-map.md): NKern::JoinGroup moved a
-	# group that was already ready to the TAIL of the joining thread's priority (ChangePriority), behind its equal-
-	# priority peers, so the running thread lost its place and the next reschedule switched it out even while it held
-	# a fast mutex (fastmutex.cpp DoRWTest 0x138/0x438, F2 != 0). The group takes the joiner's place at the head.
-	if [ $f = nkern.cpp ] && [ -z "${NO_JOINGROUP_FIX:-}" ]; then	# NO_JOINGROUP_FIX=1: the 2010 original, to compare
-		sed -e 's/^			else if (pC->iPriority > aGroup->iPriority)$/			else if (pC->iPriority >= aGroup->iPriority)	\/\/ a64 port fix: JoinGroup keeps the head/' \
-		    -e 's/^				ss.SSChgEntryP(aGroup, pC->iPriority);$/				{ ss.SSRemoveEntry(aGroup); aGroup->iPriority = pC->iPriority; ss.SSAddEntryHead(aGroup); }	\/\/ a64 port fix: group first/' \
-		    "$src" > "$OUT/nkern.cpp"
-		[ $(grep -c 'a64 port fix:' "$OUT/nkern.cpp") -eq 2 ] || { echo "FAIL nkern.cpp JoinGroup fix did not apply"; fail=1; }
-		src="$OUT/nkern.cpp"
-	fi
+	# NKern::JoinGroup's fix is in the kernel fork itself (nkernsmp/nkern.cpp, "NeoSymbian:")
 	ek "$src" "nk_${f%.cpp}"
 done
 for f in "$HERE"/a64smp/*.cpp; do b=$(basename "$f" .cpp); ek "$f" "be_$b"; done
@@ -75,30 +65,11 @@ for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fast
 	# uninitialised, so group destruction queued a garbage DFC and faulted (RVCT-era stacks evidently held 0 there)
 	extra="-ftrivial-auto-var-init=zero"; [ $f = benchmark ] && extra="$extra -fno-inline -fno-ipa-cp"
 	src="$NKSA/$f.cpp"
-	# Two statistical checks were tuned on ~400 MHz ARM11 boards; on the phone, compile a copy scaled for 2 GHz cores
-	# (QEMU's emulated cores are slow enough for the originals):
-	# - tiedevents: an untied reader must overlap the 10 ms timer, but 100 passes over 2048 flags take ~0.2 ms per
-	#   CPU ("Flag wasn't set, test broken?") -> 50x the passes.
-	# - fastmutex DoRWTest: a cross-CPU suspend must catch the writer inside an unprotected 256-word block >= 10% of
-	#   the time, but the block takes less than the ~1 us suspend IPI latency (F5 ~ 0 right after LeaveCS) -> 16x.
-	#   Each read is a full cross-CPU suspend/kill/migrate round trip, so 78 cases x 100000 reads took hours: 10000
-	#   reads keep both pass rules (0 bad reads protected, >= 10% unprotected) at a tenth of the time.
-	pat=""
-	if [ "$BOARD" = bonito ] || [ -n "${NKSA_SCALE:-}" ]; then	# NKSA_SCALE=1: the same on QEMU
-		case $f in
-		tiedevents) pat='s/^const TInt LoopCount = 100;$/const TInt LoopCount = 5000;	\/\/ a64 port: scaled for 2 GHz cores/' ;;
-		fastmutex)  pat='s/^	TUint32 bufwords = 256;$/	TUint32 bufwords = 4096;	\/\/ a64 port: scaled for 2 GHz cores/;s/^const TInt KReadCount = 100000;$/const TInt KReadCount = 10000;	\/\/ a64 port: reads/' ;;
-		esac
-	fi
-	# NKSA_RWTRACE=1: the DoRWTest reader reports the writer's state at each bad block read (race diagnostics)
-	if [ $f = fastmutex ] && [ -n "${NKSA_RWTRACE:-}" ]; then
-		pat="${pat:+$pat;}"'s/^				++info.iFails\[i\];$/				{ ++info.iFails[i]; extern void A64_RWFail(TInt, TInt, NThread*, TUint32, TUint32); A64_RWFail(info.iTestType, i, info.iWriter, winfo.iInSeq, winfo.iOutSeq); }	\/\/ a64 port: trace/'
-	fi
-	if [ -n "$pat" ]; then
-		sed "$pat" "$src" > "$OUT/$f.cpp"
-		[ $(grep -c 'a64 port: ' "$OUT/$f.cpp") -eq $(echo "$pat" | grep -o 'a64 port: ' | wc -l) ] || { echo "FAIL $f scaling patch did not apply"; fail=1; }
-		src="$OUT/$f.cpp"
-	fi
+	# Two statistical checks were tuned on ~400 MHz ARM11 boards; on the phone they run scaled for 2 GHz cores
+	# (NKSA_FAST_CPU in tiedevents.cpp / fastmutex.cpp; QEMU's emulated cores are slow enough for the originals).
+	# NKSA_SCALE=1 does the same on QEMU; NKSA_RWTRACE=1 makes the DoRWTest reader report each bad block read.
+	if [ "$BOARD" = bonito ] || [ -n "${NKSA_SCALE:-}" ]; then extra="$extra -DNKSA_FAST_CPU"; fi
+	[ -n "${NKSA_RWTRACE:-}" ] && extra="$extra -DNKSA_RWTRACE"
 	ek "$src" "sa_$f" "$extra"
 done
 # -Dprivate=public: the stall dump reads scheduler internals (NThreadWaitState, SIterDQ) of the 2010 headers

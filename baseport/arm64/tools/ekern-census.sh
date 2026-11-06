@@ -64,29 +64,10 @@ for tu in $TUS; do
 	# a marked-delta copy in port/arm64/mm (memory model) or port/arm64/ekern (kernel) replaces the baseline TU
 	[ -f "$HERE/mm/$(basename "$tu")" ] && case "$tu" in memmodel/*) src="$HERE/mm/$(basename "$tu")";; esac
 	[ -f "$HERE/ekern/$(basename "$tu")" ] && case "$tu" in kernel/arm/*) src="$HERE/ekern/$(basename "$tu")";; esac
-	# one-line patches, checked: a copy in $OUT with an "a64 port" marker that must appear exactly once
-	pat=""
-	case "$tu" in
-	# the demand-paging minimum is sized by the worst user instruction; the paged code is the AArch32 user side
-	memmodel/epoc/flexible/mmu/mpager.cpp)
-		pat='s|^#if defined(__CPU_ARM)$|#if defined(__CPU_ARM) \|\| defined(__CPU_ARM64)	// a64 port: AArch32 user code is paged|' ;;
-	# the PRRR/NMRR statics: the header declares them only for __CPU_ARM (the same text at 835/844 must stay)
-	# a release kernel prints nothing when a thread panics: print the category and reason (bring-up)
-	kernel/sthread.cpp)
-		pat='s|^\t\t__KTRACE_OPT2(KPANIC,KSCHED,\(Kern::Printf("Thread %O [PTK].*\)));$|\t\t\1);	// a64 port: always|' ;;
-	kernel/arm/cache_maintenance.cpp)
-		pat='34s|^#if !defined(__CPU_MEMORY_TYPE_REMAPPING)$|#if !defined(__CPU_MEMORY_TYPE_REMAPPING) \&\& defined(__CPU_ARM)	// a64 port: header declares them for ARM only|' ;;
-	esac
 	# Kern::Printf straight to the board console from the kernel's first line (the variant defines DebugOutputChar)
 	extra=""; [ "$tu" = kernel/arm/cutils.cpp ] && extra="-D__EARLY_DEBUG__"
-	# DThread::Exit's exit report sits under #ifdef KPANIC, a debug-build trace bit: keep it (and the patch below)
+	# DThread::Exit's exit report sits under #ifdef KPANIC, a debug-build trace bit: keep it (the fork prints it always)
 	[ "$tu" = kernel/sthread.cpp ] && extra="-DKPANIC=31"
-	if [ -n "$pat" ]; then
-		sed "$pat" "$src" > "$OUT/patched_$(basename "$tu")"
-		want=1; [ "$tu" = kernel/sthread.cpp ] && want=3			# the exit-print patch changes three lines
-		[ "$(grep -c 'a64 port:' "$OUT/patched_$(basename "$tu")")" = $want ] || echo "PATCH NOT APPLIED: $tu"
-		src="$OUT/patched_$(basename "$tu")"
-	fi
 	if $CXX $extra $DEFS $INCS $PRE -c "$src" -o "$OUT/obj/$n.o" 2>"$OUT/$n.log"; then
 		pass=$((pass+1)); rm -f "$OUT/$n.log"
 	else

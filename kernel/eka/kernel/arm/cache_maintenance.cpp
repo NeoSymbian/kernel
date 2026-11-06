@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): the PRRR/NMRR statics only for __CPU_ARM, as the header declares them.
 // Description:
 // eka\kernel\arm\cache_maintenance.cpp
 // 
@@ -31,7 +31,7 @@ SCacheInfo InternalCache::Info[KNumCacheInfos];
 TInt InternalCache::DmaBufferAlignementLog2; 
 #endif
 
-#if !defined(__CPU_MEMORY_TYPE_REMAPPING)
+#if !defined(__CPU_MEMORY_TYPE_REMAPPING) && defined(__CPU_ARM)	// NeoSymbian: the header declares them for ARM only
 TUint32 InternalCache::iPrimaryRegionRemapRegister;
 TUint32 InternalCache::iNormalMemoryRemapRegister;
 #endif

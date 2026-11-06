@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): NKSA_FAST_CPU scales the loop for 2 GHz cores.
 // Description:
 // e32test\nkernsa\tiedevents.cpp
 // 
@@ -42,7 +42,11 @@
 extern "C" void HijackSystemTimer(NSchedulable* aTieTo);
 
 const TInt FlagCount = 2048;
+#ifdef NKSA_FAST_CPU	// NeoSymbian: 100 passes over 2048 flags take ~0.2 ms on a 2 GHz core, far less than the 10 ms timer
+const TInt LoopCount = 5000;
+#else
 const TInt LoopCount = 100;
+#endif
 
 volatile TUint32 Flags[FlagCount];
 volatile TBool Done;

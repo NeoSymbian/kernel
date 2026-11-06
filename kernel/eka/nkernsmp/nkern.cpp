@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): NKern::JoinGroup keeps the joiner's place at the head.
 // Description:
 // e32\nkernsmp\nkern.cpp
 // 
@@ -2541,8 +2541,8 @@ EXPORT_C void NKern::JoinGroup(NThreadGroup* aGroup)
 				ss.SSAddEntryHead(aGroup);
 				aGroup->iReady = TUint8(ss.iCpuNum | NSchedulable::EReadyOffset);
 				}
-			else if (pC->iPriority > aGroup->iPriority)
-				ss.SSChgEntryP(aGroup, pC->iPriority);
+			else if (pC->iPriority >= aGroup->iPriority)	// NeoSymbian: JoinGroup keeps the head
+				{ ss.SSRemoveEntry(aGroup); aGroup->iPriority = pC->iPriority; ss.SSAddEntryHead(aGroup); }	// NeoSymbian: group first
 			pC->iReady = NSchedulable::EReadyGroup;
 			aGroup->iCurrent = aGroup->iReady;
 			ss.iReadyListLock.UnlockOnly();

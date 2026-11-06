@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): NKSA_FAST_CPU scales DoRWTest for 2 GHz cores; NKSA_RWTRACE traces bad reads.
 // Description:
 // e32test\nkernsa\fastmutex.cpp
 // 
@@ -17,7 +17,11 @@
 
 #include <nktest/nkutils.h>
 
+#ifdef NKSA_FAST_CPU	// NeoSymbian: each read is a cross-CPU suspend/kill/migrate round trip; 10000 keep both pass rules
+const TInt KReadCount = 10000;
+#else
 const TInt KReadCount = 100000;
+#endif
 //const TInt KReadCount = 2000000;
 #ifdef __CPU_ARM
 const TUint32 KTickLimit = (KReadCount>100000) ? (((TUint32)KReadCount)/10*18) : 180000u;
@@ -631,7 +635,11 @@ void ReaderThread(TAny* a)
 			{
 			TInt cpu = verify_block_cpu_no_trace(info.iBuf[i], info.iWords);
 			if (cpu<0)
+#ifndef NKSA_RWTRACE
 				++info.iFails[i];
+#else	// NeoSymbian: report the writer's state at each bad block read (A64_RWFail is in the arm64 nkernsa glue)
+				{ ++info.iFails[i]; extern void A64_RWFail(TInt, TInt, NThread*, TUint32, TUint32); A64_RWFail(info.iTestType, i, info.iWriter, winfo.iInSeq, winfo.iOutSeq); }
+#endif
 			}
 		++info.iReads;
 		switch (info.iTestType)
@@ -1012,7 +1020,11 @@ void DoRWTest(TInt aTestType, TUint32 aReadLimit, TUint32 aInSeq, TUint32 aOutSe
 	SGroupThreadInfo* gtinfo = new SGroupThreadInfo;
 	TEST_OOM(gtinfo);
 	memclr(gtinfo, sizeof(SGroupThreadInfo));
+#ifdef NKSA_FAST_CPU	// NeoSymbian: the unprotected block must outlast the ~1 us suspend IPI on 2 GHz cores
+	TUint32 bufwords = 4096;
+#else
 	TUint32 bufwords = 256;
+#endif
 	TUint32* buf = (TUint32*)malloc(6 * bufwords * sizeof(TUint32));
 	TEST_OOM(buf);
 	memclr(buf, 6 * bufwords * sizeof(TUint32));

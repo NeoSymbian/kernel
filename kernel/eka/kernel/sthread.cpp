@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): with KPANIC defined, thread exits are always printed.
 // Description:
 // e32\kernel\sthread.cpp
 // 
@@ -724,15 +724,15 @@ void DThread::Exit()
 #ifdef KPANIC
 	if (iExitType==EExitPanic)
 		{
-		__KTRACE_OPT2(KPANIC,KSCHED,Kern::Printf("Thread %O Panic %S %d",this,&iExitCategory,iExitReason));
+		Kern::Printf("Thread %O Panic %S %d",this,&iExitCategory,iExitReason);	// NeoSymbian: always
 		}
 	else if (iExitType==EExitTerminate)
 		{
-		__KTRACE_OPT2(KPANIC,KSCHED,Kern::Printf("Thread %O Terminated %d",this,iExitReason));
+		Kern::Printf("Thread %O Terminated %d",this,iExitReason);	// NeoSymbian: always
 		}
 	else if (iExitType==EExitKill && iExitReason!=KErrNone)
 		{
-		__KTRACE_OPT2(KPANIC,KSCHED,Kern::Printf("Thread %O Killed %d",this,iExitReason));
+		Kern::Printf("Thread %O Killed %d",this,iExitReason);	// NeoSymbian: always
 		}
 #endif
 	if (iExitType!=EExitKill && (iFlags & (KThreadFlagSystemPermanent|KThreadFlagSystemCritical)))

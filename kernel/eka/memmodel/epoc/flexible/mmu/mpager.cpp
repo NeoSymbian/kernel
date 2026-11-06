@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-or-later (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): the paging minimum also covers AArch32 user code on arm64.
 // Description:
 //
 
@@ -90,7 +90,7 @@ void DPager::InitCache()
 	__NK_ASSERT_DEBUG(iReservePageCount == iMinimumPageCount);
 	__NK_ASSERT_DEBUG(!CacheInitialised());
 
-#if defined(__CPU_ARM)
+#if defined(__CPU_ARM) || defined(__CPU_ARM64)	// NeoSymbian: AArch32 user code is paged
 
 /** Minimum number of young pages the demand paging live list may have.
 	Need at least 4 mapped pages to guarantee to be able to execute all ARM instructions,

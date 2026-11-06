@@ -1,0 +1,387 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// a64_dbgmon.cpp -- the kernel's debug monitor and log ring (board-agnostic). Every kernel debug character goes into a
+// 64 KB ring (A64Log_Putc, from DebugOutputChar), so a transport that connects late can still replay the whole boot
+// log. Commands come as text lines from a transport -- the PL011 on QEMU (Ctrl-B, then a line), USB CDC-ACM on the
+// Pixel -- and answer through that transport's blocking writer:
+//   help | log | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
+//   blk info | blk gpt | blk read <lba> [n] | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2>
+//   key <scancode> | shot | reboot | fastboot
+// "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
+// Debug builds only, on a development phone: peek/poke/spmi w reach any register.
+#include <kernel/kern_priv.h>
+#include <mmboot.h>
+#include "board.h"
+#include "a64_blk.h"
+#include "qcom_spmi.h"
+#include "a64_dbgmon.h"
+#include "../platform/a64_platform.h"
+
+// ---- the log ring
+const TUint32 KLogSize = 64 * 1024;
+static char LogRing[KLogSize];
+static volatile TUint32 LogHead;							// characters ever written (the ring keeps the last 64 KB)
+
+void A64Log_Putc(char aChar)
+	{
+	TUint32 i = __e32_atomic_add_ord32(&LogHead, 1);
+	LogRing[i % KLogSize] = aChar;
+	}
+
+TInt A64Log_Read(TUint32& aPos, TUint8* aBuf, TInt aMax)
+	{
+	TUint32 head = LogHead;
+	if (head - aPos > KLogSize)								// the reader fell behind: skip to the oldest kept byte
+		aPos = head - KLogSize;
+	TInt n = 0;
+	while (n < aMax && aPos != head)
+		aBuf[n++] = LogRing[aPos++ % KLogSize];
+	return n;
+	}
+
+// ---- output to the current transport
+static TMonWrite Out;
+
+static void Write(const TAny* aData, TInt aLen)
+	{
+	if (Out)
+		Out((const TUint8*)aData, aLen);
+	}
+
+static void Fmt(TDes8& aBuf, const char* aFmt, ...)		// append, Kern::Printf's format (no field widths)
+	{
+	VA_LIST list;
+	VA_START(list, aFmt);
+	Kern::AppendFormat(aBuf, aFmt, list);
+	VA_END(list);
+	}
+
+static TBool Eq(const TDesC8& aWord, const char* aLit)
+	{
+	TInt n = 0;
+	while (aLit[n])
+		++n;
+	return aWord.Length() == n && memcompare(aWord.Ptr(), n, (const TUint8*)aLit, n) == 0;
+	}
+
+static void Say(const char* aFmt, ...)
+	{
+	VA_LIST list;
+	VA_START(list, aFmt);
+	TBuf8<256> b;
+	Kern::AppendFormat(b, aFmt, list);
+	VA_END(list);
+	b.Append('\n');
+	Write(b.Ptr(), b.Length());
+	}
+
+// ---- hooks other board files provide (weak: absent on some boards)
+__attribute__((weak)) void A64TouchDump() {}
+__attribute__((weak)) void A64BlkDump() {}
+__attribute__((weak)) void A64KeysDump() {}
+__attribute__((weak)) void A64_RebootToFastboot() { Say("fastboot: not on this board"); }
+__attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
+__attribute__((weak)) void A64_WatchdogBite(TInt) { Say("wdt: not on this board"); }
+__attribute__((weak)) TInt A64BlkDev_Probe() { return KErrNotSupported; }
+__attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
+__attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
+__attribute__((weak)) int Spmi_Write(unsigned, unsigned, unsigned) { return KErrNotSupported; }
+void A64DumpThreads();										// below, needs scheduler internals
+
+// ---- physical access: the board's IO regions, else pages mapped on first use
+static TLinAddr Map(TUint32 aPhys)
+	{
+	TLinAddr io = A64_Io(aPhys);
+	if (io)
+		return io;
+	static struct { TUint32 iPage; DPlatChunkHw* iChunk; } cache[8];
+	static TInt next;
+	TUint32 page = aPhys & ~KPageMask;
+	for (TUint i = 0; i < sizeof(cache) / sizeof(cache[0]); ++i)
+		if (cache[i].iChunk && cache[i].iPage == page)
+			return cache[i].iChunk->LinearAddress() + (aPhys & KPageMask);
+	DPlatChunkHw* chunk = NULL;
+	if (DPlatChunkHw::New(chunk, page, KPageSize, EMapAttrSupRw | EMapAttrFullyBlocking) != KErrNone)
+		return 0;
+	TInt slot = next++ % (TInt)(sizeof(cache) / sizeof(cache[0]));
+	if (cache[slot].iChunk)
+		cache[slot].iChunk->Close(NULL);
+	cache[slot].iPage = page;
+	cache[slot].iChunk = chunk;
+	return chunk->LinearAddress() + (aPhys & KPageMask);
+	}
+
+// ---- parsing
+static TUint64 Num(const TDesC8& aWord)					// 0x... hex, else decimal; stops at the first bad digit
+	{
+	TInt i = 0, base = 10;
+	if (aWord.Length() > 2 && aWord[0] == '0' && (aWord[1] | 0x20) == 'x')
+		{
+		i = 2;
+		base = 16;
+		}
+	TUint64 v = 0;
+	for (; i < aWord.Length(); ++i)
+		{
+		TUint c = aWord[i] | 0x20, d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 99;
+		if (d >= (TUint)base)
+			break;
+		v = v * base + d;
+		}
+	return v;
+	}
+
+const TInt KMaxArgs = 6;
+
+static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
+	{
+	static TUint8 s[KA64BlkSector];
+	if (aArgc >= 2 && Eq(aArg[1], "init"))					// bring the device up now (Pixel: the eMMC)
+		{
+		TInt r = KErrNone, x;
+		XTRAP(x, XT_DEFAULT, r = A64BlkDev_Probe());		// an aborting register shows as -38, not a crash
+		Say("blk init -> %d (trap %d; see 'log' for the steps)", r, x);
+		}
+	else if (aArgc >= 2 && Eq(aArg[1], "info"))
+		{
+		A64BlkDump();
+		Say("window: %d sectors", (TInt)A64Blk_Sectors());
+		}
+	else if (aArgc >= 3 && Eq(aArg[1], "read"))		// the raw device, read-only
+		{
+		TInt n = aArgc >= 4 ? (TInt)aNum[3] : 1;
+		for (TInt k = 0; k < n && k < 16; ++k)
+			{
+			TInt r = A64BlkDev_Read(aNum[2] + k, 1, s);
+			if (r != KErrNone)
+				{
+				Say("read %d -> %d", (TInt)(aNum[2] + k), r);
+				return;
+				}
+			for (TInt i = 0; i < KA64BlkSector; i += 32)
+				{
+				TBuf8<120> b;
+				Fmt(b, "%08x+%03x:", (TUint32)(aNum[2] + k), i);
+				for (TInt j = 0; j < 32; ++j)
+					Fmt(b, j % 4 ? "%02x" : " %02x", s[i + j]);
+				Say("%S", &b);
+				}
+			}
+		}
+	else if (aArgc >= 2 && Eq(aArg[1], "gpt"))			// every partition: name, first, last sector
+		{
+		TInt r = A64BlkDev_Read(1, 1, s);
+		if (r != KErrNone || memcompare(s, 8, (const TUint8*)"EFI PART", 8) != 0)
+			{
+			Say("no GPT (%d)", r);
+			return;
+			}
+		TUint64 lba = *(TUint64*)(s + 72);
+		TUint32 n = *(TUint32*)(s + 80), size = *(TUint32*)(s + 84);
+		Say("GPT: %d entries of %d bytes at sector %d", n, size, (TInt)lba);
+		static TUint8 e[KA64BlkSector];
+		for (TUint32 i = 0; i < n && size >= 128 && size <= KA64BlkSector; ++i)
+			{
+			TUint32 off = i * size;
+			if (off % KA64BlkSector == 0 && A64BlkDev_Read(lba + off / KA64BlkSector, 1, e) != KErrNone)
+				return;
+			const TUint8* p = e + off % KA64BlkSector;
+			if (!(*(const TUint64*)(p + 32)))
+				continue;
+			TBuf8<40> name;
+			for (TInt c = 0; c < 36 && p[56 + 2 * c]; ++c)
+				name.Append(p[56 + 2 * c]);
+			TUint64 first = *(const TUint64*)(p + 32), last = *(const TUint64*)(p + 40);
+			Say("%d %S %d..%d %d MB", i, &name, (TInt)first, (TInt)last, (TInt)((last - first + 1) >> 11));
+			}
+		}
+	else
+		Say("blk init | blk info | blk gpt | blk read <lba> [n]");
+	}
+
+static void Post(TRawEvent::TType aType, TInt aX, TInt aY)
+	{
+	TRawEvent e;
+	e.Set(aType, aX, aY);
+	Kern::AddEvent(e);
+	}
+
+static void Shot()
+	{
+	TLinAddr fb = A64_FbLinear();
+	if (!fb)
+		{
+		Say("shot: no framebuffer");
+		return;
+		}
+	TBuf8<40> h;
+	Fmt(h, "SHOT %d %d\n", A64_FbWidth, A64_FbHeight);
+	Write(h.Ptr(), h.Length());
+	for (TInt y = 0; y < A64_FbHeight; ++y)
+		Write((const TAny*)(fb + y * A64_FbStride), A64_FbWidth * 4);
+	}
+
+void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
+	{
+	Out = aWrite;
+	TPtrC8 arg[KMaxArgs];
+	TUint64 num[KMaxArgs];
+	TInt argc = 0;
+	for (TInt i = 0; i < aLine.Length() && argc < KMaxArgs; )		// words separated by spaces
+		{
+		while (i < aLine.Length() && aLine[i] <= ' ')
+			++i;
+		TInt start = i;
+		while (i < aLine.Length() && aLine[i] > ' ')
+			++i;
+		if (i > start)
+			{
+			arg[argc].Set(aLine.Mid(start, i - start));
+			num[argc] = Num(arg[argc]);
+			++argc;
+			}
+		}
+	if (!argc)
+		return;
+	NKern::ThreadEnterCS();
+	const TPtrC8& c = arg[0];
+	if (Eq(c, "help"))
+		Say("help log peek poke spmi blk touch keys threads usb tap swipe key shot reboot fastboot wdt");
+	else if (Eq(c, "log"))
+		{
+		TUint32 pos = 0;
+		TUint8 b[256];
+		for (TInt n; (n = A64Log_Read(pos, b, sizeof(b))) > 0; )
+			Write(b, n);
+		}
+	else if (Eq(c, "peek") && argc >= 2)
+		{
+		TInt n = argc >= 3 ? (TInt)num[2] : 1;
+		for (TInt i = 0; i < n && i < 256; ++i)
+			{
+			TUint32 a = (TUint32)num[1] + 4 * i;
+			TLinAddr l = Map(a);
+			TUint32 v = 0;
+			TInt x = KErrNone;
+			if (l)
+				XTRAP(x, XT_DEFAULT, v = *(volatile TUint32*)l);	// a register can answer with an abort
+			if (l && x)
+				Say("%08x: abort (%d)", a, x);
+			else if (l)
+				Say("%08x: %08x", a, v);
+			else
+				Say("%08x: not mapped", a);
+			}
+		}
+	else if (Eq(c, "poke") && argc >= 3)
+		{
+		TLinAddr l = Map((TUint32)num[1]);
+		TUint32 v = 0;
+		TInt x = KErrNone;
+		if (l)
+			XTRAP(x, XT_DEFAULT, *(volatile TUint32*)l = (TUint32)num[2]; v = *(volatile TUint32*)l);
+		if (l)
+			Say("%08x <- %08x, reads %08x (trap %d)", (TUint32)num[1], (TUint32)num[2], v, x);
+		}
+	else if (Eq(c, "spmi") && argc >= 4 && Eq(arg[1], "r"))
+		Say("spmi %d:%04x = %d (0x%02x)", (TInt)num[2], (TInt)num[3], Spmi_Read((TUint)num[2], (TUint)num[3]),
+			Spmi_Read((TUint)num[2], (TUint)num[3]) & 0xff);
+	else if (Eq(c, "spmi") && argc >= 5 && Eq(arg[1], "w"))
+		Say("spmi %d:%04x <- %02x -> %d", (TInt)num[2], (TInt)num[3], (TInt)num[4],
+			Spmi_Write((TUint)num[2], (TUint)num[3], (TUint)num[4]));
+	else if (Eq(c, "blk"))
+		Blk(argc, arg, num);
+	else if (Eq(c, "touch"))
+		A64TouchDump();
+	else if (Eq(c, "keys"))
+		A64KeysDump();
+	else if (Eq(c, "threads"))
+		A64DumpThreads();
+	else if (Eq(c, "tap") && argc >= 3)
+		{
+		Post(TRawEvent::EButton1Down, (TInt)num[1], (TInt)num[2]);
+		NKern::Sleep(NKern::TimerTicks(80));
+		Post(TRawEvent::EButton1Up, (TInt)num[1], (TInt)num[2]);
+		}
+	else if (Eq(c, "swipe") && argc >= 5)
+		{
+		Post(TRawEvent::EButton1Down, (TInt)num[1], (TInt)num[2]);
+		for (TInt k = 1; k <= 10; ++k)
+			{
+			NKern::Sleep(NKern::TimerTicks(16));
+			Post(TRawEvent::EPointerMove, (TInt)(num[1] + ((TInt)num[3] - (TInt)num[1]) * k / 10),
+				(TInt)(num[2] + ((TInt)num[4] - (TInt)num[2]) * k / 10));
+			}
+		Post(TRawEvent::EButton1Up, (TInt)num[3], (TInt)num[4]);
+		}
+	else if (Eq(c, "key") && argc >= 2)
+		{
+		TRawEvent e;
+		e.Set(TRawEvent::EKeyDown, (TInt)num[1]);
+		Kern::AddEvent(e);
+		NKern::Sleep(NKern::TimerTicks(30));
+		e.Set(TRawEvent::EKeyUp, (TInt)num[1]);
+		Kern::AddEvent(e);
+		}
+	else if (Eq(c, "wdt"))
+		{
+		Say("watchdog bite in 1 s");
+		A64_WatchdogBite(1000);
+		}
+	else if (Eq(c, "usb"))
+		{
+		TBuf8<200> b;
+		A64UsbStatus(b);
+		Say("%S", &b);
+		}
+	else if (Eq(c, "shot"))
+		Shot();
+	else if (Eq(c, "fastboot"))
+		{
+		Say("rebooting to fastboot");
+		A64_RebootToFastboot();
+		}
+	else if (Eq(c, "reboot"))
+		{
+		Say("rebooting");
+		A64_Psci(0x84000009, 0, 0, 0);
+		}
+	else
+		Say("unknown: %S (try help)", &c);
+	NKern::ThreadLeaveCS();
+	if (!Eq(c, "shot"))
+		Write("\n.\n", 3);									// end of answer, for tools/phone.py
+	}
+
+// ---- the thread dump (was a64_serialkbd.cpp's Ctrl-T; this file is built with private/protected opened up)
+void A64DumpThreads()
+	{
+	DObjectCon& c = *K::Containers[EThread];
+	c.Wait();
+	Kern::Printf("[dump] ===== %d threads at tick %d =====", c.Count(), NKern::TickCount());
+	Kern::Printf("[dump] event queue: %d queued, request %08x status %08x ready %d, event thread %O",
+		(TInt)((K::EventHeadPtr - K::EventTailPtr + (K::EventBufferEnd - K::EventBufferStart)) % (K::EventBufferEnd - K::EventBufferStart)),
+		(TUint32)(TLinAddr)K::EventRequest, (TUint32)K::EventRequest->iStatus, K::EventRequest->IsReady(), K::EventThread);
+	for (TInt i = 0; i < c.Count(); ++i)
+		{
+		DThread* t = (DThread*)c[i];
+		NThreadBase& n = t->iNThread;
+		const NThreadWaitState::S& w = n.iWaitState.iWtC;
+		Kern::Printf("[dump] %O wait %02x type %d obj %08x waitobj %08x pri %d cs %d umcb %08x", t, w.iWtStFlags,
+			w.iWtObjType, (TUint32)(TLinAddr)w.iWtObj, (TUint32)(TLinAddr)t->iWaitObj, n.iPriority, n.iCsCount,
+			(TUint32)(TLinAddr)n.iUserModeCallbacks);
+		if (t->iThreadType == EThreadUser && n.iStackBase)
+			{
+			const SThreadExcStack* f = (const SThreadExcStack*)((TLinAddr)n.iStackBase + n.iStackSize) - 1;
+			if ((f->iSpsr & 0x1F) == 0x10)
+				{
+				TInt word = 0x0BADBAD0;						// the word r0 points at (a TRequestStatus, for WaitForRequest)
+				Kern::ThreadRawRead(t, (const TAny*)(TLinAddr)(TUint32)f->iX[0], &word, sizeof(word));
+				Kern::Printf("[dump]   user pc %08x lr %08x sp %08x r0 %08x [r0] %08x reqsem %d", (TUint32)f->iElr,
+					(TUint32)f->iX[14], (TUint32)f->iX[13], (TUint32)f->iX[0], word, n.iRequestSemaphore.iCount);
+				}
+			}
+		}
+	c.Signal();
+	Kern::Printf("[dump] ===== end =====");
+	}

@@ -342,12 +342,9 @@ static void PollDfcFn(TAny*)
 				Post(TRawEvent::EPointerMove, x, y);
 			else if (!down && Down)
 				Post(TRawEvent::EButton1Up, LastX, LastY);
-			if (down != Down && Logged < 30)
-				{
-				++Logged;
-				Kern::Printf("[touch] %s %d %d (raw %d %d type %d, attn %d)", down ? "down" : "up",
-					down ? x : LastX, down ? y : LastY, rx, ry, o[0], AttnSeen);
-				}
+			if (down != Down)								// every press and release: taps come at human pace
+				Kern::Printf("[touch] %d %s %d %d (type %d, attn %d)", ++Logged, down ? "down" : "up",
+					down ? x : LastX, down ? y : LastY, o[0], AttnSeen);
 			Down = down;
 			if (down)
 				{

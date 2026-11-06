@@ -17,6 +17,8 @@
 extern "C" void KernelMain();
 extern "C" void generic_ipi_isr(TSubScheduler* aS);		// nkernsmp/nkern.cpp
 extern "C" void run_event_handlers(TSubScheduler* aS);	// nkernsmp/nk_irq.cpp
+extern "C" void resched_ipi_ack(TSubScheduler* aSS);		// a64s_ncsched.cpp
+extern "C" volatile TUint32 A64_HandshakeEarly;
 extern "C" void send_resched_ipis(TUint32 aMask);
 TSubScheduler& SubScheduler();
 
@@ -124,7 +126,8 @@ static void TimerIrq(TSubScheduler& aSS)
 static void Irq(SThreadExcStack* aF)
 	{
 	TSubScheduler& ss = SubScheduler();
-	++ss.iSSX.iIrqNestCount;				// -1 = not in an ISR
+	// release: a CPU in send_resched_ipi_and_wait that sees us inside an ISR also sees the interrupted thread's stores
+	__atomic_store_n(&ss.iSSX.iIrqNestCount, ss.iSSX.iIrqNestCount + 1, __ATOMIC_RELEASE);	// -1 = not in an ISR
 	++ss.iSSX.iIrqCount;
 	for (;;)
 		{
@@ -138,7 +141,10 @@ static void Irq(SThreadExcStack* aF)
 			TimerIrq(ss);
 			}
 		else if (id == RESCHED_IPI_VECTOR)
+			{
 			ss.iRescheduleNeededFlag = TRUE;
+			resched_ipi_ack(&ss);			// after the flag: an acknowledged CPU reschedules on exit
+			}
 		else if (id == GENERIC_IPI_VECTOR)
 			generic_ipi_isr(&ss);
 		// TRANSFERRED_IRQ_VECTOR: the tail below runs the events
@@ -159,6 +165,87 @@ static void Irq(SThreadExcStack* aF)
 		if (ipis)
 			send_resched_ipis(ipis);
 		}
+	}
+
+/* Scheduler rule check, called after every selection (a64s_ncsched.cpp A64_ReschedSelect, kernel locked):
+ *  1. a thread leaves the CPU suspended (or killed) while inside a critical section -- must be deferred;
+ *  2. a thread still ready to run here is replaced by a LOWER priority thread.
+ * Logs the first few of each with the thread state (the nkernsa DoRWTest interlocked suspend/kill race). */
+static volatile TUint32 SchedCheckLogs[2];
+static void SchedLog(TInt aCheck, const char* aWhat, NThreadBase* aOld, NThreadBase* aNew, TSubScheduler* aSS)
+	{
+	if (__e32_atomic_add_ord32(&SchedCheckLogs[aCheck], 1) >= 10)
+		return;
+	A64_DebugPuts("\n*** SCHED "); A64_DebugPuts(aWhat);
+	A64_DebugPuts(" cpu="); A64_DebugHex(aSS->iCpuNum);
+	A64_DebugPuts(" old="); A64_DebugHex((TLinAddr)aOld);
+	A64_DebugPuts(" pri="); A64_DebugHex(aOld->iPriority);
+	A64_DebugPuts(" cs="); A64_DebugHex((TUint32)aOld->iCsCount);
+	A64_DebugPuts(" csf="); A64_DebugHex((TUint32)aOld->iCsFunction);
+	A64_DebugPuts(" susp="); A64_DebugHex(aOld->iSuspended);
+	A64_DebugPuts(" scnt="); A64_DebugHex((TUint32)aOld->iSuspendCount);
+	A64_DebugPuts(" fm="); A64_DebugHex((TLinAddr)aOld->iHeldFastMutex);
+	A64_DebugPuts(" frz="); A64_DebugHex(aOld->iFreezeCpu);
+	A64_DebugPuts(" wst="); A64_DebugHex(aOld->iWaitState.iWtC.iWtStFlags);
+	A64_DebugPuts(" pause="); A64_DebugHex(aOld->iPauseCount);
+	A64_DebugPuts(" par="); A64_DebugHex((TLinAddr)aOld->iParent);
+	A64_DebugPuts(" rdy="); A64_DebugHex(aOld->iReady);
+	A64_DebugPuts(" base="); A64_DebugHex(aOld->iBasePri);
+	A64_DebugPuts(" mpri="); A64_DebugHex(aOld->iMutexPri);
+	A64_DebugPuts(" nom="); A64_DebugHex(aOld->iNominalPri);
+	A64_DebugPuts(" time="); A64_DebugHex((TUint32)aOld->iTime);
+	A64_DebugPuts(" | new="); A64_DebugHex((TLinAddr)aNew);
+	A64_DebugPuts(" pri="); A64_DebugHex(aNew ? aNew->iPriority : 0xFF);
+	A64_DebugPuts(" | list hp="); A64_DebugHex((TUint32)aSS->iSSList.HighestPriority());
+	// is the old thread actually on this CPU's list at its priority?
+	TBool found = FALSE;
+	SDblQueLink* h = (aOld->iPriority < 64) ? aSS->iSSList.iQueue[aOld->iPriority] : 0;
+	for (SDblQueLink* p = h; p; p = p->iNext) { if (p == (SDblQueLink*)aOld->iParent) { found = TRUE; break; } if (p->iNext == h) break; }
+	A64_DebugPuts(found ? " old-in-list" : " old-NOT-in-list-at-its-pri");
+	A64_DebugPuts("\n");
+	}
+
+extern "C" void A64_SchedCheck(NThreadBase* aOld, NThreadBase* aNew, TSubScheduler* aSS)
+	{
+	if (!aOld || aOld == aNew || aOld->i_NThread_Initial)
+		return;
+	if (aOld->iCsCount > 0 && (aOld->iSuspended || aOld->iCsFunction == NThreadBase::ECSDivertPending))
+		SchedLog(0, "left the CPU suspended/killed INSIDE a critical section", aOld, aNew, aSS);
+	// test threads only (priority 1..15; system DFC threads are higher), the replacement not the idle thread,
+	// and the old one still on this CPU's ready list (iReady: not blocked, suspended or migrating)
+	TBool ready = !aOld->iSuspended && !aOld->iPauseCount && !aOld->iWaitState.iWtC.iWtStFlags
+				&& aOld->iCsFunction >= 0 && aOld->iReady == TUint8(aSS->iCpuNum | NSchedulable::EReadyOffset);	// ready HERE, not migrating
+	if (ready && aNew && !aNew->i_NThread_Initial && aOld->iPriority < 16 && aNew->iPriority < aOld->iPriority)
+		SchedLog(1, "chose a LOWER priority thread while the old one is ready", aOld, aNew, aSS);
+	}
+
+/* NKSA_RWTRACE: DoRWTest's reader found block aBuf of the writer's buffers inconsistent; show how the writer was
+ * stopped (only buffers 1-4, which some cases protect; the first 16) */
+static volatile TUint32 RWFails;
+void A64_RWFail(TInt aBuf, NThread* aW)
+	{
+	if (aBuf < 1 || aBuf > 4 || !aW || __e32_atomic_add_ord32(&RWFails, 1) >= 16)
+		return;
+	NThreadBase* w = aW;
+	A64_DebugPuts("\n*** RWFAIL buf="); A64_DebugHex(aBuf);
+	A64_DebugPuts(" rdcpu="); A64_DebugHex(NKern::CurrentCpu());
+	A64_DebugPuts(" w="); A64_DebugHex((TLinAddr)w);
+	A64_DebugPuts(" pri="); A64_DebugHex(w->iPriority);
+	A64_DebugPuts(" cs="); A64_DebugHex((TUint32)w->iCsCount);
+	A64_DebugPuts(" csf="); A64_DebugHex((TUint32)w->iCsFunction);
+	A64_DebugPuts(" susp="); A64_DebugHex(w->iSuspended);
+	A64_DebugPuts(" scnt="); A64_DebugHex((TUint32)w->iSuspendCount);
+	A64_DebugPuts(" fm="); A64_DebugHex((TLinAddr)w->iHeldFastMutex);
+	A64_DebugPuts(" fmd="); A64_DebugHex(w->iFastMutexDefer);
+	A64_DebugPuts(" frz="); A64_DebugHex(w->iFreezeCpu);
+	A64_DebugPuts(" wst="); A64_DebugHex(w->iWaitState.iWtC.iWtStFlags);
+	A64_DebugPuts(" wobj="); A64_DebugHex(w->iWaitState.iWtC.iWtObjType);
+	A64_DebugPuts(" rdy="); A64_DebugHex(w->iReady);
+	A64_DebugPuts(" cur="); A64_DebugHex(w->iCurrent);
+	A64_DebugPuts(" last="); A64_DebugHex(w->iLastCpu);
+	A64_DebugPuts(" par="); A64_DebugHex((TLinAddr)w->iParent);
+	A64_DebugPuts(" lnk="); A64_DebugHex(w->iLinkedObjType);
+	A64_DebugPuts("\n");
 	}
 
 static void DumpSched(const char* aWhat, NSchedulable* aS)
@@ -586,6 +673,7 @@ void __finish()
 		A64_DebugPuts("  "); PutDec(ms / 1000); A64_DebugPuts("s  "); A64_DebugPuts(TestTimes[i].iName); A64_DebugPuts("\n");
 		}
 	A64_DebugPuts("  total "); PutDec(TestTimeCount ? (end - TestTimes[0].iStartMs) / 1000 : 0); A64_DebugPuts("s\n");
+	A64_DebugPuts("Suspend/kill IPI handshakes the 2010 test would have ended too early: "); PutDec(A64_HandshakeEarly); A64_DebugPuts("\n");
 	A64_DebugPuts("EKA2/arm64: nkernsa finished, failures: ");
 	A64_DebugHex(StatusFails);
 	A64_DebugPuts("\n");

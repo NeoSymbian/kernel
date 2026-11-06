@@ -116,18 +116,47 @@ extern "C" void send_resched_ipis(TUint32 aMask)
             send_resched_ipi(i);
     }
 
+/* send_resched_ipi_and_wait (SuspendOrKill, GetUserContext): return only once aCpu is inside an interrupt that will
+ * reschedule on exit, so the thread running there can't enter or leave a critical section while the caller, holding
+ * that thread's spin lock, reads iCsCount and decides suspend-now versus defer.
+ * The 2010 ARM test -- "iRescheduleNeededFlag set, and (in an ISR, or iIrqCount changed)" -- could pass while the
+ * thread was still running: the flag can be set by a third CPU readying a thread there, and iIrqCount moved by an
+ * unrelated interrupt that had already returned. Then iCsCount read 0, the thread entered its critical section,
+ * and our IPI suspended/killed it inside (nkernsa DoRWTest interlocked suspend/kill: protected buffers read
+ * half-written; frequent with skmpar's four concurrent cases). Now each request has a number that the target's
+ * RESCHED_IPI handler acknowledges after setting its flag (resched_ipi_ack). Release/acquire on the ack also makes
+ * the thread's last stores (iCsCount) visible here. "Target already inside an ISR with the flag set" still counts:
+ * it will reschedule on exit, and waiting for the ack there could deadlock against an ISR spinning on our lock. */
+static volatile TUint32 ReschedIpiReq[KMaxCpus], ReschedIpiAck[KMaxCpus];
+extern "C" { volatile TUint32 A64_HandshakeEarly; }	/* diagnostics: times the 2010 test would have returned too soon */
+
+extern "C" void resched_ipi_ack(TSubScheduler* aSS)	/* from the RESCHED_IPI handler, after setting iRescheduleNeededFlag */
+    {
+    TInt c = aSS->iCpuNum;
+    __atomic_store_n(&ReschedIpiAck[c], __atomic_load_n(&ReschedIpiReq[c], __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+    }
+
 extern "C" void send_resched_ipi_and_wait(TInt aCpu)
     {
     TSubScheduler& ss = TheSubSchedulers[aCpu];
     volatile TUint32& irqc = ss.iSSX.iIrqCount;
-    volatile TInt& irqn    = ss.iSSX.iIrqNestCount;
-    TUint32 irqc0 = irqc;
-    __sync_synchronize();
+    TUint32 irqc0 = __atomic_load_n(&irqc, __ATOMIC_ACQUIRE);
+    TUint32 req = __atomic_add_fetch(&ReschedIpiReq[aCpu], 1, __ATOMIC_SEQ_CST);
     send_ipi(ss.iSSX.iMpidr, RESCHED_IPI_VECTOR);
-    __sync_synchronize();
-    while (!ss.iRescheduleNeededFlag || (irqn < 0 && irqc == irqc0))
+    TBool early = FALSE;
+    for (;;)
+        {
+        if ((TInt)(__atomic_load_n(&ReschedIpiAck[aCpu], __ATOMIC_ACQUIRE) - req) >= 0)
+            break;                                      /* our IPI has been taken */
+        TBool flag = __atomic_load_n(&ss.iRescheduleNeededFlag, __ATOMIC_ACQUIRE);
+        TInt irqn = __atomic_load_n(&ss.iSSX.iIrqNestCount, __ATOMIC_ACQUIRE);
+        if (flag && irqn >= 0)
+            break;                                      /* inside an ISR that will reschedule on exit */
+        if (flag && !early && __atomic_load_n(&irqc, __ATOMIC_RELAXED) != irqc0)
+            early = TRUE, __e32_atomic_add_ord32(&A64_HandshakeEarly, 1);
         A64_PAUSE();
-    __sync_synchronize();
+        }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
 
 /* A self-IPI must act as if taken at once: TDfc::RawAdd relies on it to run an IDFC right away (nkernsa
@@ -330,6 +359,9 @@ extern "C" void __phore_resched_park(void** aOldSPSlot, void* const* aTempSPSlot
 extern "C" void __phore_resume(void* aNewSP);
 extern "C" void send_resched_ipis(TUint32 aMask);
 
+/* diagnostics hook: the outgoing and the selected thread of each selection (the nkernsa glue checks scheduler rules) */
+extern "C" __attribute__((weak)) void A64_SchedCheck(NThreadBase*, NThreadBase*, TSubScheduler*) {}
+
 extern "C" void A64_ReschedSelect(void* aSS)
     {
     TSubScheduler& ss = *(TSubScheduler*)aSS;
@@ -337,7 +369,9 @@ extern "C" void A64_ReschedSelect(void* aSS)
     for (;;)
         {
         A64_STI();
+        NThreadBase* old = ss.iCurrentThread;
         next = ss.SelectNextThread();           /* neutral: bookkeeping + iCurrentThread */
+        A64_SchedCheck(old, next, &ss);
         if (next)
             break;
         /* No thread is ready for this cpu (ncsched.cia no_thread): kick whoever we owe an IPI, then

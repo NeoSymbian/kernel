@@ -89,6 +89,10 @@ for f in init kprintf tlsf nkutils diag $MAIN testutils threadbasic fastsem fast
 		fastmutex)  pat='s/^	TUint32 bufwords = 256;$/	TUint32 bufwords = 4096;	\/\/ a64 port: scaled for 2 GHz cores/;s/^const TInt KReadCount = 100000;$/const TInt KReadCount = 10000;	\/\/ a64 port: reads/' ;;
 		esac
 	fi
+	# NKSA_RWTRACE=1: the DoRWTest reader reports the writer's state at each bad block read (race diagnostics)
+	if [ $f = fastmutex ] && [ -n "${NKSA_RWTRACE:-}" ]; then
+		pat="${pat:+$pat;}"'s/^				++info.iFails\[i\];$/				{ ++info.iFails[i]; extern void A64_RWFail(TInt, NThread*); A64_RWFail(i, info.iWriter); }	\/\/ a64 port: trace/'
+	fi
 	if [ -n "$pat" ]; then
 		sed "$pat" "$src" > "$OUT/$f.cpp"
 		[ $(grep -c 'a64 port: ' "$OUT/$f.cpp") -eq $(echo "$pat" | grep -o 'a64 port: ' | wc -l) ] || { echo "FAIL $f scaling patch did not apply"; fail=1; }

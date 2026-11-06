@@ -18,6 +18,7 @@ const TInt KTickUs = 1000;			// system tick period: 1 ms, as every EKA2 port
 // cutils.cpp is built with __EARLY_DEBUG__: Kern::Printf reaches the board console from the first line of the kernel,
 // before the variant exists
 void A64Log_Putc(char aChar);								// a64_dbgmon.cpp: the log ring the debug console replays
+void A64Log_Report();										// a64_dbgmon.cpp: says whether a previous boot's log was kept
 void DebugOutputChar(TUint aChar)
 	{
 	A64Log_Putc((char)aChar);
@@ -214,6 +215,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	{
 	if (aReason != KModuleEntryReasonExtensionInit1)
 		return KErrNone;
+	A64Log_Report();									// the first point where Kern::Printf reaches the log ring
 	A64StartDisplay();									// the screen's HAL, for the window server
 	A64StartSerialKeyboard();
 	A64StartKeys();

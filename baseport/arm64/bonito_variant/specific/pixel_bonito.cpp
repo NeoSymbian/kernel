@@ -38,11 +38,14 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x0a600000, 0x0000d000, 1 },		// USB DWC3 core (qcom_dwc3_acm.cpp: the debug console)
 	{ 0x0a6f8000, 0x00001000, 1 },		// USB Qualcomm wrapper (QSCRATCH at +0x800)
 	{ 0x088e2000, 0x00001000, 1 },		// QUSB2 HS PHY
+	{ 0x9e3e0000, 0x00020000, 2 },		// the log ring that survives a reset (a64_dbgmon.cpp lastlog): the tail of
+										// the DTB's no-map framebuffer-region, kept by ABL across PSCI and watchdog resets
 	};
 const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
 // ABL's continuous-splash framebuffer: the user side gets the top 1800 rows, the kernel console the 360 below
 const unsigned long A64_FbPhys = 0x9c000000;
 const int A64_FbWidth = 1080, A64_FbHeight = 1800, A64_FbStride = 4320;
+unsigned long A64_LastLogPhys() { return 0x9e3e0000; }
 }
 
 /* --- framebuffer text console ------------------------------------------------------------------------------- */

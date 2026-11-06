@@ -4,7 +4,7 @@
 // 64 KB ring (A64Log_Putc, from DebugOutputChar), so a transport that connects late can still replay the whole boot
 // log. Commands come as text lines from a transport -- the PL011 on QEMU (Ctrl-B, then a line), USB CDC-ACM on the
 // Pixel -- and answer through that transport's blocking writer:
-//   help | log | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
+//   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   blk info | blk gpt | blk read <lba> [n] | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2>
 //   key <scancode> | shot | reboot | fastboot
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
@@ -17,14 +17,57 @@
 #include "a64_platform.h"
 
 // ---- the log ring
-const TUint32 KLogSize = 64 * 1024;
-static char LogRing[KLogSize];
+// A board with RAM that survives a reset (A64_LastLogPhys: an IO region, Normal NC, 0x20000 bytes) keeps the ring
+// there: a header {magic, head} at +0 and the ring at +0x10000. At boot the previous boot's ring is copied out for
+// "lastlog", so a crash that halts or resets the SoC still leaves its log readable on the next boot.
+const TUint32 KLogSize = 64 * 1024, KLogMagic = 0x4e4c4f47;	// 'NLOG'
+static char BssRing[KLogSize];
+static char* LogRing = BssRing;
+static volatile TUint32* LogSaved;							// the persistent header's head, once switched
+static TBool LogInited;
 static volatile TUint32 LogHead;							// characters ever written (the ring keeps the last 64 KB)
+static char LastLog[KLogSize];
+static TUint32 LastLen;
+extern "C" __attribute__((weak)) unsigned long A64_LastLogPhys() { return 0; }
+
+static void LogInit()										// first character with the IO window up (boot CPU only)
+	{
+	LogInited = ETrue;
+	volatile TUint32* h = A64_LastLogPhys() ? (volatile TUint32*)A64_Io(A64_LastLogPhys()) : NULL;
+	if (!h)
+		return;
+	char* ring = (char*)h + 0x10000;
+	if (h[0] == KLogMagic)
+		{
+		TUint32 head = h[1];
+		LastLen = head < KLogSize ? head : KLogSize;
+		for (TUint32 i = 0; i < LastLen; ++i)
+			LastLog[i] = ring[(head - LastLen + i) % KLogSize];
+		}
+	for (TUint32 i = 0; i < LogHead && i < KLogSize; ++i)	// what this boot logged before the switch
+		ring[i] = BssRing[i];
+	h[1] = LogHead;
+	h[0] = KLogMagic;
+	LogRing = ring;
+	LogSaved = h + 1;
+	}
 
 void A64Log_Putc(char aChar)
 	{
+	if (!LogInited && A64_IoWindow)
+		LogInit();
 	TUint32 i = __e32_atomic_add_ord32(&LogHead, 1);
 	LogRing[i % KLogSize] = aChar;
+	if (LogSaved)
+		*LogSaved = i + 1;		// shortcut: CPUs racing here may store heads out of order; lastlog may lose a few chars
+	}
+
+void A64Log_Report()										// once at boot (the IO window is up by then)
+	{
+	if (!LogInited && A64_IoWindow)
+		LogInit();
+	if (LastLen)
+		Kern::Printf("[log] previous boot: %d bytes kept (lastlog)", LastLen);
 	}
 
 TInt A64Log_Read(TUint32& aPos, TUint8* aBuf, TInt aMax)
@@ -245,7 +288,14 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log peek poke spmi blk touch keys threads usb tap swipe key shot reboot fastboot wdt");
+		Say("help log lastlog peek poke spmi blk touch keys threads usb tap swipe key shot reboot fastboot wdt");
+	else if (Eq(c, "lastlog"))
+		{
+		if (LastLen)
+			Write(LastLog, LastLen);
+		else
+			Say("no log kept from a previous boot");
+		}
 	else if (Eq(c, "log"))
 		{
 		TUint32 pos = 0;

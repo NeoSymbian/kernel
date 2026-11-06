@@ -110,6 +110,19 @@ if [ "$LINK" = 1 ]; then
 			|| { echo "FAIL backend $n"; grep -m3 'error:' "$OUT/be_$n.log"; }
 	done
 	${X}gcc-14 -mabi=ilp32 -c "$HERE/a64smp/a64_ctxsw.S" -o "$OUT/nk/a64_ctxsw.o"
+	# the ekern backend (port/arm64/ekern/a64e_*) and the shared platform layer
+	for b in "$HERE"/ekern/a64e_*.cpp "$HERE"/platform/*.cpp; do
+		[ -e "$b" ] || continue
+		n=$(basename "$b" .cpp)
+		$CXX $DEFS $INCS $PRE -c "$b" -o "$OUT/nk/x_$n.o" 2>"$OUT/x_$n.log" \
+			&& echo "  backend $n OK" || { echo "FAIL backend $n"; grep -m6 'error' "$OUT/x_$n.log" | sed 's/^/      /'; }
+	done
+	for b in "$HERE"/ekern/a64e_*.S; do
+		[ -e "$b" ] || continue
+		n=$(basename "$b" .S)
+		${X}gcc-14 -mabi=ilp32 -c "$b" -o "$OUT/nk/x_$n.o" 2>"$OUT/x_$n.log" \
+			&& echo "  backend $n OK" || { echo "FAIL backend $n"; grep -m6 'rror' "$OUT/x_$n.log" | sed 's/^/      /'; }
+	done
 	${X}ld -m aarch64linux32 -r -o "$OUT/ekern_all.o" "$OUT"/obj/*.o "$OUT"/nk/*.o \
 		2>"$OUT/ld-r.log" || { echo "ld -r FAILED:"; head -20 "$OUT/ld-r.log"; }
 	${X}nm -u "$OUT/ekern_all.o" | awk '{print $2}' | ${X}c++filt | sort -u > "$OUT/undefined.txt"

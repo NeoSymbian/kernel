@@ -2,22 +2,24 @@
 //
 // qcom_sdhci.cpp -- the Pixel's eMMC (DTB mmc@7c4000, sdhci-msm v5) as the A64BlkDev backend (a64_blk.h). ABL loaded
 // our boot image from this eMMC, so the host is powered and clocked and the card is selected in transfer state:
-// it is taken over as is -- no re-init, no tuning -- with standard SDHCI commands in PIO mode (no DMA, so no SMMU
-// or cache maintenance): CMD13 finds the card's RCA, CMD8 reads EXT_CSD, CMD18/CMD25 move data with auto-CMD12.
+// but ABL shuts the host down before it starts a kernel, so it is re-initialised (Reinit: legacy 19.2 MHz, 1-bit, no
+// tuning), with the RPMh votes Linux makes at probe (CX, the NoC link). CMD8 reads EXT_CSD, CMD18/CMD25 move data
+// with auto-CMD12, by ADMA2 through a non-cached bounce buffer.
 // The window (a64_blk.cpp) is the GPT partition "userdata": nothing outside it can be read or written above.
 // Writes stay off unless built with EMMC_C=1 (-DA64_EMMC_C): without it, the backend only reports (Volume Up) and
 // C: stays the RAM drive.
-// shortcut: polled PIO, bounded spins; upgrade to ADMA2 (through the SMMU) if file throughput matters.
+// shortcut: polled, bounded spins, 1-bit 19.2 MHz (~2 MB/s); HS200/8-bit with tuning if file throughput matters.
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_blk.h"
+#include "qcom_rpmh.h"
 
 const TUint32 KHc = 0x007c4000, KCqhci = 0x007c5000;
 enum
 	{
-	ESdmaAddr = 0x00, EBlockSizeCount = 0x04, EArgument = 0x08, EModeCommand = 0x0c, EResponse0 = 0x10, EBuffer = 0x20,
+	EBlockSizeCount = 0x04, EArgument = 0x08, EModeCommand = 0x0c, EResponse0 = 0x10, EBuffer = 0x20,
 	EPresentState = 0x24, EHostCtrl1 = 0x28, EClockCtrl = 0x2c, EIntStatus = 0x30, EIntStatusEn = 0x34,
-	ECaps = 0x40, ESlotVersion = 0xfc,
+	ECaps = 0x40, EAdmaError = 0x54, EAdmaAddr = 0x58, ESlotVersion = 0xfc,
 	};
 enum { EPsCmdInhibit = 1 << 0, EPsDatInhibit = 1 << 1, EPsBufWrEn = 1 << 10, EPsBufRdEn = 1 << 11 };
 enum { EIntCmd = 1 << 0, EIntXfer = 1 << 1, EIntBufWr = 1 << 4, EIntBufRd = 1 << 5, EIntErr = 1 << 15 };
@@ -33,11 +35,14 @@ const TBool KWritable = EFalse;
 
 static TUint32 Rca;
 static TUint64 Sectors;
-// data moves by SDMA through a bounce buffer: this host's PIO data port never drains (found on the phone; Linux
-// sdhci-msm only ever uses DMA). The SDHC sits behind the SMMU, which passes unconfigured streams through.
-const TInt KDmaMax = 128;								// sectors per transfer: 64 KB, inside one 512 KB boundary
-static TPhysAddr DmaPhys;
+// data moves by ADMA2 through a bounce buffer. This host has no SDMA (CAPS bit 22 is 0: an SDMA transfer leaves the
+// block in the FIFO and the stuck master resets the SoC) and its PIO data port never drains (both found on the
+// phone); Linux sdhci.c picks ADMA2 here too. The SDHC's SMMU stream (0x140) is set up as pass-through (CB0, M = 0).
+const TInt KDmaMax = 128;								// sectors per transfer: 64 KB
+const TInt KAdmaChunk = 32 * 1024;						// bytes per descriptor (the 16-bit length field)
+static TPhysAddr DmaPhys;								// KDmaMax sectors of data, then the descriptor table
 static TUint8* DmaBuf;
+static volatile TUint32* Desc;
 static TBuf8<200> Report[24];
 static TInt NReport;
 
@@ -127,8 +132,11 @@ static TInt Command(TUint aIndex, TUint32 aArg, TUint32 aFlags, TUint32 aMode = 
 		return KErrNotReady;
 	R(EIntStatus) = 0xffffffff;
 	if (aBlocks)
-		R(EBlockSizeCount) = (aBlocks << 16) | (7u << 12) | KA64BlkSector;	// SDMA boundary 512 KB
-		R(ESdmaAddr) = DmaPhys;
+		{
+		R(EBlockSizeCount) = (aBlocks << 16) | KA64BlkSector;
+		R(EAdmaAddr) = DmaPhys + KDmaMax * KA64BlkSector;
+		R(EAdmaAddr + 4) = 0;
+		}
 	R(EArgument) = aArg;
 	R(EModeCommand) = (aIndex << 24) | (aFlags << 16) | aMode;	// the command half triggers it
 	TInt r = WaitInt(EIntCmd);
@@ -137,19 +145,44 @@ static TInt Command(TUint aIndex, TUint32 aArg, TUint32 aFlags, TUint32 aMode = 
 	return r;
 	}
 
-// one SDMA transfer of aCount (<= KDmaMax) blocks between the card and DmaBuf
+// one ADMA2 transfer of aCount (<= KDmaMax) blocks between the card and DmaBuf: 32-bit descriptors (sdhci.c
+// __sdhci_adma_write_desc) {cmd = valid | transfer [| end], length, address}, 32 KB each
 static TInt Transfer(TUint aCmd, TUint32 aArg, TInt aCount, TBool aRead)
 	{
+	TInt bytes = aCount * KA64BlkSector, nd = 0;
+	for (TInt off = 0; off < bytes; off += KAdmaChunk, ++nd)
+		{
+		TInt len = Min(bytes - off, KAdmaChunk);
+		Desc[2 * nd] = (TUint32)len << 16 | 0x21 | (off + len >= bytes ? 0x2 : 0);	// ADMA2_TRAN_VALID [| ADMA2_END]
+		Desc[2 * nd + 1] = (TUint32)DmaPhys + off;
+		}
+	__e32_memory_barrier();
 	TUint32 mode = EModeDma | (aRead ? EModeRead : 0) | (aCount > 1 ? EModeMulti | EModeCount | EModeAutoCmd12 : 0);
 	TInt r = Command(aCmd, aArg, ERespR1Data, mode, aCount);
-	if (r == KErrNone)
-		r = WaitInt(EIntXfer);							// all data moved (a write: and the card's busy time)
 	if (r != KErrNone)
 		{
-		Log("CMD%d x%d failed: %d, int %08x present %08x resp %08x", aCmd, aCount, r, R(EIntStatus),
-			R(EPresentState), R(EResponse0));
-		ResetLines();
+		Log("CMD%d x%d: command failed %d", aCmd, aCount, r);
+		return r;
 		}
+	r = KErrTimedOut;
+	for (TInt i = 0; i < KSpin && r == KErrTimedOut; ++i)	// all data moved (a write: and the card's busy time)
+		{
+		TUint32 st = R(EIntStatus);
+		if (st & EIntErr)
+			r = KErrGeneral;
+		else if (st & EIntXfer)
+			{
+			R(EIntStatus) = EIntXfer;
+			r = KErrNone;
+			}
+		}
+	if (r != KErrNone)		// the data phase failed: leave the host as it is (a DAT reset under a stuck DMA may hang)
+		Log("CMD%d x%d failed %d: int %08x present %08x resp %08x adma %08x (table %08x) err %08x hostctl %08x "
+			"ctrl2 %08x", aCmd, aCount, r, R(EIntStatus), R(EPresentState), R(EResponse0), R(EAdmaAddr),
+			(TUint32)DmaPhys + KDmaMax * KA64BlkSector, R(EAdmaError), R(EHostCtrl1), R(0x3c));
+	if (r != KErrNone)		// the msm core's own view (sdhci-msm.c v5 offsets): FIFO count, MCI status, data count, debug
+		Log("  mci fifo %08x status %08x data cnt %08x debug %08x generics %08x", R(0x308), R(0x324), R(0x35c),
+			R(0x358), R(0x320));
 	return r;
 	}
 
@@ -249,7 +282,7 @@ static TInt Reinit()
 		{}
 	TUint32 pwrOff = R(EPwrStatus) ? PwrAck() : 0;
 	R(EVendorSpec) = 0xa9c | (1u << 15) | (1u << 16);		// POR value + IO_PAD_PWR_SWITCH_EN + 1.8 V pads
-	R(EIntStatusEn) = 0xffff0033;							// the reset cleared the status enables
+	R(EIntStatusEn) = 0xffff003f;							// the reset cleared the status enables
 	R(EPwrMask) = 0xf;
 	Log("step: power (reset pwr irq %x)", pwrOff);
 	Set(EPowerCtrl, 8, 0x0b);									// bus power on, 1.8 V
@@ -259,7 +292,7 @@ static TInt Reinit()
 	Log("step: clock 400k (pwr irq %x)", pwr);
 	SdClock(24);											// 400 kHz for identification
 	Set(ETimeoutCtrl, 8, 0x0e);
-	Set(EHostCtrl1, 8, 0);										// 1-bit, SDR
+	Set(EHostCtrl1, 8, 0x10);								// 1-bit, SDR, DMA select = ADMA2 32-bit
 	NKern::Sleep(NKern::TimerTicks(2));
 	Log("step: cmd0");
 	Command(0, 0, 0);										// GO_IDLE_STATE (no response)
@@ -313,21 +346,27 @@ static TInt DoInit(TUint64& aSectors)
 	if (!DmaBuf)
 		{
 		NKern::ThreadEnterCS();
-		TInt r = Epoc::AllocPhysicalRam(KDmaMax * KA64BlkSector, DmaPhys, 12);
+		const TInt size = KDmaMax * KA64BlkSector + 4096;	// + one page of descriptors
+		TInt r = Epoc::AllocPhysicalRam(size, DmaPhys, 12);
 		DPlatChunkHw* chunk = NULL;
 		if (r == KErrNone)
-			r = DPlatChunkHw::New(chunk, DmaPhys, KDmaMax * KA64BlkSector, EMapAttrSupRw | EMapAttrBufferedNC);
+			r = DPlatChunkHw::New(chunk, DmaPhys, size, EMapAttrSupRw | EMapAttrBufferedNC);
 		NKern::ThreadLeaveCS();
 		if (r != KErrNone)
 			return r;
 		DmaBuf = (TUint8*)chunk->LinearAddress();
+		Desc = (volatile TUint32*)(DmaBuf + KDmaMax * KA64BlkSector);
 		}
 	Log("host v%x caps %08x present %08x hostctl %08x clock %08x; gcc apps %08x ahb %08x", R(ESlotVersion) >> 16,
 		R(ECaps), R(EPresentState), R(EHostCtrl1), R(EClockCtrl), Gcc(ESdcc1Apps), Gcc(ESdcc1Ahb));
+	// ABL dropped the eMMC's votes; Linux makes them at probe from the DT opp-20000000: CX low_svs, and the bandwidth
+	// through qnm_aggre1_noc (16 bytes wide, BCM SN8)
+	Log("step: CX low_svs -> %d", Arc_Vote("cx.lvl", 64));	// the DT opp-20000000 required-opps
+	Log("step: bus vote -> %d", Bcm_Vote("SN8", 52286, 80000, 16));
 	Log("step: gcc clocks");
 	ClocksOn();
 	Log("step: int enable");
-	R(EIntStatusEn) = 0xffff0033;						// make the status bits we poll visible (no signals)
+	R(EIntStatusEn) = 0xffff003f;						// make the status bits we poll visible (no signals)
 	Log("clocks on: gcc apps %08x ahb %08x; vendor %08x pwr %08x cqhci %08x", Gcc(ESdcc1Apps), Gcc(ESdcc1Ahb),
 		R(EVendorSpec), R(EPwrStatus), *(volatile TUint32*)(A64_Io(KCqhci) + 0x08));
 	*(volatile TUint32*)(A64_Io(KCqhci) + 0x08) &= ~1u;	// command queueing off: plain SDHCI commands

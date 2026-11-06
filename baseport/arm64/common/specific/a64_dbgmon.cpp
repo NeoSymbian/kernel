@@ -5,6 +5,7 @@
 // log. Commands come as text lines from a transport -- the PL011 on QEMU (Ctrl-B, then a line), USB CDC-ACM on the
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
+//   rpmh <bcm> (vote a bus clock manager, Pixel)
 //   blk info | blk gpt | blk read <lba> [n] | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2>
 //   key <scancode> | shot | reboot | fastboot
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
@@ -126,6 +127,7 @@ __attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
 __attribute__((weak)) void A64_WatchdogBite(TInt) { Say("wdt: not on this board"); }
 __attribute__((weak)) TInt A64BlkDev_Probe() { return KErrNotSupported; }
 __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
+__attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((const TUint8*)"rpmh: not on this board", 23); }
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
 __attribute__((weak)) int Spmi_Write(unsigned, unsigned, unsigned) { return KErrNotSupported; }
 void A64DumpThreads();										// below, needs scheduler internals
@@ -288,7 +290,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog peek poke spmi blk touch keys threads usb tap swipe key shot reboot fastboot wdt");
+		Say("help log lastlog peek poke spmi rpmh blk touch keys threads usb tap swipe key shot reboot fastboot wdt");
 	else if (Eq(c, "lastlog"))
 		{
 		if (LastLen)
@@ -338,6 +340,12 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	else if (Eq(c, "spmi") && argc >= 5 && Eq(arg[1], "w"))
 		Say("spmi %d:%04x <- %02x -> %d", (TInt)num[2], (TInt)num[3], (TInt)num[4],
 			Spmi_Write((TUint)num[2], (TUint)num[3], (TUint)num[4]));
+	else if (Eq(c, "rpmh") && argc >= 2)
+		{
+		TBuf8<120> b;
+		A64RpmhVote(arg[1], b);
+		Say("%S", &b);
+		}
 	else if (Eq(c, "blk"))
 		Blk(argc, arg, num);
 	else if (Eq(c, "touch"))

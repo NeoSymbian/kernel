@@ -38,6 +38,8 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x0a600000, 0x0000d000, 1 },		// USB DWC3 core (qcom_dwc3_acm.cpp: the debug console)
 	{ 0x0a6f8000, 0x00001000, 1 },		// USB Qualcomm wrapper (QSCRATCH at +0x800)
 	{ 0x088e2000, 0x00001000, 1 },		// QUSB2 HS PHY
+	{ 0x179e0000, 0x00010000, 1 },		// apps RSC DRV2: RPMh bus votes (qcom_rpmh.cpp)
+	{ 0x85fe0000, 0x00020000, 2 },		// the AOP command DB (DTB aop-cmd-db-mem, no-map): RPMh resource addresses
 	{ 0x9e3e0000, 0x00020000, 2 },		// the log ring that survives a reset (a64_dbgmon.cpp lastlog): the tail of
 										// the DTB's no-map framebuffer-region, kept by ABL across PSCI and watchdog resets
 	};

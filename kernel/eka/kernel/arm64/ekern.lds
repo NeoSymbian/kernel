@@ -27,12 +27,14 @@ SECTIONS
 	.boot :
 		{
 		KEEP(*(.text.head))
-		*boot.o(.text .text.* .rodata .rodata.* .data .data.*)
+		*/boot.o(.text .text.* .rodata .rodata.* .data .data.*)		/* exact names: "*boot.o" also caught a64_reboot.o */
+		*/a64boot.o(.text .text.* .rodata .rodata.* .data .data.*)
 		} >LOW
 	.boot.bss (NOLOAD) : ALIGN(16)
 		{
 		__bss_start = .;				/* boot.S zeroes this */
-		*boot.o(.bss .bss.* COMMON)
+		*/boot.o(.bss .bss.* COMMON)
+		*/a64boot.o(.bss .bss.* COMMON)
 		. = ALIGN(16);
 		__bss_end = .;
 		} >LOW

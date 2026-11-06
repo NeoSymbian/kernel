@@ -67,6 +67,7 @@ $EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_display.cpp" -o "$I/a64_display.o"
 if [ "$BOARD" = bonito ]; then	# the power and volume keys over the PMIC's SPMI bus; the touchscreen
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/qcom_spmi.cpp" -o "$I/qcom_spmi.o"
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_keys.cpp" -o "$I/a64_keys.o"
+	$EKXX $DEFS $INCS $PRE ${AUTOFASTBOOT:+-DA64_AUTOFASTBOOT=$AUTOFASTBOOT} -c "$HERE/board/a64_reboot.cpp" -o "$I/a64_reboot.o"	# AUTOFASTBOOT=<s>: back to fastboot after s seconds
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/a64_touch.cpp" -o "$I/a64_touch.o"
 	$EKXX $DEFS $INCS $PRE -c "$HERE/board/qcom_geni_i2c.cpp" -o "$I/qcom_geni_i2c.o"
 	$EKXX $DEFS $INCS $PRE ${EMMC_C:+-DA64_EMMC_C} -c "$HERE/board/qcom_sdhci.cpp" -o "$I/qcom_sdhci.o"	# EMMC_C=1: C: on userdata

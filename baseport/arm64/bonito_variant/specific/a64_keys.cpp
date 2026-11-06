@@ -33,6 +33,8 @@ static void Post(TRawEvent::TType aType, TInt aScanCode)
 	Kern::AddEvent(e);
 	}
 
+void A64_RebootToFastboot();								// a64_reboot.cpp
+static TInt ComboPolls;								// Volume Up + Volume Down held: back to fastboot after 2 s
 __attribute__((weak)) void A64TouchDump() {}				// a64_touch.cpp: its probe, again on Volume Up
 __attribute__((weak)) void A64BlkDump() {}					// qcom_sdhci.cpp: the eMMC report, again on Volume Up
 
@@ -51,10 +53,13 @@ static void PollDfcFn(TAny*)
 		Post(down ? TRawEvent::EKeyDown : TRawEvent::EKeyUp, Keys[i].iScanCode);
 		if (down && Keys[i].iScanCode == EStdKeyIncVolume)
 			{
-			A64BlkDump();
 			A64TouchDump();
+			A64BlkDump();								// last: the strip shows only ~10 lines
 			}
 		}
+	ComboPolls = Down[1] && Down[2] ? ComboPolls + 1 : 0;	// VolDown and VolUp (Keys[] order)
+	if (ComboPolls == 2000 / KPollMs)
+		A64_RebootToFastboot();
 	PollTimer.Again(NKern::TimerTicks(KPollMs));
 	}
 

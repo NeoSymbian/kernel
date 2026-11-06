@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): the AArch64 per-address-space level-1 root under __CPU_ARM64.
 // Description:
 //
 
@@ -28,6 +28,28 @@ __ASSERT_COMPILE(KNumOsAsids <= (KPageDirectoryEnd-KPageDirectoryBase)/KPageDire
 
 PageDirectoryAllocator PageDirectories;
 
+#ifdef __CPU_ARM64
+// NeoSymbian arm64: the per-address-space VMSAv8 level-1 root (TTBR0_EL1 target, 4 table descriptors: the address space's own
+// two level-2 tables for 0-2 GB, then the kernel's two for 2-4 GB). Slot = KRootTableBase + OS ASID * 32; the
+// bootstrap maps the 8 KB and fills the kernel's (ASID 0) slot. The process switch loads
+// TTBR0_EL1 = A64RootTablePhys + (asid<<KRootTableShift) | asid<<48.
+TPhysAddr A64RootTablePhys;
+
+static inline TPde* A64RootSlot(TUint aOsAsid)
+	{
+	return (TPde*)(KRootTableBase + (aOsAsid<<KRootTableShift));
+	}
+
+static void A64SetRoot(TUint aOsAsid, TPhysAddr aLocalPd, TPhysAddr aKernelPd)
+	{
+	TPde* root = A64RootSlot(aOsAsid);
+	root[0] = (TPde)aLocalPd | KA64DescTable;
+	root[1] = (TPde)(aLocalPd+KPageSize) | KA64DescTable;
+	root[2] = (TPde)(aKernelPd+2*KPageSize) | KA64DescTable;
+	root[3] = (TPde)(aKernelPd+3*KPageSize) | KA64DescTable;
+	__asm__ __volatile__("dsb ishst" ::: "memory");		// visible to the table walker before the ASID is used
+	}
+#endif
 
 const TUint KLocalPdShift = KPageDirectoryShift > KPageShift ? KPageDirectoryShift-1 : KPageShift;
 const TUint KLocalPdSize = 1<<KLocalPdShift;
@@ -98,6 +120,13 @@ void PageDirectoryAllocator::Init2()
 	((DMemModelProcess*)K::TheKernelProcess)->iPageDir = kernelPd;
 	AssignPages(KKernelOsAsid*(KPageDirectorySize>>KPageShift),KPageDirectorySize>>KPageShift,kernelPd);
 
+#ifdef __CPU_ARM64
+	// NeoSymbian arm64: the bootstrap built the kernel's root; check it describes this page directory
+	A64RootTablePhys = Mmu::LinearToPhysical(KRootTableBase);
+	__NK_ASSERT_ALWAYS(A64RootTablePhys != KPhysAddrInvalid);
+	for (TInt i=0; i<4; ++i)
+		__NK_ASSERT_ALWAYS(A64RootSlot(KKernelOsAsid)[i] == ((TPde)(kernelPd+i*KPageSize) | KA64DescTable));
+#endif
 	// construct allocator...
 	iAllocator = TBitMapAllocator::New(KNumOsAsids,ETrue);
 	__NK_ASSERT_ALWAYS(iAllocator);
@@ -179,6 +208,9 @@ TInt PageDirectoryAllocator::Alloc(TUint aOsAsid, TPhysAddr& aPageDirectory)
 				r = MM::MemoryAddContiguous(iPageDirectoryMemory, MM::BytesToPages(offset+KLocalPdSize), 
 						(KPageDirectorySize-KLocalPdSize)/KPageSize, iKernelPageDirectory+KLocalPdSize);
 				__NK_ASSERT_DEBUG(r==KErrNone); // can't fail
+#ifdef __CPU_ARM64
+				A64SetRoot(aOsAsid, pdPhys, iKernelPageDirectory);	// NeoSymbian arm64: this address space's level-1 root
+#endif
 				MmuLock::Lock(); // need lock because allocator not otherwise atomic
 				iAllocator->Alloc(aOsAsid,1);
 				MmuLock::Unlock();
@@ -208,6 +240,12 @@ void PageDirectoryAllocator::Free(TUint aOsAsid)
 	iAllocator->Free(aOsAsid, 1);
 	MmuLock::Unlock();
 
+#ifdef __CPU_ARM64
+	// NeoSymbian arm64: retire the level-1 root before its page directory pages go (the caller has already switched every
+	// CPU away from this ASID; DAddressSpace's destructor invalidates its TLB entries afterwards)
+	memclr(A64RootSlot(aOsAsid), KRootTableSize);
+	__asm__ __volatile__("dsb ishst" ::: "memory");
+#endif
 	const TUint KPageDirectoryPageCount = KPageDirectorySize>>KPageShift;
 	TPhysAddr pages[KPageDirectoryPageCount];
 	TUint n = MM::MemoryRemovePages(iPageDirectoryMemory,aOsAsid*KPageDirectoryPageCount,KPageDirectoryPageCount,pages);

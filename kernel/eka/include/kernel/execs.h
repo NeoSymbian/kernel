@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): the AArch64 kernel builds the X86 branch's C++ exec tables.
 // Description:
 // e32\include\kernel\execs.h
 // 
@@ -83,7 +83,7 @@ class DShBuf;
 #define	DECLARE_FLAGS_ASMFUNC(flags, asmfunc, cppfunc)	(flags), DECLARE_FUNC(cppfunc)
 #define	DECLARE_SLOW_EXEC_INVALID			0, DECLARE_FUNC(InvalidExecHandler)
 
-#elif defined(__CPU_X86)
+#elif defined(__CPU_X86) || defined(__CPU_ARM64)	// NeoSymbian: arm64 = the portable C++ tables
 
 // Executive call macros for X86
 

@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): an __CPU_ARM64 section for the AArch64 kernel.
 // Description:
 // e32\include\u32exec.h
 // 
@@ -191,6 +191,31 @@
 #define	KSLOW_EXEC2_NR(n)	__KDISPATCH_NR((n)|EXECUTIVE_SLOW)
 #define KSLOW_EXEC3_NR(n)	__KDISPATCH_NR((n)|EXECUTIVE_SLOW)
 #define KSLOW_EXEC4_NR(n)	__KDISPATCH_NR((n)|EXECUTIVE_SLOW)
+
+#elif defined(__CPU_ARM64)
+
+// NeoSymbian: the AArch64 kernel never issues execs itself (no kernel TU uses the K*EXEC macros); the AArch32
+// user side is built with the __CPU_ARM branch. This branch keeps the ABI constants, and expanding a stub is an error.
+// The AArch32 user side's SWI immediate: bit 23 selects the fast exec table (vectors.cia, our exec gate)
+#define EXECUTIVE_FAST	0x00800000
+#define EXECUTIVE_SLOW	0x00000000
+
+#define __A64_NO_EXEC_STUB(n)	_Pragma("GCC error \"exec stubs are AArch32 user code: not built into the arm64 kernel\"")
+#define	FAST_EXEC0(n)		__A64_NO_EXEC_STUB(n)
+#define	FAST_EXEC1(n)		__A64_NO_EXEC_STUB(n)
+#define	SLOW_EXEC0(n)		__A64_NO_EXEC_STUB(n)
+#define	SLOW_EXEC1(n)		__A64_NO_EXEC_STUB(n)
+#define	SLOW_EXEC2(n)		__A64_NO_EXEC_STUB(n)
+#define SLOW_EXEC3(n)		__A64_NO_EXEC_STUB(n)
+#define SLOW_EXEC4(n)		__A64_NO_EXEC_STUB(n)
+#define	KFAST_EXEC0(n)		__A64_NO_EXEC_STUB(n)
+#define	KFAST_EXEC1(n)		__A64_NO_EXEC_STUB(n)
+#define	KSLOW_EXEC0(n)		__A64_NO_EXEC_STUB(n)
+#define	KSLOW_EXEC1(n)		__A64_NO_EXEC_STUB(n)
+#define	KSLOW_EXEC2(n)		__A64_NO_EXEC_STUB(n)
+#define KSLOW_EXEC3(n)		__A64_NO_EXEC_STUB(n)
+#define KSLOW_EXEC4(n)		__A64_NO_EXEC_STUB(n)
+
 
 #else
 #error Unknown CPU

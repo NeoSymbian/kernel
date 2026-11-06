@@ -81,6 +81,7 @@ load_mismatch:
 	b	5b
 	.ltorg
 
+#ifndef A64_EKERN	/* the full kernel's AP entry comes with its NKern::BootAP (M4.2 step 6) */
 /* Secondary CPU entry (PSCI CPU_ON target). In: x0 = context = SAPBootInfo* (identity-mapped), MMU off, EL1.
  * Stack = iInitStackBase + iInitStackSize; same vectors and MMU map as the boot CPU; then A64_ApMain(info). */
 	.text
@@ -103,6 +104,7 @@ A64_ApEntry:
 	bl	A64_ApMain			// never returns
 1:	wfe
 	b	1b
+#endif
 
 	.section .bss.stack, "aw", %nobits
 	.balign	16

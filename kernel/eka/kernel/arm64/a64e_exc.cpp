@@ -28,8 +28,8 @@ extern "C" {
 TInt A64_TrapSaveExc(TExcTrap*, TExcTrapHandler);
 TInt A64_TrapSaveIpc(TIpcExcTrap*, DThread*);
 TInt A64_TrapSavePaging(TPagingExcTrap*);
-void A64_TrapRestoreExc(TExcTrap*, TInt);
-void A64_TrapRestorePaging(TPagingExcTrap*, TInt);
+__attribute__((noreturn)) void A64_TrapRestoreExc(TExcTrap*, TInt);
+__attribute__((noreturn)) void A64_TrapRestorePaging(TPagingExcTrap*, TInt);
 TAny* A64_SafeReadKern(const TAny* aSrc, TAny* aDest, TInt aSize);
 TAny* A64_SafeReadUser(const TAny* aSrc, TAny* aDest, TInt aSize);
 TAny* A64_SafeWriteUser(TAny* aDest, const TAny* aSrc, TInt aSize);
@@ -40,12 +40,15 @@ extern char A64_MagicStart[], A64_MagicEnd[];
 /******************************************************************************
  * Traps (ckernel.cia): naked forwarders to a64e_trap.S, which saves/restores the context; the bookkeeping is here
  ******************************************************************************/
-__attribute__((naked)) EXPORT_C TInt TExcTrap::Trap()								{ asm("mov x1, xzr\n\tb A64_TrapSaveExc"); }
-__attribute__((naked)) EXPORT_C TInt TExcTrap::Trap(TExcTrapHandler)				{ asm("b A64_TrapSaveExc"); }
-__attribute__((naked)) TInt TIpcExcTrap::Trap(DThread*)								{ asm("b A64_TrapSaveIpc"); }
-__attribute__((naked)) TInt TPagingExcTrap::Trap()									{ asm("b A64_TrapSavePaging"); }
-__attribute__((naked)) EXPORT_C void TExcTrap::Exception(TInt)					{ asm("b A64_TrapRestoreExc"); }
-__attribute__((naked)) void TPagingExcTrap::Exception(TInt)							{ asm("b A64_TrapRestorePaging"); }
+// Trap() must reach the context save with the caller's callee-saved registers and sp untouched: naked, and never
+// inlined (GCC copies a naked body verbatim into a caller, dropping the argument set-up around the call)
+__attribute__((naked, noinline)) EXPORT_C TInt TExcTrap::Trap()						{ asm("mov x1, xzr\n\tb A64_TrapSaveExc"); }
+__attribute__((naked, noinline)) EXPORT_C TInt TExcTrap::Trap(TExcTrapHandler)		{ asm("b A64_TrapSaveExc"); }
+__attribute__((naked, noinline)) TInt TIpcExcTrap::Trap(DThread*)					{ asm("b A64_TrapSaveIpc"); }
+__attribute__((naked, noinline)) TInt TPagingExcTrap::Trap()						{ asm("b A64_TrapSavePaging"); }
+// Exception() restores everything from the trap object, so an ordinary call is fine
+EXPORT_C void TExcTrap::Exception(TInt aResult)		{ A64_TrapRestoreExc(this, aResult); __builtin_unreachable(); }
+void TPagingExcTrap::Exception(TInt aResult)		{ A64_TrapRestorePaging(this, aResult); __builtin_unreachable(); }
 
 static void DefaultExcTrapHandler(TExcTrap* aTrap, DThread*, TAny*)	// Trap() with no handler: a bad descriptor
 	{

@@ -74,12 +74,14 @@ for tu in $TUS; do
 	kernel/arm/cache_maintenance.cpp)
 		pat='34s|^#if !defined(__CPU_MEMORY_TYPE_REMAPPING)$|#if !defined(__CPU_MEMORY_TYPE_REMAPPING) \&\& defined(__CPU_ARM)	// a64 port: header declares them for ARM only|' ;;
 	esac
+	# Kern::Printf straight to the board console from the kernel's first line (the variant defines DebugOutputChar)
+	extra=""; [ "$tu" = kernel/arm/cutils.cpp ] && extra="-D__EARLY_DEBUG__"
 	if [ -n "$pat" ]; then
 		sed "$pat" "$src" > "$OUT/patched_$(basename "$tu")"
 		[ "$(grep -c 'a64 port:' "$OUT/patched_$(basename "$tu")")" = 1 ] || echo "PATCH NOT APPLIED: $tu"
 		src="$OUT/patched_$(basename "$tu")"
 	fi
-	if $CXX $DEFS $INCS $PRE -c "$src" -o "$OUT/obj/$n.o" 2>"$OUT/$n.log"; then
+	if $CXX $extra $DEFS $INCS $PRE -c "$src" -o "$OUT/obj/$n.o" 2>"$OUT/$n.log"; then
 		pass=$((pass+1)); rm -f "$OUT/$n.log"
 	else
 		fail=$((fail+1)); echo "$tu" >> "$OUT/failed.txt"; rm -f "$OUT/obj/$n.o"

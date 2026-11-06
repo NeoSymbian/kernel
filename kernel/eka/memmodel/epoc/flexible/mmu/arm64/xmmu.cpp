@@ -374,8 +374,10 @@ TPte Mmu::BlankPte(TMemoryAttributes aAttributes, TUint aPteType)
 		pte |= KA64nG;							// tagged with the ASID
 	if((aPteType&EPteTypeExecutable)==false || (aPteType&EPteTypeUserAccess)==false)
 		pte |= KA64UXN;							// EL0 may execute only user executable pages
-	if((aPteType&EPteTypeExecutable)==false || (aPteType&EPteTypeUserAccess))
-		pte |= KA64PXN;							// the kernel never executes user pages or non-executable ones
+	// the kernel never executes non-executable pages or a process's own user pages; global user code (the ROM,
+	// global code chunks) stays executable at EL1 because the kernel's own code is in the ROM, as on ARM
+	if((aPteType&EPteTypeExecutable)==false || ((aPteType&EPteTypeUserAccess) && (aPteType&EPteTypeGlobal)==false))
+		pte |= KA64PXN;
 
 	TRACE2(("Mmu::BlankPte(%x,%x) returns 0x%x%08x",aAttributes,aPteType,(TUint32)(pte>>32),(TUint32)pte));
 	return pte;

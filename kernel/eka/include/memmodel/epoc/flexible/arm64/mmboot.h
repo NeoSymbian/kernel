@@ -89,7 +89,7 @@ const TLinAddr KPageDirectoryBase		=0xF4000000u;	// 256 x 16 KB directories = 4 
 const TLinAddr KPageDirectoryEnd		=0xF8000000u;
 
 const TLinAddr KPageTableBase			=0xF8000000u;
-const TLinAddr KPageTableEnd			=0xFFF00000u;
+const TLinAddr KPageTableEnd			=0xFFE00000u;	// 2 MB aligned: a fixed kernel region must be whole chunks (DMemoryManager::New)
 
 // VMSAv8-64, 4 KB granule, T0SZ=32
 const TInt KPageShift=12;

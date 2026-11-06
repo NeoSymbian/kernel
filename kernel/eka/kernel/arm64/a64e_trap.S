@@ -35,16 +35,19 @@
  * caller of Trap (x30 is untouched). x0 = this, x1 = handler / client thread. */
 	.global	A64_TrapSaveExc
 A64_TrapSaveExc:
+	mov		w0, w0			// ILP32: a pointer argument's upper half is not defined
 	SAVE_CTX x0
 	b		A64TrapSetExc			// TInt A64TrapSetExc(TExcTrap*, TExcTrapHandler)
 
 	.global	A64_TrapSaveIpc
 A64_TrapSaveIpc:
+	mov		w0, w0			// ILP32: a pointer argument's upper half is not defined
 	SAVE_CTX x0
 	b		A64TrapSetIpc			// TInt A64TrapSetIpc(TIpcExcTrap*, DThread*)
 
 	.global	A64_TrapSavePaging
 A64_TrapSavePaging:
+	mov		w0, w0			// ILP32: a pointer argument's upper half is not defined
 	SAVE_CTX x0
 	b		A64TrapSetPaging		// TInt A64TrapSetPaging(TPagingExcTrap*)
 
@@ -52,7 +55,7 @@ A64_TrapSavePaging:
  * x0 = this, w1 = r. Called from inside Exc::Dispatch (the exception shim's stack frame is abandoned). */
 	.global	A64_TrapRestoreExc
 A64_TrapRestoreExc:
-	mov		x19, x0
+	mov		w19, w0
 	mov		w20, w1
 	bl		A64TrapClearExc			// void A64TrapClearExc(TExcTrap*)
 	mov		x0, x19
@@ -63,7 +66,7 @@ A64_TrapRestoreExc:
 
 	.global	A64_TrapRestorePaging
 A64_TrapRestorePaging:
-	mov		x19, x0
+	mov		w19, w0
 	mov		w20, w1
 	bl		A64TrapClearPaging		// void A64TrapClearPaging(TPagingExcTrap*)
 	mov		x0, x19
@@ -88,6 +91,8 @@ A64_MagicStart:
 
 	.global	A64_SafeReadKern
 A64_SafeReadKern:
+	mov		w0, w0
+	mov		w1, w1
 1:	cmp		sp, #0
 	ldr		w3, [x0]
 	b.eq	9f
@@ -102,6 +107,8 @@ A64_SafeReadKern:
 
 	.global	A64_SafeReadUser
 A64_SafeReadUser:
+	mov		w0, w0
+	mov		w1, w1
 1:	cmp		sp, #0
 	ldtr	w3, [x0]
 	b.eq	9f
@@ -116,6 +123,8 @@ A64_SafeReadUser:
 
 	.global	A64_SafeWriteUser
 A64_SafeWriteUser:
+	mov		w0, w0
+	mov		w1, w1
 1:	ldr		w3, [x1], #4
 	cmp		sp, #0
 	sttr	w3, [x0]
@@ -130,6 +139,8 @@ A64_SafeWriteUser:
 
 	.global	A64_SafeWriteKern
 A64_SafeWriteKern:
+	mov		w0, w0
+	mov		w1, w1
 1:	ldr		w3, [x1], #4
 	cmp		sp, #0
 	str		w3, [x0]

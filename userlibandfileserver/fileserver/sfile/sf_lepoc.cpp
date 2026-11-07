@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): ELF-format import words carry an addend in their top half; the import checks use the ordinal.
 // Description:
 // f32\sfile\sf_lepoc.cpp
 // 
@@ -794,7 +794,7 @@ TInt svElfDerivedGetImportInfo(TAny* aPtr)
 
 	TUint32* iolEnd = iol+count;
 	while(iol<iolEnd)
-		*dest++ = *(TUint32*)(code + *iol++);
+		*dest++ = *(TUint32*)(code + *iol++) & 0xffff;	// NeoSymbian: the ordinal; the top half is the addend
 		
 	return 0;
 	}

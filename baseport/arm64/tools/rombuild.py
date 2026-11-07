@@ -753,8 +753,13 @@ class E32Xip:
                              % (self.zname, data_run_base, ddata % self.data_align,
                                 self.data_align, self.link_data_base))
 
+        dsz = self.data_size + self.bss_size
+
         def fix(buf, off, typ):
             (w,) = struct.unpack_from("<I", buf, off)
+            if typ == 0x3000:		# inferred (the export table, e32image.py): data if the value lies in the data
+                typ = RELOC_DATA_NIBBLE if dsz and self.link_data_base <= w < self.link_data_base + dsz \
+                    else RELOC_TEXT_NIBBLE
             w = (w + (dcode if typ == RELOC_TEXT_NIBBLE else ddata)) & 0xFFFFFFFF
             struct.pack_into("<I", buf, off, w)
 

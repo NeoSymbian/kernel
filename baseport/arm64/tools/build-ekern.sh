@@ -53,6 +53,8 @@ $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medint -DKernelModuleE
 	-DCreatePhysicalDevice=CreatePhysicalDevice_medint -c "$EKA/drivers/medint/iram.cpp" -o "$I/iram.o"
 $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medblk -DKernelModuleEntry=KernelModuleEntry_medblk \
 	-DCreatePhysicalDevice=CreatePhysicalDevice_medblk -c "$BSP/common/specific/a64_medblk.cpp" -o "$I/a64_medblk.o"
+$EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medrofs -DKernelModuleEntry=KernelModuleEntry_medrofs \
+	-DCreatePhysicalDevice=CreatePhysicalDevice_medrofs -c "$BSP/common/specific/a64_medrofs.cpp" -o "$I/a64_medrofs.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_blk.cpp" -o "$I/a64_blk.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$BSP/common/specific/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_display.cpp" -o "$I/a64_display.o"
@@ -80,6 +82,10 @@ if [ "${USERSIDE:-1}" != 0 ]; then
 	OUT="$OUT" BASE=$(printf '0x%08X' $((ROM_LIN + 0x200000))) sh "$HERE/tools/build-userrom.sh"
 	printf '\t.section .uimage, "a"\n\t.incbin "%s"\n' "$OUT/romsect.bin" > "$I/uimage.S"
 	$AS "$I/uimage.S" -o "$I/uimage.o"
+	if [ "${ROFS:-0}" = 1 ]; then	# Z:'s ROFS part, after the section (ekern.lds .urofs, a64_medrofs.cpp)
+		printf '\t.section .urofs, "a"\n\t.incbin "%s"\n' "$OUT/user/rofs.img" > "$I/urofs.S"
+		$AS "$I/urofs.S" -o "$I/urofs.o"
+	fi
 fi
 [ -n "$FONT" ] && python3 "$HERE/tools/mkfont.py" "$I/font.h" >/dev/null
 $PLAIN -I "$I" -c "$VDIR/$BOARD_SRC" -o "$I/board.o"

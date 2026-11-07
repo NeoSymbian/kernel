@@ -15,6 +15,9 @@ TInt InitExtension_medint();
 DPhysicalDevice* CreatePhysicalDevice_medint();
 TInt InitExtension_medblk();
 DPhysicalDevice* CreatePhysicalDevice_medblk();
+TInt InitExtension_medrofs();
+DPhysicalDevice* CreatePhysicalDevice_medrofs();
+extern "C" TUint8 __urofs_base[], __urofs_end[];		// ekern.lds: the ROFS image, empty without ROFS=1
 
 void A64StartMedia()
 	{
@@ -29,4 +32,12 @@ void A64StartMedia()
 	Kern::Printf("[media] InstallPhysicalDevice(%s) -> %d", blk ? "Media.Blk" : "Media.IRam", r);
 	r = blk ? InitExtension_medblk() : InitExtension_medint();
 	Kern::Printf("[media] %s = local drive 0 -> %d", blk ? "block drive" : "IRAM", r);
+	if (__urofs_end != __urofs_base)						// Z:'s ROFS part (docs/filesystem.md FS4a): local drive 2
+		{
+		pd = CreatePhysicalDevice_medrofs();
+		r = pd ? Kern::InstallPhysicalDevice(pd) : KErrNoMemory;
+		if (r == KErrNone)
+			r = InitExtension_medrofs();
+		Kern::Printf("[media] ROFS image (%d KB) = local drive 2 -> %d", (TInt)((__urofs_end - __urofs_base) >> 10), r);
+		}
 	}

@@ -36,10 +36,12 @@ const TBool KBootDrive = A64_EMMC_C == 1;
 const TBool KWritable = EFalse;
 const TBool KBootDrive = EFalse;
 #endif
-// C: = the first 2000 MB of userdata: ELOCAL.FSY is still the old sfat (FAT12/16), whose 32 KB clusters top out
-// just under 2 GB (docs/filesystem.md). shortcut: grows to 4-8 GB (FAT32) with FS1's sfat32
-const TUint64 KCSectors = (2000ull << 20) / KA64BlkSector;
+// C: = 8 GB of userdata, FAT32 (ELOCAL.FSY = sfat32), starting on the first 4 MiB boundary of the disk inside it:
+// userdata's sectors before it hold the MBR that adds E: (docs/filesystem.md FS3), so C: keeps its place then
+const TUint64 KCSectors = (8ull << 30) / KA64BlkSector;
+const TUint64 KAlign = (4 << 20) / KA64BlkSector;
 static TUint64 WinFirst, WinCount;						// the window, once the GPT is read: the only writable range
+static TUint32 EraseBytes;								// EXT_CSD HC_ERASE_GRP_SIZE, if it divides KAlign
 
 static TUint32 Rca;
 static TUint64 Sectors;
@@ -395,6 +397,10 @@ static TInt DoInit(TUint64& aSectors)
 	Log("RCA %d, %d sectors (%d MB), cache size %d ctrl %d, partition config %02x, rev %d", Rca, (TInt)Sectors,
 		(TInt)(Sectors >> 11), ext[249] | (ext[250] << 8) | (ext[251] << 16) | (ext[252] << 24), ext[33], ext[179],
 		ext[192]);
+	EraseBytes = ext[224] * (512u << 10);					// HC_ERASE_GRP_SIZE, in 512 KB units
+	if (EraseBytes & (EraseBytes - 1) || EraseBytes > KAlign * KA64BlkSector)
+		EraseBytes = 0;										// not a power of 2 that divides the window's start
+	Log("erase group %d KB", (TInt)(EraseBytes >> 10));
 	if (ext[179] & 7)										// PARTITION_ACCESS: a boot or RPMB area is selected
 		{
 		Log("not the user area (partition access %d)", ext[179] & 7);
@@ -405,7 +411,9 @@ static TInt DoInit(TUint64& aSectors)
 	return KErrNone;
 	}
 
-// the GPT partition "userdata" (UTF-16 name in the entry): the only window
+TUint32 A64BlkDev_EraseBlock() { return EraseBytes; }
+
+// the GPT partition "userdata" (UTF-16 name in the entry): the only window, C:
 TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
 	{
 	static TUint8 s[KA64BlkSector];
@@ -436,13 +444,14 @@ TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
 			last = *(const TUint64*)(e + 40);
 			}
 		}
-	if (found != 1 || last < first || last >= aSectors)
+	const TUint64 cFirst = (first + KAlign - 1) / KAlign * KAlign;
+	if (found != 1 || last < cFirst || last >= aSectors)
 		{
 		Log("GPT: %d entries, userdata found %d times (%d..%d): no window", n, found, (TInt)first, (TInt)last);
 		return KErrNotFound;
 		}
-	aFirst = WinFirst = first;
-	aCount = WinCount = Min(last - first + 1, KCSectors);
+	aFirst = WinFirst = cFirst;
+	aCount = WinCount = Min(last - cFirst + 1, KCSectors);
 	Log("GPT: %d entries; userdata = sectors %d..%d (%d MB); window %d + %d, %s", n, (TInt)first, (TInt)last,
 		(TInt)((last - first + 1) >> 11), (TInt)WinFirst, (TInt)WinCount,
 		!KWritable ? "read-only" : KBootDrive ? "writable, C:" : "writable (monitor only)");

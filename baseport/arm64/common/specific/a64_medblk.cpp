@@ -99,7 +99,7 @@ TInt DMediaDriverBlk::Caps(TLocDrvRequest& m)
 	caps.iPartitionType = Fat32() ? KPartitionTypeWin95FAT32 : KPartitionTypeFAT16;
 	caps.iSize = m.Drive()->iPartitionLen;
 	caps.iHiddenSectors = 0;
-	caps.iEraseBlockSize = 0;
+	caps.iEraseBlockSize = A64BlkDev_EraseBlock();	// sfat32's format aligns the first data sector to it
 	caps.iBlockSize = KA64BlkSector;
 	caps.iMaxBytesPerFormat = 1 << 30;		// EFormat is a no-op: without this a full format takes 16 KB steps (8 GB =
 											// 512K file-server round trips, which looks like a hang)

@@ -8,6 +8,7 @@
 __attribute__((weak)) TInt A64BlkDev_Init(TUint64&) { return KErrNotSupported; }
 __attribute__((weak)) TInt A64BlkDev_Read(TUint64, TInt, TUint8*) { return KErrNotSupported; }
 __attribute__((weak)) TInt A64BlkDev_Write(TUint64, TInt, const TUint8*) { return KErrNotSupported; }
+__attribute__((weak)) TUint32 A64BlkDev_EraseBlock() { return 0; }
 __attribute__((weak)) TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
 	{
 	aFirst = 0;

@@ -14,6 +14,9 @@ TInt A64BlkDev_Read(TUint64 aLba, TInt aCount, TUint8* aBuf);
 TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf);
 // the board's window on the device (weak default: the whole device): KErrNone and [aFirst, aFirst + aCount)
 TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount);
+// the device's erase unit in bytes, a power of 2 dividing the window's start (weak default: 0, unknown); FAT's
+// format aligns its data area to it
+TUint32 A64BlkDev_EraseBlock();
 
 // ---- the window
 TInt A64Blk_Start();										// backend init + the board's window

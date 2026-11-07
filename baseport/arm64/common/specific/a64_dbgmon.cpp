@@ -188,6 +188,11 @@ __attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
 __attribute__((weak)) void A64_WatchdogBite(TInt) { Say("wdt: not on this board"); }
 __attribute__((weak)) TInt A64BlkDev_Probe() { return KErrNotSupported; }
 __attribute__((weak)) TInt A64BlkDev_SelfTest() { return KErrNotSupported; }
+__attribute__((weak)) TInt A64BlkDev_Monitor(TInt, const TPtrC8*, const TUint64*, TDes8& aOut)
+	{
+	aOut.Copy((const TUint8*)"blk: not on this board", 22);
+	return KErrNotSupported;
+	}
 __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
 __attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((const TUint8*)"rpmh: not on this board", 23); }
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
@@ -307,8 +312,15 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 			Say("%d %S %d..%d %d MB", i, &name, (TInt)first, (TInt)last, (TInt)((last - first + 1) >> 11));
 			}
 		}
+	else if (aArgc >= 2 && (Eq(aArg[1], "speed") || Eq(aArg[1], "guard") || Eq(aArg[1], "mode")))	// the board's
+		{
+		TBuf8<200> b;
+		TInt r = KErrNone, x;
+		XTRAP(x, XT_DEFAULT, r = A64BlkDev_Monitor(aArgc, aArg, aNum, b));
+		Say("%S (%d, trap %d)", &b, r, x);
+		}
 	else
-		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk wtest");
+		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk wtest | blk speed | blk guard <lba> | blk mode <0-2>");
 	}
 
 static void Post(TRawEvent::TType aType, TInt aX, TInt aY)

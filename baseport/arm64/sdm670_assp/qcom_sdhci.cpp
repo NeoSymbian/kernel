@@ -3,16 +3,19 @@
 // qcom_sdhci.cpp -- the Pixel's eMMC (DTB mmc@7c4000, sdhci-msm v5) as the A64BlkDev backend (a64_blk.h). ABL loaded
 // our boot image from this eMMC, so the host is powered and clocked and the card is selected in transfer state:
 // but ABL shuts the host down before it starts a kernel, so it is re-initialised (Reinit: legacy 19.2 MHz, 1-bit, no
-// tuning), with the RPMh votes Linux makes at probe (CX, the NoC link). CMD8 reads EXT_CSD, CMD18/CMD25 move data
-// with auto-CMD12, by ADMA2 through a non-cached bounce buffer.
-// The window (a64_blk.cpp) is the GPT partition "userdata": nothing outside it can be read or written above.
+// tuning), with the RPMh votes Linux makes at probe (CX, the NoC link), then raised to the fastest mode that
+// verifies (SelectMode: 8-bit DDR52, else HS52, else legacy). CMD8 reads EXT_CSD, CMD18/CMD25 move data with
+// auto-CMD12, by ADMA2 through a non-cached bounce buffer.
+// The window (a64_blk.cpp) is C: inside the GPT partition "userdata"; below it, writes must fall inside an enabled
+// partition of the allow-list (Parts), whoever asks.
 // Writes stay off unless built with EMMC_C=1 (-DA64_EMMC_C): without it, the backend only reports (Volume Up) and
 // C: stays the RAM drive.
-// shortcut: polled, bounded spins, 1-bit 19.2 MHz (~2 MB/s); HS200/8-bit with tuning if file throughput matters.
+// shortcut: polled, bounded spins, no HS200/HS400 (tuning) and no command queue: DDR52 is the top mode.
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_blk.h"
 #include "qcom_rpmh.h"
+#include <kernel/cache.h>
 
 const TUint32 KHc = 0x007c4000, KCqhci = 0x007c5000;
 enum
@@ -43,6 +46,37 @@ const TUint64 KAlign = (4 << 20) / KA64BlkSector;
 static TUint64 WinFirst, WinCount;						// the window, once the GPT is read: the only writable range
 static TUint32 EraseBytes;								// EXT_CSD HC_ERASE_GRP_SIZE, if it divides KAlign
 
+// the partitions a write may reach (docs/filesystem.md "allow-list"); found by GPT name, each exactly once.
+// system_* and vendor_* stay off until the owner approves writing them (gate G1, FS4b)
+struct TPart { const char* iName; TBool iWritable; TInt iFound; TUint64 iFirst, iLast; };
+static TPart Parts[] =
+	{
+	{ "userdata", ETrue }, { "system_a", EFalse }, { "system_b", EFalse }, { "vendor_a", EFalse }, { "vendor_b", EFalse },
+	};
+const TInt KParts = sizeof(Parts) / sizeof(Parts[0]);
+
+// the bus modes, slowest first (SelectMode); A64_EMMC_MODE (EMMC_MODE=0..2) caps it for bisecting
+enum TMode { ELegacy, EHs52, EDdr52 };
+static const char* const KModeName[] = { "legacy 1-bit 19.2 MHz", "HS52 8-bit 50 MHz", "DDR52 8-bit 50 MHz (core 100)" };
+#ifdef A64_EMMC_MODE
+const TInt KMaxMode = A64_EMMC_MODE;
+#else
+const TInt KMaxMode = EDdr52;
+#endif
+static TInt CurMode = ELegacy;
+static TUint8 Ext[KA64BlkSector];							// EXT_CSD as read in legacy mode
+
+// one transfer at a time: the media driver (C:) and the monitor's blk commands share the host and DmaBuf.
+// Below the media driver's own lock (KMutexOrdGeneral0) in the mutex order
+static DMutex* Lock;
+const TUint8 KMutexOrdEmmc = 0xe0;
+class TLock
+	{
+public:
+	TLock() { NKern::ThreadEnterCS(); if (Lock) Kern::MutexWait(*Lock); }
+	~TLock() { if (Lock) Kern::MutexSignal(*Lock); NKern::ThreadLeaveCS(); }
+	};
+
 static TUint32 Rca;
 static TUint64 Sectors;
 // data moves by ADMA2 through a bounce buffer. This host has no SDMA (CAPS bit 22 is 0: an SDMA transfer leaves the
@@ -67,7 +101,9 @@ static void Set(TUint32 aOff, TInt aBits, TUint32 aVal)
 	}
 
 // sdhci-msm v5 (Linux sdhci-msm.c sdhci_msm_v5_offset): the vendor register and the power-control handshake
-enum { EVendorSpec = 0x20c, EPwrStatus = 0x240, EPwrMask = 0x244, EPwrClear = 0x248, EPwrCtl = 0x24c };
+enum { EDllConfig = 0x200, EVendorSpec = 0x20c, EPwrStatus = 0x240, EPwrMask = 0x244, EPwrClear = 0x248, EPwrCtl = 0x24c };
+enum { EDllPdn = 1u << 29, EDllRst = 1u << 30 };
+enum { EHc1HighSpeed = 1 << 2, EHc1Bus8 = 1 << 5, EHc2UhsMask = 7, EHc2Ddr50 = 4 };
 enum { EPowerCtrl = 0x29, ETimeoutCtrl = 0x2e, EHostCtrl2 = 0x3e };
 const TUint32 KGcc = 0x00100000;
 enum { ESdcc1Apps = 0x26004, ESdcc1Ahb = 0x26008, ESdcc1RcgCmd = 0x26028, ESdcc1RcgCfg = 0x2602c };
@@ -196,16 +232,22 @@ static TInt Transfer(TUint aCmd, TUint32 aArg, TInt aCount, TBool aRead)
 	return r;
 	}
 
+// DmaBuf is cached (a non-cached bounce halves DDR52's throughput: copying 64 MB out of it took 1 s, the bus 0.8 s):
+// its lines are invalidated around a card-to-memory transfer and cleaned before a memory-to-card one
 static TInt ReadBlocks(TUint aCmd, TUint32 aArg, TInt aCount, TUint8* aBuf)
 	{
+	const TInt bytes = aCount * KA64BlkSector;
+	Cache::SyncMemoryBeforeDmaRead((TLinAddr)DmaBuf, bytes);
 	TInt r = Transfer(aCmd, aArg, aCount, ETrue);
+	Cache::SyncMemoryAfterDmaRead((TLinAddr)DmaBuf, bytes);
 	if (r == KErrNone)
-		memcpy(aBuf, DmaBuf, aCount * KA64BlkSector);
+		memcpy(aBuf, DmaBuf, bytes);
 	return r;
 	}
 
 TInt A64BlkDev_Read(TUint64 aLba, TInt aCount, TUint8* aBuf)
 	{
+	TLock lock;
 	if (!Rca || aLba + aCount > Sectors)
 		return KErrArgument;
 	for (TInt done = 0; done < aCount; )
@@ -219,17 +261,34 @@ TInt A64BlkDev_Read(TUint64 aLba, TInt aCount, TUint8* aBuf)
 	return KErrNone;
 	}
 
+// the partition of the allow-list holding [aLba, aLba + aCount), or NULL
+static const TPart* PartOf(TUint64 aLba, TInt aCount)
+	{
+	for (TInt i = 0; i < KParts; ++i)
+		if (Parts[i].iFound == 1 && aCount > 0 && aLba >= Parts[i].iFirst && aLba + aCount - 1 <= Parts[i].iLast)
+			return &Parts[i];
+	return NULL;
+	}
+
+static TBool WriteAllowed(TUint64 aLba, TInt aCount)
+	{
+	const TPart* p = PartOf(aLba, aCount);
+	return KWritable && p && p->iWritable;
+	}
+
 TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
 	{
-	// a second check under a64_blk.cpp's: nothing outside the window userdata gave, whoever asks
-	if (!KWritable || !WinCount || aCount <= 0 || aLba < WinFirst || aLba + aCount > WinFirst + WinCount)
+	// a second check under a64_blk.cpp's window: only an enabled partition of the allow-list, whoever asks
+	if (!WriteAllowed(aLba, aCount))
 		return KErrAccessDenied;
+	TLock lock;
 	if (!Rca || aLba + aCount > Sectors)
 		return KErrArgument;
 	for (TInt done = 0; done < aCount; )
 		{
 		TInt n = Min(aCount - done, KDmaMax);
 		memcpy(DmaBuf, aBuf + done * KA64BlkSector, n * KA64BlkSector);
+		Cache::SyncMemoryBeforeDmaWrite((TLinAddr)DmaBuf, n * KA64BlkSector);
 		TInt r = Transfer(n > 1 ? 25 : 24, (TUint32)(aLba + done), n, EFalse);
 		if (r != KErrNone)
 			return r;
@@ -280,6 +339,108 @@ static void ClocksOn()
 	Gcc(ESdcc1Apps) |= 1;
 	for (TInt i = 0; i < KSpin && ((Gcc(ESdcc1Apps) | Gcc(ESdcc1Ahb)) & (1u << 31)); ++i)	// CLK_OFF clears
 		{}
+	}
+
+// the core clock from the GCC sdcc1 RCG (gcc-sdm845.c: CFG source in [10:8], divider 2*div-1 in [4:0]); the msm
+// host doesn't divide it (sdhci-msm.c __sdhci_msm_set_clock), except by 2 in DDR modes
+static void CoreClock(TUint32 aCfg)
+	{
+	Set(EClockCtrl, 16, 0);									// card clock off while the source changes
+	Gcc(ESdcc1RcgCfg) = aCfg;
+	Gcc(ESdcc1RcgCmd) |= 1;
+	for (TInt i = 0; i < KSpin && (Gcc(ESdcc1RcgCmd) & 1); ++i)
+		{}
+	SdClock(0);
+	}
+const TUint32 KCore50 = 0x117, KCore100 = 0x10b;			// GPLL0 (600 MHz) / 12, / 6
+
+static TInt Reinit();
+
+// CMD6 SWITCH, write byte aIndex of EXT_CSD := aValue (R1b), then CMD13 until the card is back in transfer state
+// without SWITCH_ERROR (JEDEC; Linux mmc_ops.c __mmc_switch)
+static TInt Switch(TUint aIndex, TUint aValue)
+	{
+	TInt r = Command(6, (3u << 24) | (aIndex << 16) | (aValue << 8), 0x1b);
+	if (r != KErrNone)
+		return r;
+	WaitInt(EIntXfer);										// the busy time (a timeout: CMD13 below waits it out)
+	for (TInt i = 0; i < 100; ++i)
+		{
+		r = Command(13, 1 << 16, ERespR1);
+		TUint32 st = R(EResponse0);
+		if (r == KErrNone && ((st >> 9) & 0xf) == 4)
+			return (st & (1 << 7)) ? KErrNotSupported : KErrNone;	// SWITCH_ERROR
+		NKern::Sleep(NKern::TimerTicks(1));
+		}
+	return r != KErrNone ? r : KErrTimedOut;
+	}
+
+// EXT_CSD read again in the new mode: 512 bytes over every data line with CRC, compared with the legacy read
+static TInt Verify()
+	{
+	static TUint8 e[KA64BlkSector];
+	TInt r = ReadBlocks(8, 0, 1, e);
+	if (r == KErrNone && (memcompare(e + 212, 4, Ext + 212, 4) != 0 || e[196] != Ext[196]))
+		r = KErrCorrupt;
+	return r;
+	}
+
+// raise the bus from legacy (Reinit) to aMode, as Linux mmc_init_card without HS200: mmc_select_hs,
+// mmc_select_bus_width, mmc_select_hs_ddr; the OPP votes (DTB opp-50000000/100000000) before the clock goes up
+static TInt SelectMode(TInt aMode)
+	{
+	if (aMode == ELegacy)
+		return KErrNone;
+	if (!(Ext[196] & 2) || (aMode == EDdr52 && !(Ext[196] & 4)))	// DEVICE_TYPE: HS52, DDR52 1.8/3 V
+		return KErrNotSupported;
+	Arc_Vote("cx.lvl", aMode == EDdr52 ? 128 : 64);
+	Bcm_Vote("SN8", 130718, 200000, 16);
+	TInt r = Switch(185, 1);								// HS_TIMING = high speed
+	if (r == KErrNone)
+		{
+		Set(EHostCtrl1, 8, Get(EHostCtrl1, 8) | EHc1HighSpeed);
+		R(EDllConfig) |= EDllRst;							// no DLL at 100 MHz or below (sdhci_msm_set_uhs_signaling)
+		R(EDllConfig) |= EDllPdn;
+		CoreClock(KCore50);
+		r = Switch(183, 2);									// BUS_WIDTH = 8-bit SDR
+		}
+	if (r == KErrNone)
+		{
+		Set(EHostCtrl1, 8, Get(EHostCtrl1, 8) | EHc1Bus8);
+		r = Verify();
+		}
+	if (r == KErrNone && aMode == EDdr52)
+		{
+		r = Switch(183, 6);									// BUS_WIDTH = 8-bit DDR
+		if (r == KErrNone)
+			{
+			Set(EHostCtrl2, 16, (Get(EHostCtrl2, 16) & ~EHc2UhsMask) | EHc2Ddr50);
+			CoreClock(KCore100);							// the card still sees 50 MHz
+			r = Verify();
+			}
+		}
+	return r;
+	}
+
+// the fastest mode up to aMax that verifies; a failed attempt starts over from CMD0 (the card's timing resets)
+static TInt RaiseMode(TInt aMax)
+	{
+	CurMode = ELegacy;
+	for (TInt m = aMax; m > ELegacy; --m)
+		{
+		TInt r = SelectMode(m);
+		Log("mode %s -> %d", KModeName[m], r);
+		if (r == KErrNone)
+			{
+			CurMode = m;
+			return KErrNone;
+			}
+		ClocksOn();
+		r = Reinit();
+		if (r != KErrNone)
+			return r;
+		}
+	return KErrNone;
 	}
 
 static TInt Reinit()
@@ -354,19 +515,32 @@ TInt A64BlkDev_Probe()
 
 static TInt DoInit(TUint64& aSectors)
 	{
+	if (!Lock)
+		{
+		_LIT(KLockName, "Emmc");
+		NKern::ThreadEnterCS();
+		TInt r = Kern::MutexCreate(Lock, KLockName, KMutexOrdEmmc);
+		NKern::ThreadLeaveCS();
+		if (r != KErrNone)
+			return r;
+		}
+	TLock lock;
 	if (!DmaBuf)
 		{
 		NKern::ThreadEnterCS();
-		const TInt size = KDmaMax * KA64BlkSector + 4096;	// + one page of descriptors
-		TInt r = Epoc::AllocPhysicalRam(size, DmaPhys, 12);
+		const TInt data = KDmaMax * KA64BlkSector;			// cached data, then one non-cached page of descriptors
+		TInt r = Epoc::AllocPhysicalRam(data + 4096, DmaPhys, 12);
 		DPlatChunkHw* chunk = NULL;
+		DPlatChunkHw* desc = NULL;
 		if (r == KErrNone)
-			r = DPlatChunkHw::New(chunk, DmaPhys, size, EMapAttrSupRw | EMapAttrBufferedNC);
+			r = DPlatChunkHw::New(chunk, DmaPhys, data, EMapAttrSupRw | EMapAttrCachedMax);
+		if (r == KErrNone)
+			r = DPlatChunkHw::New(desc, DmaPhys + data, 4096, EMapAttrSupRw | EMapAttrBufferedNC);
 		NKern::ThreadLeaveCS();
 		if (r != KErrNone)
 			return r;
 		DmaBuf = (TUint8*)chunk->LinearAddress();
-		Desc = (volatile TUint32*)(DmaBuf + KDmaMax * KA64BlkSector);
+		Desc = (volatile TUint32*)desc->LinearAddress();
 		}
 	Log("host v%x caps %08x present %08x hostctl %08x clock %08x; gcc apps %08x ahb %08x", R(ESlotVersion) >> 16,
 		R(ECaps), R(EPresentState), R(EHostCtrl1), R(EClockCtrl), Gcc(ESdcc1Apps), Gcc(ESdcc1Ahb));
@@ -384,7 +558,7 @@ static TInt DoInit(TUint64& aSectors)
 	TInt r = Reinit();
 	if (r != KErrNone)
 		return r;
-	static TUint8 ext[KA64BlkSector];
+	TUint8* ext = Ext;
 	Sectors = ~0ull;										// let CMD8 through ReadBlocks' bounds
 	r = ReadBlocks(8, 0, 1, ext);						// SEND_EXT_CSD
 	if (r != KErrNone)
@@ -407,11 +581,124 @@ static TInt DoInit(TUint64& aSectors)
 		Rca = 0;
 		return KErrNotSupported;
 		}
+	r = RaiseMode(KMaxMode);
+	Log("mode: %s (device type %02x)", KModeName[CurMode], ext[196]);
+	if (r != KErrNone)
+		{
+		Rca = 0;
+		return r;
+		}
 	aSectors = Sectors;
 	return KErrNone;
 	}
 
 TUint32 A64BlkDev_EraseBlock() { return EraseBytes; }
+
+static void Fmt(TDes8& aOut, const char* aFmt, ...)
+	{
+	VA_LIST list;
+	VA_START(list, aFmt);
+	Kern::AppendFormat(aOut, aFmt, list);
+	VA_END(list);
+	}
+
+static TBool Is(const TDesC8& aWord, const char* aLit)
+	{
+	TInt n = 0;
+	while (aLit[n])
+		++n;
+	return aWord.Length() == n && memcompare(aWord.Ptr(), n, (const TUint8*)aLit, n) == 0;
+	}
+
+// the monitor's blk speed | guard <lba> | mode <0-2> (a64_dbgmon.cpp), one answer line in aOut
+TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes8& aOut)
+	{
+	if (!Rca || !WinCount)
+		{
+		aOut.Append((const TUint8*)"blk: not initialised (blk init)", 31);
+		return KErrNotReady;
+		}
+	if (Is(aArg[1], "guard") && aArgc >= 3)				// no I/O: what the write check would say
+		{
+		const TPart* p = PartOf(aNum[2], 1);
+		Fmt(aOut, "lba %d: write %s (%s)", (TInt)aNum[2], WriteAllowed(aNum[2], 1) ? "allowed" : "denied",
+			p ? p->iName : "outside the allow-list");
+		return KErrNone;
+		}
+	if (Is(aArg[1], "mode") && aArgc >= 3)
+		{
+		TInt m = Min((TInt)aNum[2], (TInt)EDdr52);
+		TLock lock;
+		ClocksOn();
+		TInt r = Reinit();
+		if (r == KErrNone)
+			r = RaiseMode(m);
+		Fmt(aOut, "mode %s -> %d", KModeName[CurMode], r);
+		return r;
+		}
+	if (Is(aArg[1], "speed") && aArgc >= 3)				// "blk speed raw": the bus alone, no copy out of DmaBuf
+		{
+		const TInt KTotal = (64 << 20) / KA64BlkSector;
+		TLock lock;
+		TInt r = KErrNone;
+		TUint32 t0 = NKern::TickCount();
+		for (TInt i = 0; i < KTotal && r == KErrNone; i += KDmaMax)
+			{
+			Cache::SyncMemoryBeforeDmaRead((TLinAddr)DmaBuf, KDmaMax * KA64BlkSector);
+			r = Transfer(18, (TUint32)(WinFirst + i), KDmaMax, ETrue);
+			Cache::SyncMemoryAfterDmaRead((TLinAddr)DmaBuf, KDmaMax * KA64BlkSector);
+			}
+		TUint32 t1 = NKern::TickCount();
+		TInt ms = Max(1, (TInt)((t1 - t0) * NKern::TickPeriod() / 1000));
+		TUint32 c0 = NKern::TickCount();
+		static TUint8 sink[KDmaMax * KA64BlkSector];
+		for (TInt i = 0; i < KTotal; i += KDmaMax)
+			memcpy(sink, DmaBuf, sizeof(sink));
+		TInt cms = Max(1, (TInt)((NKern::TickCount() - c0) * NKern::TickPeriod() / 1000));
+		Fmt(aOut, "%s: raw read 64 MB in %d ms (%d KB/s); copying 64 MB out of DmaBuf %d ms -> %d", KModeName[CurMode],
+			ms, 65536 * 1000 / ms, cms, r);
+		return r;
+		}
+	if (Is(aArg[1], "speed"))
+		{
+		// 64 MB read from C:, then 64 MB written past C: (userdata's unused tail, E: from FS3 on): MB/s for each
+		const TInt KChunk = KDmaMax, KTotal = (64 << 20) / KA64BlkSector;
+		const TUint64 eFirst = (WinFirst + WinCount + KAlign - 1) / KAlign * KAlign;
+		NKern::ThreadEnterCS();
+		TUint8* buf = (TUint8*)Kern::Alloc(KChunk * KA64BlkSector);
+		NKern::ThreadLeaveCS();
+		if (!buf)
+			return KErrNoMemory;
+		TInt r = KErrNone;
+		TUint32 t0 = NKern::TickCount();
+		for (TInt i = 0; i < KTotal && r == KErrNone; i += KChunk)
+			r = A64BlkDev_Read(WinFirst + i, KChunk, buf);
+		TUint32 t1 = NKern::TickCount();
+		for (TInt i = 0; i < KTotal && r == KErrNone; i += KChunk)
+			r = A64BlkDev_Write(eFirst + i, KChunk, buf);
+		TUint32 t2 = NKern::TickCount();
+		// the last chunk written, read back and compared: the cache maintenance around DmaBuf, end to end
+		TInt same = -1;
+		NKern::ThreadEnterCS();
+		TUint8* back = (TUint8*)Kern::Alloc(KChunk * KA64BlkSector);
+		NKern::ThreadLeaveCS();
+		if (back && r == KErrNone && (r = A64BlkDev_Read(eFirst + KTotal - KChunk, KChunk, back)) == KErrNone)
+			same = memcompare(buf, KChunk * KA64BlkSector, back, KChunk * KA64BlkSector) == 0;
+		NKern::ThreadEnterCS();
+		Kern::Free(back);
+		Kern::Free(buf);
+		NKern::ThreadLeaveCS();
+		if (r == KErrNone && same != 1)
+			r = KErrCorrupt;
+		const TInt us = NKern::TickPeriod();
+		TInt rms = Max(1, (TInt)((t1 - t0) * us / 1000)), wms = Max(1, (TInt)((t2 - t1) * us / 1000));
+		Fmt(aOut, "%s: read 64 MB in %d ms (%d KB/s), write 64 MB at %d in %d ms (%d KB/s) -> %d",
+			KModeName[CurMode], rms, 65536 * 1000 / rms, (TInt)eFirst, wms, 65536 * 1000 / wms, r);
+		return r;
+		}
+	aOut.Append((const TUint8*)"blk speed | blk guard <lba> | blk mode <0-2>", 44);
+	return KErrArgument;
+	}
 
 // the GPT partition "userdata" (UTF-16 name in the entry): the only window, C:
 TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
@@ -425,25 +712,36 @@ TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
 		}
 	TUint64 entries = *(TUint64*)(s + 72);
 	TUint32 n = *(TUint32*)(s + 80), size = *(TUint32*)(s + 84);
-	TInt found = 0;
-	TUint64 first = 0, last = 0;
+	for (TInt p = 0; p < KParts; ++p)
+		Parts[p].iFound = 0;
 	for (TUint32 i = 0; i < n && size >= 128 && size <= KA64BlkSector; ++i)
 		{
 		TUint32 off = i * size;
 		if (off % KA64BlkSector == 0 && A64BlkDev_Read(entries + off / KA64BlkSector, 1, s) != KErrNone)
 			return KErrCorrupt;
 		const TUint8* e = s + off % KA64BlkSector;
-		static const char KName[] = "userdata";
-		TBool match = ETrue;
-		for (TInt c = 0; c < 9 && match; ++c)				// 8 letters and the terminating 0, as UTF-16
-			match = e[56 + 2 * c] == (TUint8)KName[c] && e[57 + 2 * c] == 0;
-		if (match)
+		for (TInt p = 0; p < KParts; ++p)
 			{
-			++found;
-			first = *(const TUint64*)(e + 32);
-			last = *(const TUint64*)(e + 40);
+			const char* name = Parts[p].iName;
+			TBool match = ETrue;
+			for (TInt c = 0; match; ++c)					// the letters and the terminating 0, as UTF-16
+				{
+				match = e[56 + 2 * c] == (TUint8)name[c] && e[57 + 2 * c] == 0;
+				if (!name[c])
+					break;
+				}
+			if (match && ++Parts[p].iFound == 1)
+				{
+				Parts[p].iFirst = *(const TUint64*)(e + 32);
+				Parts[p].iLast = *(const TUint64*)(e + 40);
+				}
 			}
 		}
+	for (TInt p = 1; p < KParts; ++p)
+		Log("allow-list: %s %d..%d (found %d), %s", Parts[p].iName, (TInt)Parts[p].iFirst, (TInt)Parts[p].iLast,
+			Parts[p].iFound, Parts[p].iWritable ? "writable" : "not enabled");
+	const TInt found = Parts[0].iFound;
+	const TUint64 first = Parts[0].iFirst, last = Parts[0].iLast;
 	const TUint64 cFirst = (first + KAlign - 1) / KAlign * KAlign;
 	if (found != 1 || last < cFirst || last >= aSectors)
 		{

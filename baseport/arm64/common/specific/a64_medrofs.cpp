@@ -8,7 +8,8 @@
 //     GPT partition system_a, chunk by chunk where it differs, each written chunk read back and compared (FS4b);
 //   - its first 4 KB only (ROFS=flash): from system_a, and only if system_a starts with exactly that header -- the
 //     ROFS this core was built with, never another build's.
-// Shaped like a64_medblk.cpp: a fixed-media driver for ELOCD, synchronous in the caller's thread.
+// Shaped like a64_medblk.cpp, but on its own DFC queue: a64_medverity.cpp (FS5a) sits on top of it and sends it
+// requests through its message queue, so success is KErrCompletion here (KErrNone would mean "pending").
 #include "locmedia.h"
 #include "platform.h"
 #include "a64_blk.h"
@@ -75,6 +76,7 @@ TInt DPhysicalDeviceMediaRofs::Create(DBase*& aChannel, TInt aMediaId, const TDe
 	if (!d)
 		return KErrNoMemory;
 	d->SetTotalSizeInBytes(ImageSize());
+	d->OpenMediaDriverComplete(KErrNone);				// a DFC-queued media: the open completes here
 	return KErrNone;
 	}
 
@@ -84,7 +86,7 @@ TInt DMediaDriverRofs::PartitionInfo(TPartitionInfo& aInfo)
 	aInfo.iEntry[0].iPartitionBaseAddr = 0;
 	aInfo.iEntry[0].iPartitionLen = aInfo.iMediaSizeInBytes = ImageSize();
 	aInfo.iEntry[0].iPartitionType = KPartitionTypeRofs;
-	return KErrNone;
+	return KErrCompletion;
 	}
 
 // [aPos, aPos + aLen) of the image from system_a, in whole sectors through the bounce buffer
@@ -127,17 +129,22 @@ TInt DMediaDriverRofs::Request(TLocDrvRequest& m)
 		caps.iSize = ImageSize();
 		caps.iBlockSize = KA64BlkSector;
 		SetTotalSizeInBytes(caps);
-		return KErrNone;
+		return KErrCompletion;
 		}
 	case DLocalDrive::ERead:
 		{
 		const Int64 pos = m.Pos(), len = m.Length();
 		if (pos < 0 || len < 0 || pos + len > ImageSize())
 			return KErrArgument;
+		TInt r;
 		if (!InRam())
-			return ReadFlash(m, pos, len);
-		TPtrC8 des(__urofs_base + (TInt)pos, (TInt)len);
-		return m.WriteRemote(&des, 0);
+			r = ReadFlash(m, pos, len);
+		else
+			{
+			TPtrC8 des(__urofs_base + (TInt)pos, (TInt)len);
+			r = m.WriteRemote(&des, 0);
+			}
+		return r == KErrNone ? KErrCompletion : r;
 		}
 	case DLocalDrive::EWrite:
 	case DLocalDrive::EFormat:
@@ -186,6 +193,8 @@ DECLARE_EXTENSION_PDD()
 
 static const TInt DriveNumbers[1] = { 2 };				// local drive 2: estart.txt's FS_COMPOSITE line
 
+static TDfcQue DfcQ;									// the media's thread ("MedRofsQ")
+
 DECLARE_STANDARD_EXTENSION()
 	{
 	if (!ImageSize())
@@ -222,5 +231,11 @@ DECLARE_STANDARD_EXTENSION()
 	DPrimaryMediaBase* pm = new DPrimaryMediaBase;
 	if (!pm)
 		return KErrNoMemory;
+	_LIT(KThreadName, "MedRofsQ");
+	r = Kern::DfcQInit(&DfcQ, 24, &KThreadName);
+	if (r != KErrNone)
+		return r;
+	pm->iDfcQ = &DfcQ;
+	pm->iMsgQ.Receive();
 	return LocDrv::RegisterMediaDevice(KMediaDevice, 1, &DriveNumbers[0], pm, 1, KDriveName);
 	}

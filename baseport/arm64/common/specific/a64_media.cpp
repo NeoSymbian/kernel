@@ -17,6 +17,8 @@ TInt InitExtension_medblk();
 DPhysicalDevice* CreatePhysicalDevice_medblk();
 TInt InitExtension_medrofs();
 DPhysicalDevice* CreatePhysicalDevice_medrofs();
+TInt InitExtension_medverity();
+DPhysicalDevice* CreatePhysicalDevice_medverity();
 extern "C" TUint8 __urofs_base[], __urofs_end[];		// ekern.lds: the ROFS image, empty without ROFS=1
 
 void A64StartMedia()
@@ -39,5 +41,10 @@ void A64StartMedia()
 		if (r == KErrNone)
 			r = InitExtension_medrofs();
 		Kern::Printf("[media] ROFS image (%d KB) = local drive 2 -> %d", (TInt)((__urofs_end - __urofs_base) >> 10), r);
+		pd = CreatePhysicalDevice_medverity();			// FS5a: every ROFS read checked against boot.img's hashes
+		r = pd ? Kern::InstallPhysicalDevice(pd) : KErrNoMemory;
+		if (r == KErrNone)
+			r = InitExtension_medverity();
+		Kern::Printf("[media] ROFS hash check on local drive 2 -> %d", r);
 		}
 	}

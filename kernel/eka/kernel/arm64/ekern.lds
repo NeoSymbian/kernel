@@ -110,9 +110,16 @@ SECTIONS
 		KEEP(*(.urofs))
 		__urofs_end = .;
 		}
+	/* SHA-256 of each 4 KB block of the ROFS image (docs/filesystem.md FS5a; a64_medverity.cpp). Empty without ROFS. */
+	.urofshash ALIGN(__urofs_end, 0x1000) : AT(__rom_phys + (ALIGN(__urofs_end, 0x1000) - __rom_lin))
+		{
+		__urofs_hash = .;
+		KEEP(*(.urofshash))
+		__urofs_hash_end = .;
+		}
 	__urofs_size = __urofs_end - __urofs_base;
-	__rom_size = (__urofs_size ? __urofs_end : __uimage_size ? __uimage_end : __data_load + SIZEOF(.data))
-		- __rom_lin;																/* bytes of ROM loaded */
+	__rom_size = (__urofs_hash_end != __urofs_hash ? __urofs_hash_end : __urofs_size ? __urofs_end
+		: __uimage_size ? __uimage_end : __data_load + SIZEOF(.data)) - __rom_lin;	/* bytes of ROM loaded */
 	__image_size = ALIGN(__rom_phys + __rom_size - _start, 0x1000);	/* boot.S Image header */
 
 	/DISCARD/ : { *(.note*) *(.comment) *(.eh_frame*) }

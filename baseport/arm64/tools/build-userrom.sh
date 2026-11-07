@@ -96,6 +96,18 @@ if [ "$ROFS" != 0 ]; then
 	(cd "$OUT/user" && rofsbuild rofs.oby > rofsbuild.log 2>&1) || { echo "rofsbuild FAILED:"; tail -15 "$OUT/user/rofsbuild.log"; exit 1; }
 	! grep -E "WARNING|ERROR" "$OUT/user/rofsbuild.log" || { echo "rofsbuild: warnings (an image it refused?)"; exit 1; }
 	echo "rofs.img: $(wc -c < "$OUT/user/rofs.img") bytes"
+	# FS5a: SHA-256 of each 4 KB block (the last one zero-padded) for a64_medverity.cpp. VERITY_BAD=N spoils block N's
+	# hash, to test that a changed block is caught.
+	python3 -I - "$OUT/user/rofs.img" "$OUT/user/rofs.hash" "${VERITY_BAD:-}" <<'PY'
+import hashlib, sys
+img = open(sys.argv[1], "rb").read()
+img += bytes(-len(img) % 4096)
+table = bytearray(b"".join(hashlib.sha256(img[i:i + 4096]).digest() for i in range(0, len(img), 4096)))
+if sys.argv[3]:
+    table[int(sys.argv[3]) * 32] ^= 0xff
+open(sys.argv[2], "wb").write(table)
+print("rofs.hash: %d blocks%s" % (len(table) // 32, ", block %s spoilt (VERITY_BAD)" % sys.argv[3] if sys.argv[3] else ""))
+PY
 fi
 # EXE data/bss run at the bottom of the local data area; ROM DLL data under the ARM flexible model's 0x7f000000
 python3 -I "$HERE/tools/rombuild.py" --section "$BASE" --data-top 0x7f000000 --exe-data-base 0x00400000 \

@@ -56,6 +56,9 @@ $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medblk -DKernelModuleE
 $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medrofs -DKernelModuleEntry=KernelModuleEntry_medrofs \
 	-DCreatePhysicalDevice=CreatePhysicalDevice_medrofs ${ROFS_INSTALL:+-DA64_ROFS_INSTALL} \
 	-c "$BSP/common/specific/a64_medrofs.cpp" -o "$I/a64_medrofs.o"
+$EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medverity -DKernelModuleEntry=KernelModuleEntry_medverity \
+	-DCreatePhysicalDevice=CreatePhysicalDevice_medverity -I "$EKA/include/kernel" \
+	-c "$BSP/common/specific/a64_medverity.cpp" -o "$I/a64_medverity.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_blk.cpp" -o "$I/a64_blk.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$BSP/common/specific/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_display.cpp" -o "$I/a64_display.o"
@@ -89,6 +92,8 @@ if [ "${USERSIDE:-1}" != 0 ]; then
 	1)		printf '\t.section .urofs, "a"\n\t.incbin "%s"\n' "$OUT/user/rofs.img" > "$I/urofs.S" ;;
 	flash)	printf '\t.section .urofs, "a"\n\t.incbin "%s", 0, 4096\n' "$OUT/user/rofs.img" > "$I/urofs.S" ;;
 	esac
+	# FS5a: the per-block hashes ride in boot.img, the root of trust (a64_medverity.cpp checks every ROFS read)
+	[ "${ROFS:-0}" = 0 ] || printf '\t.section .urofshash, "a"\n\t.incbin "%s"\n' "$OUT/user/rofs.hash" >> "$I/urofs.S"
 	[ "${ROFS:-0}" = 0 ] || $AS "$I/urofs.S" -o "$I/urofs.o"
 fi
 [ -n "$FONT" ] && python3 "$HERE/tools/mkfont.py" "$I/font.h" >/dev/null

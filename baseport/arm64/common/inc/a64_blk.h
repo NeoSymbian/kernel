@@ -20,6 +20,8 @@ TUint32 A64BlkDev_EraseBlock();
 // tell the device a range no longer holds data (eMMC TRIM; weak default: nothing to do). Advisory: KErrNone even if
 // the device failed it (FAT's DeleteNotify faults the file server on an error)
 TInt A64BlkDev_Discard(TUint64 aLba, TInt aCount);
+// a GPT partition of the allow-list by name (weak default: KErrNotFound): [aFirst, aFirst + aCount) on the device
+TInt A64BlkDev_Partition(const char* aName, TUint64& aFirst, TUint64& aCount);
 
 // ---- the window
 TInt A64Blk_Start();										// backend init + the board's window

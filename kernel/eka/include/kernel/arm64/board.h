@@ -39,5 +39,7 @@ extern const unsigned long A64_FbPhys;
 extern const int A64_FbWidth, A64_FbHeight, A64_FbStride;
 // The user side has taken the top aPixels rows of the screen: the kernel's own screen console keeps below them
 void A64_ConsoleReserveTop(int aPixels);
+void A64_ConsoleShow(int aOn);			// the on-screen kernel console in dev mode (weak default: nothing)
+int A64_ConsoleShown();
 }
 #endif

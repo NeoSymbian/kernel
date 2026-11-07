@@ -25,7 +25,7 @@ ARGS=$OUT/user/rombuild.args
 # section takes its layout from its own options)
 ROFS=${ROFS:-0}
 ESTART=$HERE/common/estart.txt
-if [ "$ROFS" = 1 ]; then	# local drive 2 = the ROFS image (a64_medrofs.cpp), added to Z: by the composite file system
+if [ "$ROFS" != 0 ]; then	# local drive 2 = the ROFS image (a64_medrofs.cpp), added to Z: by the composite file system
 	cat "$ESTART" - > "$OUT/user/estart.txt" <<'TXT'
 Z:  2  EROFS   ROFS  0       FS_COMPOSITE                       # the ROFS part of Z: (docs/filesystem.md FS4a)
 TXT
@@ -34,7 +34,7 @@ fi
 python3 -I - "$SRCARGS" "$S2010" "$ESTART" "$ARGS" "${USERROM_SKIP-}" "$ROFS" "$HERE/tools" "$OUT/user/rofs.oby" <<'PY'
 import os, re, sys
 src, root, estart, out = sys.argv[1:5]
-rofs, tools, oby = sys.argv[6] == "1", sys.argv[7], sys.argv[8]
+rofs, tools, oby = sys.argv[6] != "0", sys.argv[7], sys.argv[8]
 words = [w.rstrip("\n") for w in open(src) if w.strip()]
 res, n = [], 0
 # estart starts SYSSTART.EXE (neoui, the Rust UI) in preference to EWSRV.EXE (the window server -> eshell); leaving
@@ -73,7 +73,10 @@ if rofs:
             if dep and dep not in core:
                 core.add(dep)
                 todo.append(dep)
-    keep, lines = [], ["rofsname=" + os.path.join(os.path.dirname(oby), "rofs.img"), "rofssize=0x4000000"]
+    # a fixed time: the image (its header) depends only on its content, so a core-only build (ROFS=flash) matches the
+    # ROFS a ROFS_INSTALL build wrote to system_a (a64_medrofs.cpp compares the headers)
+    keep, lines = [], ["rofsname=" + os.path.join(os.path.dirname(oby), "rofs.img"), "rofssize=0x4000000",
+                       "time=01/01/2026 00:00:00"]
     for o, v in pairs:
         z, _, path = v.partition("=")
         if z.lower() in core or z.lower() == r"sys\data\estart.txt":
@@ -84,11 +87,11 @@ if rofs:
             lines.append("file=%s %s capability=All" % (path, z) if o == "--xip" else "data=%s %s" % (path, z))
     res = keep
     open(oby, "w").write("\n".join(lines) + "\n")
-    print("ROFS split: %d in the core ROM, %d in the ROFS" % (len(keep) // 2, len(lines) - 2))
+    print("ROFS split: %d in the core ROM, %d in the ROFS" % (len(keep) // 2, len(lines) - 3))
 open(out, "w").write("\n".join(res) + "\n")
 print("user side: %d files from %s" % (n, src))
 PY
-if [ "$ROFS" = 1 ]; then
+if [ "$ROFS" != 0 ]; then
 	command -v rofsbuild >/dev/null || { echo "ROFS=1 needs rofsbuild (the toolchain image's host tools)"; exit 1; }
 	(cd "$OUT/user" && rofsbuild rofs.oby > rofsbuild.log 2>&1) || { echo "rofsbuild FAILED:"; tail -15 "$OUT/user/rofsbuild.log"; exit 1; }
 	! grep -E "WARNING|ERROR" "$OUT/user/rofsbuild.log" || { echo "rofsbuild: warnings (an image it refused?)"; exit 1; }

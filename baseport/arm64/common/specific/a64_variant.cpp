@@ -11,6 +11,7 @@
 #include <assp.h>
 #include <mmboot.h>
 #include "board.h"
+#include "a64_dbgmon.h"
 #include "a64_platform.h"
 
 const TInt KTickUs = 1000;			// system tick period: 1 ms, as every EKA2 port
@@ -44,11 +45,45 @@ public:
 	virtual TPtr8 MachineConfiguration()					{ return TPtr8((TUint8*)KMachineConfigLinAddr, 0x400, 0x400); }
 	};
 
+// NeoSymbian's own EHalGroupVariant functions, for the dev tools on the phone (docs/rust-integration.md "Dev tools"):
+//   ENeoHalLogRead     a1 = TUint32* cursor (in/out; 0 = the oldest kept), a2 = TDes8* -> this boot's kernel log
+//   ENeoHalLastLogRead a1 = TUint32* cursor (in/out; 0 = the start),      a2 = TDes8* -> the previous boot's (lastlog)
+//   ENeoHalConsoleSet  a1 = 1 on / 0 off -> the kernel log on screen (dev mode); ENeoHalConsoleGet a1 = TInt* out
+// Reading needs ReadDeviceData, switching the console WriteDeviceData. Each read fills at most 1024 bytes.
+enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet };
+
+static TInt LogToUser(TBool aLast, TAny* aCursor, TAny* aDes)
+	{
+	if (!Kern::CurrentThreadHasCapability(ECapabilityReadDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian log read")))
+		return KErrPermissionDenied;
+	TUint32 pos;
+	kumemget32(&pos, aCursor, sizeof(pos));
+	TBuf8<1024> b;
+	b.SetLength(aLast ? A64Log_LastRead(pos, (TUint8*)b.Ptr(), b.MaxLength())
+		: A64Log_Read(pos, (TUint8*)b.Ptr(), b.MaxLength()));
+	kumemput32(aCursor, &pos, sizeof(pos));
+	return Kern::ThreadDesWrite(&Kern::CurrentThread(), aDes, b, 0, KChunkShiftBy0, NULL);
+	}
+
 // EHalGroupVariant. EVariantHalVariantInfo is the one UserHal::MachineInfo() requires (us_exec.cpp); Phorepoc's shape
-TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny*)
+TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 	{
 	switch (aFunction)
 		{
+	case ENeoHalLogRead:
+	case ENeoHalLastLogRead:
+		return LogToUser(aFunction == ENeoHalLastLogRead, a1, a2);
+	case ENeoHalConsoleSet:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityWriteDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian console")))
+			return KErrPermissionDenied;
+		A64_ConsoleShow((TInt)a1);
+		return KErrNone;
+	case ENeoHalConsoleGet:
+		{
+		TInt on = A64_ConsoleShown();
+		kumemput32(a1, &on, sizeof(on));
+		return KErrNone;
+		}
 	case EVariantHalVariantInfo:
 		{
 		TVariantInfoV01Buf infoBuf;

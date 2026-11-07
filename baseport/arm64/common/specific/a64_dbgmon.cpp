@@ -72,6 +72,14 @@ void A64Log_Report()										// once at boot (the IO window is up by then)
 		Kern::Printf("[log] previous boot: %d bytes kept (lastlog)", LastLen);
 	}
 
+TInt A64Log_LastRead(TUint32& aPos, TUint8* aBuf, TInt aMax)	// the previous boot's log, from a cursor
+	{
+	TInt n = 0;
+	while (n < aMax && aPos < LastLen)
+		aBuf[n++] = LastLog[aPos++];
+	return n;
+	}
+
 TInt A64Log_Read(TUint32& aPos, TUint8* aBuf, TInt aMax)
 	{
 	TUint32 head = LogHead;
@@ -370,7 +378,13 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog peek poke spmi rpmh blk touch keys threads usb tap swipe key type shot reboot fastboot wdt");
+		Say("help log lastlog console peek poke spmi rpmh blk touch keys threads usb tap swipe key type shot reboot fastboot wdt");
+	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
+		{
+		if (argc >= 2)
+			A64_ConsoleShow(Eq(arg[1], "on"));
+		Say("console %s", A64_ConsoleShown() ? "on" : "off");
+		}
 	else if (Eq(c, "lastlog"))
 		{
 		if (LastLen)

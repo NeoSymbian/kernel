@@ -28,6 +28,7 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x00118000, 0x00001000, 1 },		// GCC: QUP wrapper 1 AHB + SE1 clock branches and RCG (a64_touch.cpp)
 	{ 0x00152000, 0x00001000, 1 },		// GCC: APCS clock branch enable vote 1
 	{ 0x00126000, 0x00001000, 1 },		// GCC: sdcc1 (eMMC) clock branches and RCG (qcom_sdhci.cpp)
+	{ 0x0010f000, 0x00001000, 1 },		// GCC: usb30_prim GDSC + master clock (qcom_dwc3_acm.cpp: is USB powered?)
 	{ 0x17980000, 0x00001000, 1 },		// APSS watchdog (a64_reboot.cpp: the reset fallback)
 	{ 0x00a84000, 0x00004000, 1 },		// GENI serial engine 1 of QUP wrapper 1: the touchscreen's I2C
 	{ 0x03906000, 0x00002000, 1 },		// TLMM north tile: gpio6, gpio7 (I2C SDA/SCL)
@@ -44,9 +45,10 @@ const SA64IoRegion A64_IoRegions[] = {
 										// the DTB's no-map framebuffer-region, kept by ABL across PSCI and watchdog resets
 	};
 const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
-// ABL's continuous-splash framebuffer: the user side gets the top 1800 rows, the kernel console the 360 below
+// ABL's continuous-splash framebuffer: all of it is the user side's; in dev mode the kernel console overlays its bottom
+// 360 rows (A64_ConsoleShow)
 const unsigned long A64_FbPhys = 0x9c000000;
-const int A64_FbWidth = 1080, A64_FbHeight = 1800, A64_FbStride = 4320;
+const int A64_FbWidth = 1080, A64_FbHeight = 2160, A64_FbStride = 4320;
 unsigned long A64_LastLogPhys() { return 0x9e3e0000; }
 }
 
@@ -57,6 +59,12 @@ static const int KCols = KFbW / FONT_W, KRows = KFbH / FONT_H;
 static const int KPinRows = 8;		// rows 1..8: pinned failure lines; the console scrolls in the rows below
 static int gCol, gRow;
 static int gFirstRow = 1 + KPinRows;	// the console scrolls from here down (A64_ConsoleReserveTop moves it)
+static const int KOverlayPixels = 360;	// dev mode: the console's rows at the bottom, over the user side's screen
+#ifndef A64_CONSOLE
+#define A64_CONSOLE 1
+#endif
+static int gConsoleOn = A64_CONSOLE;	// dev mode (build-ekern.sh CONSOLE=): draw the kernel log on screen
+static int gShared;						// the user side owns the screen: draw only in dev mode
 
 static void DrawGlyph(int aCol, int aRow, char c, TUint32 aFg, TUint32 aBg = 0xFF000000)
 	{
@@ -84,6 +92,8 @@ static void NewLine()
 extern "C" void A64_DebugPutc(char c)
 	{
 	static int started;
+	if (gShared && !gConsoleOn)
+		return;									// the log ring, lastlog and the USB console still get it
 	if (!started) { started = 1; gRow = gFirstRow; for (int r = 0; r <= gRow; ++r) ClearRow(r); }
 	if (c == '\r') return;
 	if (c == '\n') { NewLine(); return; }
@@ -105,9 +115,13 @@ extern "C" void A64_ConsoleStatus(const char* aTest, unsigned aLines, unsigned a
 		DrawGlyph(i, 0, buf[i], 0xFFFFE066, bg);
 	}
 
-// the full kernel's display driver gave the top of the screen to the user side: keep the kernel log below it
+// the full kernel's display driver gave the screen to the user side: in dev mode the kernel log overlays its bottom
+// rows (shortcut: drawn over the UI, which may draw over it in turn -- not a surface of its own)
 extern "C" void A64_ConsoleReserveTop(int aPixels)
 	{
+	gShared = 1;
+	if (aPixels > KFbH - KOverlayPixels)
+		aPixels = KFbH - KOverlayPixels;
 	int first = (aPixels + FONT_H - 1) / FONT_H;
 	if (first >= KRows - 2)
 		return;
@@ -117,6 +131,16 @@ extern "C" void A64_ConsoleReserveTop(int aPixels)
 	for (int r = first; r < KRows; ++r)
 		ClearRow(r);
 	}
+
+extern "C" void A64_ConsoleShow(int aOn)
+	{
+	gConsoleOn = aOn != 0;
+	if (gConsoleOn && gShared)
+		for (int r = gFirstRow; r < KRows; ++r)		// a clean strip to write into
+			ClearRow(r);
+	}
+
+extern "C" int A64_ConsoleShown() { return gConsoleOn; }
 
 extern "C" void A64_ConsolePin(int aSlot, const char* aText)
 	{

@@ -49,11 +49,11 @@ static TUint64 TrimSectors;
 static TUint32 EraseBytes;								// EXT_CSD HC_ERASE_GRP_SIZE, if it divides KAlign
 
 // the partitions a write may reach (docs/filesystem.md "allow-list"); found by GPT name, each exactly once.
-// system_* and vendor_* stay off until the owner approves writing them (gate G1, FS4b)
+// system_a holds Z:'s ROFS image (FS4b; gate G1 approved by the owner 2026-11-07); system_b and vendor_* stay off
 struct TPart { const char* iName; TBool iWritable; TInt iFound; TUint64 iFirst, iLast; };
 static TPart Parts[] =
 	{
-	{ "userdata", ETrue }, { "system_a", EFalse }, { "system_b", EFalse }, { "vendor_a", EFalse }, { "vendor_b", EFalse },
+	{ "userdata", ETrue }, { "system_a", ETrue }, { "system_b", EFalse }, { "vendor_a", EFalse }, { "vendor_b", EFalse },
 	};
 const TInt KParts = sizeof(Parts) / sizeof(Parts[0]);
 
@@ -610,6 +610,23 @@ static TInt DoInit(TUint64& aSectors)
 	}
 
 TUint32 A64BlkDev_EraseBlock() { return EraseBytes; }
+
+TInt A64BlkDev_Partition(const char* aName, TUint64& aFirst, TUint64& aCount)
+	{
+	for (TInt i = 0; i < KParts; ++i)
+		{
+		TInt n = 0;
+		while (aName[n] && aName[n] == Parts[i].iName[n])
+			++n;
+		if (aName[n] == 0 && Parts[i].iName[n] == 0 && Parts[i].iFound == 1)
+			{
+			aFirst = Parts[i].iFirst;
+			aCount = Parts[i].iLast - Parts[i].iFirst + 1;
+			return KErrNone;
+			}
+		}
+	return KErrNotFound;
+	}
 
 static void Fmt(TDes8& aOut, const char* aFmt, ...)
 	{

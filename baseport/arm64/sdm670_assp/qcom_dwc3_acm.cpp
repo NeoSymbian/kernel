@@ -437,6 +437,16 @@ static TDynamicDfcQue* UsbQ;
 
 void A64StartUsbConsole()
 	{
+	// ABL powers the USB controller only for fastboot: after a normal boot (the phone installed, boot_a) its power
+	// domain and clocks are off, and a DWC3 register access would stall the bus -- so look at them first (gcc-sdm845.c
+	// usb30_prim_gdsc 0xf004 PWR_ON bit 31, gcc_usb30_prim_master_clk 0xf00c CLK_OFF bit 31).
+	// shortcut: no console then; bringing the controller and its PHY up ourselves is a follow-up
+	const TUint32 gdsc = *(volatile TUint32*)A64_Io(0x0010f004), master = *(volatile TUint32*)A64_Io(0x0010f00c);
+	if (!(gdsc & (1u << 31)) || (master & (1u << 31)))
+		{
+		Kern::Printf("[usb] controller off (gdsc %08x, master clock %08x): a normal boot, no USB console", gdsc, master);
+		return;
+		}
 	TUint32 id = R(EGsnpsid);
 	Kern::Printf("[usb] DWC3 id %08x, ABL left dctl %08x dsts %08x dcfg %08x gctl %08x", id, R(EDctl), R(EDsts),
 		R(EDcfg), R(EGctl));

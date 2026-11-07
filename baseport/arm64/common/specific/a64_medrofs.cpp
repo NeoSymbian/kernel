@@ -207,13 +207,14 @@ DECLARE_STANDARD_EXTENSION()
 	if (!Bounce)
 		return KErrNoMemory;
 	TUint64 first = 0, count = 0;
-	TInt part = A64BlkDev_Partition("system_a", first, count);
+	const char* const system = A64Slot_Current() == 'b' ? "system_b" : "system_a";	// FS5b: the booted slot's
+	TInt part = A64BlkDev_Partition(system, first, count);
 	if (InRam())
 		{
 #ifdef A64_ROFS_INSTALL
 		TInt written = 0;
 		r = part == KErrNone ? Install(first, count, written) : part;
-		Kern::Printf("[media] ROFS -> system_a: %d KB written, verified -> %d", written >> 10, r);
+		Kern::Printf("[media] ROFS -> %s: %d KB written, verified -> %d", system, written >> 10, r);
 #endif
 		}
 	else
@@ -222,7 +223,7 @@ DECLARE_STANDARD_EXTENSION()
 		r = part == KErrNone ? A64BlkDev_Read(first, KHeader / KA64BlkSector, Bounce) : part;
 		if (r == KErrNone && memcompare(Bounce, KHeader, __urofs_base, KHeader) != 0)
 			r = KErrCorrupt;
-		Kern::Printf("[media] ROFS from system_a (%d KB): %s -> %d", ImageSize() >> 10,
+		Kern::Printf("[media] ROFS from %s (%d KB): %s -> %d", system, ImageSize() >> 10,
 			r == KErrNone ? "this build's" : r == KErrCorrupt ? "another build's, not used" : "not readable", r);
 		if (r != KErrNone)
 			return KErrNone;								// Z: is the core ROM alone; estart's ROFS line finds no drive

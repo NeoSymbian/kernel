@@ -49,11 +49,13 @@ static TUint64 TrimSectors;
 static TUint32 EraseBytes;								// EXT_CSD HC_ERASE_GRP_SIZE, if it divides KAlign
 
 // the partitions a write may reach (docs/filesystem.md "allow-list"); found by GPT name, each exactly once.
-// system_a holds Z:'s ROFS image (FS4b; gate G1 approved by the owner 2026-11-07); system_b and vendor_* stay off
+// system_a/_b hold Z:'s ROFS image, one per A/B slot (FS4b, gate G1 approved by the owner 2026-11-07; system_b for
+// FS5b 2026-11-08: ABL refuses to flash system_* outside fastbootd, so the ROFS installer image writes the booted
+// slot's); vendor_* stay off
 struct TPart { const char* iName; TBool iWritable; TInt iFound; TUint64 iFirst, iLast; };
 static TPart Parts[] =
 	{
-	{ "userdata", ETrue }, { "system_a", ETrue }, { "system_b", EFalse }, { "vendor_a", EFalse }, { "vendor_b", EFalse },
+	{ "userdata", ETrue }, { "system_a", ETrue }, { "system_b", ETrue }, { "vendor_a", EFalse }, { "vendor_b", EFalse },
 	};
 const TInt KParts = sizeof(Parts) / sizeof(Parts[0]);
 
@@ -279,11 +281,27 @@ static TBool WriteAllowed(TUint64 aLba, TInt aCount)
 	return KWritable && p && p->iWritable;
 	}
 
+static TInt RawWrite(TUint64 aLba, TInt aCount, const TUint8* aBuf);
+
 TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
 	{
 	// a second check under a64_blk.cpp's window: only an enabled partition of the allow-list, whoever asks
 	if (!WriteAllowed(aLba, aCount))
 		return KErrAccessDenied;
+	return RawWrite(aLba, aCount, aBuf);
+	}
+
+// FS5b (gate G3, approved 2026-11-07): qcom_bootctrl.cpp's slot attribute update. One sector, and only the GPT's own:
+// the primary header + entry array (LBA 1..33) or the backup's (the disk's last 33 sectors)
+TInt A64BlkDev_WriteGpt(TUint64 aLba, const TUint8* aSector)
+	{
+	if (!KWritable || !Sectors || !((aLba >= 1 && aLba <= 33) || (aLba >= Sectors - 33 && aLba < Sectors)))
+		return KErrAccessDenied;
+	return RawWrite(aLba, 1, aSector);
+	}
+
+static TInt RawWrite(TUint64 aLba, TInt aCount, const TUint8* aBuf)
+	{
 	TLock lock;
 	if (!Rca || aLba + aCount > Sectors)
 		return KErrArgument;

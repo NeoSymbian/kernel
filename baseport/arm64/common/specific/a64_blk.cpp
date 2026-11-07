@@ -11,6 +11,11 @@ __attribute__((weak)) TInt A64BlkDev_Write(TUint64, TInt, const TUint8*) { retur
 __attribute__((weak)) TUint32 A64BlkDev_EraseBlock() { return 0; }
 __attribute__((weak)) TInt A64BlkDev_Discard(TUint64, TInt) { return KErrNone; }
 __attribute__((weak)) TInt A64BlkDev_Partition(const char*, TUint64&, TUint64&) { return KErrNotFound; }
+__attribute__((weak)) TInt A64BlkDev_WriteGpt(TUint64, const TUint8*) { return KErrNotSupported; }
+__attribute__((weak)) TInt A64Slot_Current() { return 'a'; }
+__attribute__((weak)) void A64Slot_Show(TDes8& aOut) { aOut.Append((const TUint8*)"no A/B slots", 12); }
+__attribute__((weak)) TInt A64Slot_MarkOk(TBool, TDes8& aOut) { A64Slot_Show(aOut); return KErrNotSupported; }
+__attribute__((weak)) void A64Slot_BootDry(TDes8& aOut) { A64Slot_Show(aOut); }
 __attribute__((weak)) TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
 	{
 	aFirst = 0;

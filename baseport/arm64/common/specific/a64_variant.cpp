@@ -12,6 +12,7 @@
 #include <mmboot.h>
 #include "board.h"
 #include "a64_dbgmon.h"
+#include "a64_blk.h"
 #include "a64_platform.h"
 
 const TInt KTickUs = 1000;			// system tick period: 1 ms, as every EKA2 port
@@ -49,8 +50,11 @@ public:
 //   ENeoHalLogRead     a1 = TUint32* cursor (in/out; 0 = the oldest kept), a2 = TDes8* -> this boot's kernel log
 //   ENeoHalLastLogRead a1 = TUint32* cursor (in/out; 0 = the start),      a2 = TDes8* -> the previous boot's (lastlog)
 //   ENeoHalConsoleSet  a1 = 1 on / 0 off -> the kernel log on screen (dev mode); ENeoHalConsoleGet a1 = TInt* out
-// Reading needs ReadDeviceData, switching the console WriteDeviceData. Each read fills at most 1024 bytes.
-enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet };
+//   ENeoHalBootOk      no arguments -> mark the booted A/B slot "successful" for ABL (FS5b; neoui calls it once the
+//                      launcher is drawn). KErrNone if done or already set; KErrNotSupported without A/B slots
+// Reading needs ReadDeviceData, switching the console and ENeoHalBootOk WriteDeviceData. Each read fills at most
+// 1024 bytes. 0x4e04/0x4e05 are kept for the dev-mode switch.
+enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalBootOk = 0x4e06 };
 
 static TInt LogToUser(TBool aLast, TAny* aCursor, TAny* aDes)
 	{
@@ -78,6 +82,13 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 			return KErrPermissionDenied;
 		A64_ConsoleShow((TInt)a1);
 		return KErrNone;
+	case ENeoHalBootOk:
+		{
+		if (!Kern::CurrentThreadHasCapability(ECapabilityWriteDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian boot OK")))
+			return KErrPermissionDenied;
+		TBuf8<800> b;
+		return A64Slot_MarkOk(EFalse, b);
+		}
 	case ENeoHalConsoleGet:
 		{
 		TInt on = A64_ConsoleShown();

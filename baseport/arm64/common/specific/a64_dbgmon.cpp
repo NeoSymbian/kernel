@@ -6,7 +6,7 @@
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel)
-//   blk info | blk gpt | blk read <lba> [n] | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2>
+//   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2>
 //   key <scancode> | type <text> | shot | reboot | fastboot
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
@@ -378,7 +378,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console peek poke spmi rpmh blk touch keys threads usb tap swipe key type shot reboot fastboot wdt");
+		Say("help log lastlog console peek poke spmi rpmh blk slot touch keys threads usb tap swipe key type shot reboot fastboot wdt");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -442,6 +442,18 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		}
 	else if (Eq(c, "blk"))
 		Blk(argc, arg, num);
+	else if (Eq(c, "slot"))								// FS5b: slot | slot ok dry | slot ok
+		{
+		TBuf8<800> b;									// past Say's 256 bytes: written as it is
+		if (argc >= 2 && Eq(arg[1], "ok"))
+			A64Slot_MarkOk(!(argc >= 3 && Eq(arg[2], "now")), b);	// "slot ok" is the dry run; "slot ok now" writes
+		else if (argc >= 2 && Eq(arg[1], "boot"))
+			A64Slot_BootDry(b);							// what an install image's boot-time try count would write
+		else
+			A64Slot_Show(b);
+		b.Append('\n');
+		Write(b.Ptr(), b.Length());
+		}
 	else if (Eq(c, "touch"))
 		A64TouchDump();
 	else if (Eq(c, "keys"))

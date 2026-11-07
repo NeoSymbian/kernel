@@ -64,8 +64,33 @@ static void AutoTimerFn(TAny*) { AutoDfc.Add(); }
 static NTimer AutoTimer(AutoTimerFn, NULL);
 #endif
 
+// a normal restart: ABL boots the active slot (qcom_bootctrl.cpp switches slots this way). Thread context
+void A64_RebootNormal()
+	{
+	TInt old = Spmi_Read(0, KPonSoftRbSpare);
+	TInt r = Spmi_Write(0, KPonSoftRbSpare, (old < 0 ? 0 : old) & 1);
+	Kern::Printf("[reboot] normal restart (reason write -> %d)", r);
+	A64_WatchdogBite(2000);								// if PSCI can't reset
+	A64_Psci(KPsciSystemReset, 0, 0, 0);
+	}
+
+// a kernel fault (NotifyCrash, interrupts off): register writes only. The bite restarts the phone 10 s later -- time
+// to read the FAULT on screen -- and ABL then boots the active slot normally (an install image cleared the reason at
+// boot), counting a failed try on a slot not yet marked successful: the FS5b rollback. Test images keep petting the
+// watchdog from the other CPUs and stay on the screen until AUTOFASTBOOT.
+extern "C" void A64_CrashReset()
+	{
+	A64_WatchdogBite(10000);
+	}
+
 void A64StartReboot()
 	{
+#ifndef A64_AUTOFASTBOOT
+	// an install image: a restart (crash or reset) is a normal boot again, whatever a test image left in the reason
+	TInt old = Spmi_Read(0, KPonSoftRbSpare);
+	TInt r = old < 0 ? old : Spmi_Write(0, KPonSoftRbSpare, old & 1);
+	Kern::Printf("[reboot] reason cleared (was %02x) -> %d", old < 0 ? 0 : old, r);
+#endif
 #ifdef A64_AUTOFASTBOOT
 	AutoDfc.SetDfcQ(Kern::DfcQue0());
 	AutoTimer.OneShot(NKern::TimerTicks(A64_AUTOFASTBOOT * 1000));

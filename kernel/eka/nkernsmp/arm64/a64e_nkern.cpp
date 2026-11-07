@@ -84,6 +84,7 @@ void NKern::NotifyCrash(const TAny* /*a0*/, TInt /*a1*/)
 	A64_DebugPuts(" thread "); A64_DebugHex((TLinAddr)NKern::CurrentThread());
 	A64_DebugPuts(" from "); A64_DebugHex(lr);
 	A64_DebugPuts("\n");
+	A64_CrashReset();				// the Pixel: a watchdog restart, so ABL can count a failed boot (FS5b)
 	for (;;) { __asm__ __volatile__("msr daifset, #3\n\twfi"); }
 	}
 

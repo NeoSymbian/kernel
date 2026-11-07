@@ -41,5 +41,6 @@ extern const int A64_FbWidth, A64_FbHeight, A64_FbStride;
 void A64_ConsoleReserveTop(int aPixels);
 void A64_ConsoleShow(int aOn);			// the on-screen kernel console in dev mode (weak default: nothing)
 int A64_ConsoleShown();
+void A64_CrashReset();				// after a kernel fault (NotifyCrash): the board may arrange a restart (weak default: halt)
 }
 #endif

@@ -35,4 +35,5 @@ __attribute__((weak)) void A64_ConsolePin(int, const char*) {}
 __attribute__((weak)) void A64_ConsoleReserveTop(int) {}		// serial consoles share nothing
 __attribute__((weak)) void A64_ConsoleShow(int) {}
 __attribute__((weak)) int A64_ConsoleShown() { return 0; }
+__attribute__((weak)) void A64_CrashReset() {}
 }

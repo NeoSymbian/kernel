@@ -7,11 +7,12 @@
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel)
 //   blk info | blk gpt | blk read <lba> [n] | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2>
-//   key <scancode> | shot | reboot | fastboot
+//   key <scancode> | type <text> | shot | reboot | fastboot
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
 #include <kernel/kern_priv.h>
 #include <mmboot.h>
+#include <e32keys.h>
 #include "board.h"
 #include "a64_blk.h"
 #include "a64_dbgmon.h"
@@ -82,6 +83,66 @@ TInt A64Log_Read(TUint32& aPos, TUint8* aBuf, TInt aMax)
 	return n;
 	}
 
+// ---- keys: ASCII -> EPOC standard scan codes (EKDATA translates them, as a real keyboard's)
+// ASCII -> (standard scan code, shift); 0 = no key
+static TInt ScanCode(TUint8 aChar, TBool& aShift)
+	{
+	aShift = EFalse;
+	if (aChar >= 'a' && aChar <= 'z')
+		return aChar - 'a' + 'A';
+	if (aChar >= 'A' && aChar <= 'Z')
+		{
+		aShift = ETrue;
+		return aChar;
+		}
+	if (aChar >= '0' && aChar <= '9')
+		return aChar;
+	switch (aChar)
+		{
+	case '\r': case '\n':	return EStdKeyEnter;
+	case 0x08: case 0x7f:	return EStdKeyBackspace;
+	case 0x1b:				return EStdKeyEscape;
+	case ' ':				return EStdKeySpace;
+	case '.':				return EStdKeyFullStop;
+	case ',':				return EStdKeyComma;
+	case '/':				return EStdKeyForwardSlash;
+	case '\\':				return EStdKeyBackSlash;
+	case ';':				return EStdKeySemiColon;
+	case '-':				return EStdKeyMinus;
+	case '=':				return EStdKeyEquals;
+	case ':':	aShift = ETrue;	return EStdKeySemiColon;
+	case '_':	aShift = ETrue;	return EStdKeyMinus;
+	case '?':	aShift = ETrue;	return EStdKeyForwardSlash;
+	case '*':	aShift = ETrue;	return '8';
+	default:				return 0;
+		}
+	}
+
+static void PostKey(TRawEvent::TType aType, TInt aScanCode)
+	{
+	TRawEvent e;
+	e.Set(aType, aScanCode);
+	while (Kern::AddEvent(e) == KErrOverflow)			// the window server will drain the queue
+		NKern::Sleep(1);
+	}
+
+// one character as a key press, paced like typing (a64_serialkbd.cpp on QEMU, the monitor's "type")
+void A64Key_Type(TUint8 aChar)
+	{
+	TBool shift;
+	TInt code = ScanCode(aChar, shift);
+	if (!code)
+		return;
+	if (shift)
+		PostKey(TRawEvent::EKeyDown, EStdKeyLeftShift);
+	PostKey(TRawEvent::EKeyDown, code);
+	NKern::Sleep(10);								// a key is held a little, and keys come apart, as typed:
+	PostKey(TRawEvent::EKeyUp, code);				// a burst of a whole pasted line overruns the window
+	if (shift)										// server's queue for the console (eshell then stalls)
+		PostKey(TRawEvent::EKeyUp, EStdKeyLeftShift);
+	NKern::Sleep(20);
+	}
+
 // ---- output to the current transport
 static TMonWrite Out;
 
@@ -126,6 +187,7 @@ __attribute__((weak)) void A64_RebootToFastboot() { Say("fastboot: not on this b
 __attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
 __attribute__((weak)) void A64_WatchdogBite(TInt) { Say("wdt: not on this board"); }
 __attribute__((weak)) TInt A64BlkDev_Probe() { return KErrNotSupported; }
+__attribute__((weak)) TInt A64BlkDev_SelfTest() { return KErrNotSupported; }
 __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
 __attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((const TUint8*)"rpmh: not on this board", 23); }
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
@@ -186,6 +248,12 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		XTRAP(x, XT_DEFAULT, r = A64BlkDev_Probe());		// an aborting register shows as -38, not a crash
 		Say("blk init -> %d (trap %d; see 'log' for the steps)", r, x);
 		}
+	else if (aArgc >= 2 && Eq(aArg[1], "wtest"))			// writable builds: write/compare at the window's end, then
+		{													// clear its start and end for a fresh format
+		TInt r = KErrNone, x;
+		XTRAP(x, XT_DEFAULT, r = A64BlkDev_SelfTest());
+		Say("blk wtest -> %d (trap %d; see 'log')", r, x);
+		}
 	else if (aArgc >= 2 && Eq(aArg[1], "info"))
 		{
 		A64BlkDump();
@@ -240,7 +308,7 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 			}
 		}
 	else
-		Say("blk init | blk info | blk gpt | blk read <lba> [n]");
+		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk wtest");
 	}
 
 static void Post(TRawEvent::TType aType, TInt aX, TInt aY)
@@ -290,7 +358,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog peek poke spmi rpmh blk touch keys threads usb tap swipe key shot reboot fastboot wdt");
+		Say("help log lastlog peek poke spmi rpmh blk touch keys threads usb tap swipe key type shot reboot fastboot wdt");
 	else if (Eq(c, "lastlog"))
 		{
 		if (LastLen)
@@ -379,6 +447,14 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		NKern::Sleep(NKern::TimerTicks(30));
 		e.Set(TRawEvent::EKeyUp, (TInt)num[1]);
 		Kern::AddEvent(e);
+		}
+	else if (Eq(c, "type") && argc >= 2)				// the rest of the line as typed keys, then Enter
+		{
+		TPtrC8 text = aLine.Mid(aLine.Find(arg[1]));
+		for (TInt i = 0; i < text.Length(); ++i)
+			A64Key_Type(text[i]);
+		A64Key_Type('\r');
+		Say("typed %d chars", text.Length());
 		}
 	else if (Eq(c, "wdt"))
 		{

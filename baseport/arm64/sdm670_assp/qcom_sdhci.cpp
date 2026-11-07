@@ -27,11 +27,19 @@ enum { EModeDma = 1 << 0, EModeCount = 1 << 1, EModeAutoCmd12 = 1 << 2, EModeRea
 enum { ERespR1 = 0x1a, ERespR1Data = 0x3a };			// 48-bit response, CRC + index check (+ data present)
 const TInt KSpin = 2000000;							// ~0.2 s of register reads: fail fast, never stall boot
 
+// EMMC_C=1: C: is the window at boot; EMMC_C=2: writes allowed, but only the monitor touches the eMMC (C: stays
+// the RAM drive); unset: read-only
 #ifdef A64_EMMC_C
 const TBool KWritable = ETrue;
+const TBool KBootDrive = A64_EMMC_C == 1;
 #else
 const TBool KWritable = EFalse;
+const TBool KBootDrive = EFalse;
 #endif
+// C: = the first 2000 MB of userdata: ELOCAL.FSY is still the old sfat (FAT12/16), whose 32 KB clusters top out
+// just under 2 GB (docs/filesystem.md). shortcut: grows to 4-8 GB (FAT32) with FS1's sfat32
+const TUint64 KCSectors = (2000ull << 20) / KA64BlkSector;
+static TUint64 WinFirst, WinCount;						// the window, once the GPT is read: the only writable range
 
 static TUint32 Rca;
 static TUint64 Sectors;
@@ -211,7 +219,8 @@ TInt A64BlkDev_Read(TUint64 aLba, TInt aCount, TUint8* aBuf)
 
 TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
 	{
-	if (!KWritable)
+	// a second check under a64_blk.cpp's: nothing outside the window userdata gave, whoever asks
+	if (!KWritable || !WinCount || aCount <= 0 || aLba < WinFirst || aLba + aCount > WinFirst + WinCount)
 		return KErrAccessDenied;
 	if (!Rca || aLba + aCount > Sectors)
 		return KErrArgument;
@@ -327,7 +336,7 @@ static TInt DoInit(TUint64& aSectors);
 // at boot only in the EMMC_C build; else the monitor's "blk init" (a hang then stops only the console's thread)
 TInt A64BlkDev_Init(TUint64& aSectors)
 	{
-	if (!KWritable)
+	if (!KBootDrive)
 		return KErrNotSupported;
 	return DoInit(aSectors);
 	}
@@ -432,9 +441,39 @@ TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
 		Log("GPT: %d entries, userdata found %d times (%d..%d): no window", n, found, (TInt)first, (TInt)last);
 		return KErrNotFound;
 		}
-	Log("GPT: %d entries; userdata = sectors %d..%d (%d MB)%s", n, (TInt)first, (TInt)last,
-		(TInt)((last - first + 1) >> 11), KWritable ? "" : "; read-only build: C: stays the RAM drive");
-	aFirst = first;
-	aCount = last - first + 1;
-	return KWritable ? KErrNone : KErrNotSupported;		// read-only build: no block drive yet
+	aFirst = WinFirst = first;
+	aCount = WinCount = Min(last - first + 1, KCSectors);
+	Log("GPT: %d entries; userdata = sectors %d..%d (%d MB); window %d + %d, %s", n, (TInt)first, (TInt)last,
+		(TInt)((last - first + 1) >> 11), (TInt)WinFirst, (TInt)WinCount,
+		!KWritable ? "read-only" : KBootDrive ? "writable, C:" : "writable (monitor only)");
+	return KErrNone;
+	}
+
+// the monitor's "blk wtest" (EMMC_C builds, after "blk init"): write, read back and compare a pattern on the
+// window's last 8 sectors, then zero the window's first 34 and last 64 sectors -- ext4's superblock and any stale
+// GPT go, so the next mount sees an unformatted disk (ztOS FIXES.md #5)
+TInt A64BlkDev_SelfTest()
+	{
+	if (!KWritable || !WinCount || WinCount < 128)
+		return KErrNotReady;
+	static TUint8 b[8 * KA64BlkSector];
+	const TUint64 end = WinFirst + WinCount;
+	for (TInt i = 0; i < 8 * KA64BlkSector; ++i)
+		b[i] = (TUint8)(i % KA64BlkSector < 8 ? "NEOSYMB"[i % 8] : i / KA64BlkSector + i);
+	TInt r = A64BlkDev_Write(end - 8, 8, b);
+	Log("wtest: write 8 at %d -> %d", (TInt)(end - 8), r);
+	static TUint8 c[8 * KA64BlkSector];
+	if (r == KErrNone)
+		r = A64BlkDev_Read(end - 8, 8, c);
+	TInt bad = r == KErrNone ? memcompare(b, sizeof(b), c, sizeof(c)) : -1;
+	Log("wtest: read back -> %d, %s", r, bad ? "MISMATCH" : "matches");
+	if (r != KErrNone || bad)
+		return r != KErrNone ? r : KErrCorrupt;
+	memclr(b, sizeof(b));
+	for (TInt i = 0; i < 64 && r == KErrNone; i += 8)		// the last 64
+		r = A64BlkDev_Write(end - 64 + i, 8, b);
+	for (TInt i = 0; i < 40 && r == KErrNone; i += 8)		// the first 34 (40)
+		r = A64BlkDev_Write(WinFirst + i, 8, b);
+	Log("wtest: zeroed the window's first 40 and last 64 sectors -> %d", r);
+	return r;
 	}

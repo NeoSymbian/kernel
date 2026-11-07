@@ -101,11 +101,13 @@ TInt DMediaDriverBlk::Caps(TLocDrvRequest& m)
 	caps.iHiddenSectors = 0;
 	caps.iEraseBlockSize = 0;
 	caps.iBlockSize = KA64BlkSector;
+	caps.iMaxBytesPerFormat = 1 << 30;		// EFormat is a no-op: without this a full format takes 16 KB steps (8 GB =
+											// 512K file-server round trips, which looks like a hang)
 	SetTotalSizeInBytes(caps);
 	return KErrNone;
 	}
 
-// ERead / EWrite / EFormat (zeroes) over [pos, pos + len), in bounce-buffer pieces
+// ERead / EWrite over [pos, pos + len), in bounce-buffer pieces
 TInt DMediaDriverBlk::Transfer(TLocDrvRequest& m, TInt aKind)
 	{
 	Int64 pos = m.Pos(), len = m.Length();
@@ -133,13 +135,11 @@ TInt DMediaDriverBlk::Transfer(TLocDrvRequest& m, TInt aKind)
 			TBool partial = skip || (n % KA64BlkSector);
 			if (partial)									// read-modify-write the edge sectors (simply: all)
 				r = A64Blk_Read(lba, sectors, iBuf);
-			if (r == KErrNone && aKind == DLocalDrive::EWrite)
+			if (r == KErrNone)
 				{
 				TPtr8 des(iBuf + skip, n, n);
 				r = m.ReadRemote(&des, done);
 				}
-			else if (r == KErrNone)
-				memclr(iBuf + skip, n);
 			if (r == KErrNone)
 				r = A64Blk_Write(lba, sectors, iBuf);
 			}
@@ -162,8 +162,10 @@ TInt DMediaDriverBlk::Request(TLocDrvRequest& m)
 		break;
 	case DLocalDrive::ERead:
 	case DLocalDrive::EWrite:
-	case DLocalDrive::EFormat:
 		r = Transfer(m, id);
+		break;
+	case DLocalDrive::EFormat:		// FAT writes its own boot sector, FATs and root afterwards: nothing to erase
+		r = KErrNone;				// shortcut: no erase (zeroing 8 GB at 2 MB/s takes an hour); eMMC ERASE/TRIM later
 		break;
 	default:
 		r = KErrNotSupported;

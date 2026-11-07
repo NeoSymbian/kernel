@@ -10,4 +10,5 @@ void A64Log_Report();										// at boot: a previous boot's log kept (lastlog)
 TInt A64Log_Read(TUint32& aPos, TUint8* aBuf, TInt aMax);	// from a reader's cursor (start at 0: the whole ring)
 void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite);	// run one command line; thread context
 void A64DumpThreads();
+void A64Key_Type(TUint8 aChar);								// one ASCII character as a paced key press (thread)
 #endif

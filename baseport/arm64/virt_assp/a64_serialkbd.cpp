@@ -9,7 +9,6 @@
 // shortcut: ASCII letters, digits, space, Enter, Backspace, Escape and the punctuation a shell needs; no cursor
 // keys (VT100 escape sequences) and no EHalGroupKeyboard info -- add them when an app needs them.
 #include <kernel/kern_priv.h>
-#include <e32keys.h>
 #include "board.h"
 #include "a64_platform.h"
 #include "a64_dbgmon.h"
@@ -38,48 +37,6 @@ static void UartIsr(TAny*)
 	RxDfc.Add();
 	}
 
-// ASCII -> (standard scan code, shift); 0 = no key
-static TInt ScanCode(TUint8 aChar, TBool& aShift)
-	{
-	aShift = EFalse;
-	if (aChar >= 'a' && aChar <= 'z')
-		return aChar - 'a' + 'A';
-	if (aChar >= 'A' && aChar <= 'Z')
-		{
-		aShift = ETrue;
-		return aChar;
-		}
-	if (aChar >= '0' && aChar <= '9')
-		return aChar;
-	switch (aChar)
-		{
-	case '\r': case '\n':	return EStdKeyEnter;
-	case 0x08: case 0x7f:	return EStdKeyBackspace;
-	case 0x1b:				return EStdKeyEscape;
-	case ' ':				return EStdKeySpace;
-	case '.':				return EStdKeyFullStop;
-	case ',':				return EStdKeyComma;
-	case '/':				return EStdKeyForwardSlash;
-	case '\\':				return EStdKeyBackSlash;
-	case ';':				return EStdKeySemiColon;
-	case '-':				return EStdKeyMinus;
-	case '=':				return EStdKeyEquals;
-	case ':':	aShift = ETrue;	return EStdKeySemiColon;
-	case '_':	aShift = ETrue;	return EStdKeyMinus;
-	case '?':	aShift = ETrue;	return EStdKeyForwardSlash;
-	case '*':	aShift = ETrue;	return '8';
-	default:				return 0;
-		}
-	}
-
-static void Post(TRawEvent::TType aType, TInt aScanCode)
-	{
-	TRawEvent e;
-	e.Set(aType, aScanCode);
-	while (Kern::AddEvent(e) == KErrOverflow)			// the window server will drain the queue
-		NKern::Sleep(1);
-	}
-
 static TBool MonMode;
 static TBuf8<128> MonLine;
 static void SerialWrite(const TUint8* aData, TInt aLen)
@@ -93,7 +50,6 @@ static void RxDfcFn(TAny*)
 	NKern::ThreadEnterCS();
 	while (RingTail != RingHead)
 		{
-		TBool shift;
 		TUint8 ch = Ring[RingTail++ % sizeof(Ring)];
 		if (ch == 0x14)
 			{
@@ -117,17 +73,7 @@ static void RxDfcFn(TAny*)
 				MonLine.Append(ch);
 			continue;
 			}
-		TInt code = ScanCode(ch, shift);
-		if (!code)
-			continue;
-		if (shift)
-			Post(TRawEvent::EKeyDown, EStdKeyLeftShift);
-		Post(TRawEvent::EKeyDown, code);
-		NKern::Sleep(10);								// a key is held a little, and keys come apart, as typed:
-		Post(TRawEvent::EKeyUp, code);					// a burst of a whole pasted line overruns the window
-		if (shift)										// server's queue for the console (eshell then stalls)
-			Post(TRawEvent::EKeyUp, EStdKeyLeftShift);
-		NKern::Sleep(20);
+		A64Key_Type(ch);
 		}
 	NKern::ThreadLeaveCS();
 	}

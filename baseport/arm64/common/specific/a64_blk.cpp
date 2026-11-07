@@ -9,6 +9,7 @@ __attribute__((weak)) TInt A64BlkDev_Init(TUint64&) { return KErrNotSupported; }
 __attribute__((weak)) TInt A64BlkDev_Read(TUint64, TInt, TUint8*) { return KErrNotSupported; }
 __attribute__((weak)) TInt A64BlkDev_Write(TUint64, TInt, const TUint8*) { return KErrNotSupported; }
 __attribute__((weak)) TUint32 A64BlkDev_EraseBlock() { return 0; }
+__attribute__((weak)) TInt A64BlkDev_Discard(TUint64, TInt) { return KErrNone; }
 __attribute__((weak)) TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
 	{
 	aFirst = 0;
@@ -33,6 +34,7 @@ TInt A64Blk_Start()
 	}
 
 TUint64 A64Blk_Sectors() { return Count; }
+TUint64 A64Blk_First() { return First; }
 
 static TBool Inside(TUint64 aLba, TInt aCount)
 	{
@@ -47,4 +49,9 @@ TInt A64Blk_Read(TUint64 aLba, TInt aCount, TUint8* aBuf)
 TInt A64Blk_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
 	{
 	return Inside(aLba, aCount) ? A64BlkDev_Write(First + aLba, aCount, aBuf) : KErrAccessDenied;
+	}
+
+TInt A64Blk_Discard(TUint64 aLba, TInt aCount)
+	{
+	return Inside(aLba, aCount) ? A64BlkDev_Discard(First + aLba, aCount) : KErrAccessDenied;
 	}

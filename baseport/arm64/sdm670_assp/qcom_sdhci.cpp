@@ -6,8 +6,9 @@
 // tuning), with the RPMh votes Linux makes at probe (CX, the NoC link), then raised to the fastest mode that
 // verifies (SelectMode: 8-bit DDR52, else HS52, else legacy). CMD8 reads EXT_CSD, CMD18/CMD25 move data with
 // auto-CMD12, by ADMA2 through a non-cached bounce buffer.
-// The window (a64_blk.cpp) is C: inside the GPT partition "userdata"; below it, writes must fall inside an enabled
-// partition of the allow-list (Parts), whoever asks.
+// The window (a64_blk.cpp) is the GPT partition "userdata" (C: and E: inside it, through the MBR a64_medblk.cpp
+// keeps in its sector 0); below it, writes must fall inside an enabled partition of the allow-list (Parts), whoever
+// asks. FAT's delete notifications become eMMC TRIM (A64BlkDev_Discard).
 // Writes stay off unless built with EMMC_C=1 (-DA64_EMMC_C): without it, the backend only reports (Volume Up) and
 // C: stays the RAM drive.
 // shortcut: polled, bounded spins, no HS200/HS400 (tuning) and no command queue: DDR52 is the top mode.
@@ -41,9 +42,10 @@ const TBool KBootDrive = EFalse;
 #endif
 // C: = 8 GB of userdata, FAT32 (ELOCAL.FSY = sfat32), starting on the first 4 MiB boundary of the disk inside it:
 // userdata's sectors before it hold the MBR that adds E: (docs/filesystem.md FS3), so C: keeps its place then
-const TUint64 KCSectors = (8ull << 30) / KA64BlkSector;
-const TUint64 KAlign = (4 << 20) / KA64BlkSector;
-static TUint64 WinFirst, WinCount;						// the window, once the GPT is read: the only writable range
+const TUint64 KAlign = (4 << 20) / KA64BlkSector;		// a64_medblk.cpp starts partitions on these boundaries
+static TUint64 WinFirst, WinCount;						// the window (userdata), once the GPT is read
+static TInt Trims, TrimErrors;
+static TUint64 TrimSectors;
 static TUint32 EraseBytes;								// EXT_CSD HC_ERASE_GRP_SIZE, if it divides KAlign
 
 // the partitions a write may reach (docs/filesystem.md "allow-list"); found by GPT name, each exactly once.
@@ -125,6 +127,7 @@ void A64BlkDump()										// a64_keys.cpp: on Volume Up
 	{
 	for (TInt i = 0; i < NReport; ++i)
 		Kern::Printf("[emmc] %S", &Report[i]);
+	Kern::Printf("[emmc] trims %d (%d MB), errors %d", Trims, (TInt)(TrimSectors >> 11), TrimErrors);
 	}
 
 static TBool WaitClear(TUint32 aOff, TUint32 aMask)
@@ -356,23 +359,32 @@ const TUint32 KCore50 = 0x117, KCore100 = 0x10b;			// GPLL0 (600 MHz) / 12, / 6
 
 static TInt Reinit();
 
-// CMD6 SWITCH, write byte aIndex of EXT_CSD := aValue (R1b), then CMD13 until the card is back in transfer state
-// without SWITCH_ERROR (JEDEC; Linux mmc_ops.c __mmc_switch)
-static TInt Switch(TUint aIndex, TUint aValue)
+// after an R1b command: its busy time, then CMD13 until the card is back in transfer state (up to aMs);
+// KErrNone and the status in aStatus
+static TInt WaitTran(TInt aMs, TUint32& aStatus)
 	{
-	TInt r = Command(6, (3u << 24) | (aIndex << 16) | (aValue << 8), 0x1b);
-	if (r != KErrNone)
-		return r;
 	WaitInt(EIntXfer);										// the busy time (a timeout: CMD13 below waits it out)
-	for (TInt i = 0; i < 100; ++i)
+	TInt r = KErrTimedOut;
+	for (TInt i = 0; i < aMs; ++i)
 		{
 		r = Command(13, 1 << 16, ERespR1);
-		TUint32 st = R(EResponse0);
-		if (r == KErrNone && ((st >> 9) & 0xf) == 4)
-			return (st & (1 << 7)) ? KErrNotSupported : KErrNone;	// SWITCH_ERROR
+		aStatus = R(EResponse0);
+		if (r == KErrNone && ((aStatus >> 9) & 0xf) == 4)
+			return KErrNone;
 		NKern::Sleep(NKern::TimerTicks(1));
 		}
 	return r != KErrNone ? r : KErrTimedOut;
+	}
+
+// CMD6 SWITCH, write byte aIndex of EXT_CSD := aValue (R1b), back in transfer state without SWITCH_ERROR
+// (JEDEC; Linux mmc_ops.c __mmc_switch)
+static TInt Switch(TUint aIndex, TUint aValue)
+	{
+	TInt r = Command(6, (3u << 24) | (aIndex << 16) | (aValue << 8), 0x1b);
+	TUint32 st = 0;
+	if (r == KErrNone)
+		r = WaitTran(100, st);
+	return r == KErrNone && (st & (1 << 7)) ? KErrNotSupported : r;	// SWITCH_ERROR
 	}
 
 // EXT_CSD read again in the new mode: 512 bytes over every data line with CRC, compared with the legacy read
@@ -556,6 +568,11 @@ static TInt DoInit(TUint64& aSectors)
 		R(EVendorSpec), R(EPwrStatus), *(volatile TUint32*)(A64_Io(KCqhci) + 0x08));
 	*(volatile TUint32*)(A64_Io(KCqhci) + 0x08) &= ~1u;	// command queueing off: plain SDHCI commands
 	TInt r = Reinit();
+	for (TInt i = 0; i < 2 && r != KErrNone; ++i)			// the first CMD3 after ABL sometimes times out: again
+		{
+		ClocksOn();
+		r = Reinit();
+		}
 	if (r != KErrNone)
 		return r;
 	TUint8* ext = Ext;
@@ -610,6 +627,8 @@ static TBool Is(const TDesC8& aWord, const char* aLit)
 	return aWord.Length() == n && memcompare(aWord.Ptr(), n, (const TUint8*)aLit, n) == 0;
 	}
 
+static TUint64 GapEnd();
+
 // the monitor's blk speed | guard <lba> | mode <0-2> (a64_dbgmon.cpp), one answer line in aOut
 TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes8& aOut)
 	{
@@ -661,9 +680,15 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		}
 	if (Is(aArg[1], "speed"))
 		{
-		// 64 MB read from C:, then 64 MB written past C: (userdata's unused tail, E: from FS3 on): MB/s for each
-		const TInt KChunk = KDmaMax, KTotal = (64 << 20) / KA64BlkSector;
-		const TUint64 eFirst = (WinFirst + WinCount + KAlign - 1) / KAlign * KAlign;
+		// 64 MB read from the window's start (the MBR, then C:), then 64 MB written as 128 passes over window
+		// sectors 1024..2047, free between the MBR and C:: MB/s for each
+		const TInt KChunk = KDmaMax, KTotal = (64 << 20) / KA64BlkSector, KGapFirst = 1024, KGapLen = 1024;
+		if (GapEnd() < KGapFirst + KGapLen)
+			{
+			aOut.Append((const TUint8*)"blk speed: no free gap before C:", 32);
+			return KErrNotReady;
+			}
+		const TUint64 eFirst = WinFirst + KGapFirst;
 		NKern::ThreadEnterCS();
 		TUint8* buf = (TUint8*)Kern::Alloc(KChunk * KA64BlkSector);
 		NKern::ThreadLeaveCS();
@@ -675,14 +700,14 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 			r = A64BlkDev_Read(WinFirst + i, KChunk, buf);
 		TUint32 t1 = NKern::TickCount();
 		for (TInt i = 0; i < KTotal && r == KErrNone; i += KChunk)
-			r = A64BlkDev_Write(eFirst + i, KChunk, buf);
+			r = A64BlkDev_Write(eFirst + i % KGapLen, KChunk, buf);
 		TUint32 t2 = NKern::TickCount();
 		// the last chunk written, read back and compared: the cache maintenance around DmaBuf, end to end
 		TInt same = -1;
 		NKern::ThreadEnterCS();
 		TUint8* back = (TUint8*)Kern::Alloc(KChunk * KA64BlkSector);
 		NKern::ThreadLeaveCS();
-		if (back && r == KErrNone && (r = A64BlkDev_Read(eFirst + KTotal - KChunk, KChunk, back)) == KErrNone)
+		if (back && r == KErrNone && (r = A64BlkDev_Read(eFirst + KGapLen - KChunk, KChunk, back)) == KErrNone)
 			same = memcompare(buf, KChunk * KA64BlkSector, back, KChunk * KA64BlkSector) == 0;
 		NKern::ThreadEnterCS();
 		Kern::Free(back);
@@ -742,45 +767,81 @@ TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount)
 			Parts[p].iFound, Parts[p].iWritable ? "writable" : "not enabled");
 	const TInt found = Parts[0].iFound;
 	const TUint64 first = Parts[0].iFirst, last = Parts[0].iLast;
-	const TUint64 cFirst = (first + KAlign - 1) / KAlign * KAlign;
-	if (found != 1 || last < cFirst || last >= aSectors)
+	if (found != 1 || last < first || last >= aSectors)
 		{
 		Log("GPT: %d entries, userdata found %d times (%d..%d): no window", n, found, (TInt)first, (TInt)last);
 		return KErrNotFound;
 		}
-	aFirst = WinFirst = cFirst;
-	aCount = WinCount = Min(last - cFirst + 1, KCSectors);
-	Log("GPT: %d entries; userdata = sectors %d..%d (%d MB); window %d + %d, %s", n, (TInt)first, (TInt)last,
-		(TInt)((last - first + 1) >> 11), (TInt)WinFirst, (TInt)WinCount,
-		!KWritable ? "read-only" : KBootDrive ? "writable, C:" : "writable (monitor only)");
+	aFirst = WinFirst = first;
+	aCount = WinCount = last - first + 1;
+	Log("GPT: %d entries; window = userdata, sectors %d..%d (%d MB), %s", n, (TInt)first, (TInt)last,
+		(TInt)((last - first + 1) >> 11),
+		!KWritable ? "read-only" : KBootDrive ? "writable, C: + E:" : "writable (monitor only)");
 	return KErrNone;
 	}
 
-// the monitor's "blk wtest" (EMMC_C builds, after "blk init"): write, read back and compare a pattern on the
-// window's last 8 sectors, then zero the window's first 34 and last 64 sectors -- ext4's superblock and any stale
-// GPT go, so the next mount sees an unformatted disk (ztOS FIXES.md #5)
+// the first window sector a partition of the MBR uses (a64_medblk.cpp keeps at least 2048 free), or 2048 without
+// an MBR: the sectors between the MBR and it are free for the monitor's tests
+static TUint64 GapEnd()
+	{
+	static TUint8 s[KA64BlkSector];
+	TUint64 end = 2048;
+	if (A64BlkDev_Read(WinFirst, 1, s) == KErrNone && s[510] == 0x55 && s[511] == 0xaa && s[0] != 0xeb && s[0] != 0xe9)
+		for (TInt i = 0; i < 4; ++i)
+			{
+			const TUint8* e = s + 446 + 16 * i;
+			TUint64 base = e[8] | (e[9] << 8) | (e[10] << 16) | ((TUint32)e[11] << 24);
+			if (e[4] && base)
+				end = Min(end, base);
+			}
+	return end;
+	}
+
+// the monitor's "blk wtest" (EMMC_C builds, after "blk init"): write, read back and compare a pattern on window
+// sectors 1..8 (free, between the MBR and C:), then zero them
 TInt A64BlkDev_SelfTest()
 	{
-	if (!KWritable || !WinCount || WinCount < 128)
+	if (!KWritable || !WinCount || GapEnd() < 16)
 		return KErrNotReady;
 	static TUint8 b[8 * KA64BlkSector];
-	const TUint64 end = WinFirst + WinCount;
 	for (TInt i = 0; i < 8 * KA64BlkSector; ++i)
 		b[i] = (TUint8)(i % KA64BlkSector < 8 ? "NEOSYMB"[i % 8] : i / KA64BlkSector + i);
-	TInt r = A64BlkDev_Write(end - 8, 8, b);
-	Log("wtest: write 8 at %d -> %d", (TInt)(end - 8), r);
+	TInt r = A64BlkDev_Write(WinFirst + 1, 8, b);
+	Log("wtest: write 8 at %d -> %d", (TInt)(WinFirst + 1), r);
 	static TUint8 c[8 * KA64BlkSector];
 	if (r == KErrNone)
-		r = A64BlkDev_Read(end - 8, 8, c);
+		r = A64BlkDev_Read(WinFirst + 1, 8, c);
 	TInt bad = r == KErrNone ? memcompare(b, sizeof(b), c, sizeof(c)) : -1;
 	Log("wtest: read back -> %d, %s", r, bad ? "MISMATCH" : "matches");
 	if (r != KErrNone || bad)
 		return r != KErrNone ? r : KErrCorrupt;
 	memclr(b, sizeof(b));
-	for (TInt i = 0; i < 64 && r == KErrNone; i += 8)		// the last 64
-		r = A64BlkDev_Write(end - 64 + i, 8, b);
-	for (TInt i = 0; i < 40 && r == KErrNone; i += 8)		// the first 34 (40)
-		r = A64BlkDev_Write(WinFirst + i, 8, b);
-	Log("wtest: zeroed the window's first 40 and last 64 sectors -> %d", r);
+	r = A64BlkDev_Write(WinFirst + 1, 8, b);
+	Log("wtest: zeroed them again -> %d", r);
 	return r;
+	}
+
+// TRIM (JEDEC: CMD35/CMD36 the range, CMD38 with argument 1), when EXT_CSD SEC_FEATURE_SUPPORT says SEC_GB_CL_EN.
+// Advisory: an error is counted and logged, never returned (FAT's DeleteNotify faults the file server on one)
+TInt A64BlkDev_Discard(TUint64 aLba, TInt aCount)
+	{
+	if (!(Ext[231] & (1 << 4)) || !Rca || aCount <= 0 || !WriteAllowed(aLba, aCount))
+		return KErrNone;
+	TLock lock;
+	TUint32 st = 0;
+	TInt r = Command(35, (TUint32)aLba, ERespR1);
+	if (r == KErrNone)
+		r = Command(36, (TUint32)(aLba + aCount - 1), ERespR1);
+	if (r == KErrNone)
+		r = Command(38, 1, 0x1b);
+	if (r == KErrNone)
+		r = WaitTran(Max(100, Ext[232] * 300 + 100), st);	// TRIM_MULT x 300 ms
+	++Trims;
+	TrimSectors += aCount;
+	if (r != KErrNone)
+		{
+		if (++TrimErrors <= 4)
+			Log("trim %d + %d -> %d (status %08x)", (TInt)aLba, aCount, r, st);
+		}
+	return KErrNone;
 	}

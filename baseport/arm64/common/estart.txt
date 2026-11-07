@@ -1,5 +1,7 @@
 #
-# estart.txt -- the AArch64 kernel's drives: local drive 0 as C: -- the persistent block drive (board/a64_medblk.cpp),
-# or the internal RAM drive without one. Formatted only when it doesn't mount (a blank disk, or a fresh RAM drive).
+# estart.txt -- the AArch64 kernel's drives: local drive 0 as C: -- the persistent block drive's first partition
+# (common/specific/a64_medblk.cpp), or the internal RAM drive without one -- and local drive 1 as E:, the block drive's
+# second partition, if it has one. Formatted only when they don't mount (blank, or a fresh RAM drive).
 #
 C:  0  ELOCAL  FAT   0       FS_FORMAT_CORRUPT,FS_SYNC_DRIVE,FS_SCANDRIVE,FS_SYSTEM_DRIVE       # block drive or IRAM
+E:  1  ELOCAL  FAT   0       FS_FORMAT_CORRUPT,FS_SCANDRIVE       # the rest of the block drive (docs/filesystem.md FS3)

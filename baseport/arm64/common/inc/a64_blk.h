@@ -17,10 +17,15 @@ TInt A64BlkBoard_Window(TUint64 aSectors, TUint64& aFirst, TUint64& aCount);
 // the device's erase unit in bytes, a power of 2 dividing the window's start (weak default: 0, unknown); FAT's
 // format aligns its data area to it
 TUint32 A64BlkDev_EraseBlock();
+// tell the device a range no longer holds data (eMMC TRIM; weak default: nothing to do). Advisory: KErrNone even if
+// the device failed it (FAT's DeleteNotify faults the file server on an error)
+TInt A64BlkDev_Discard(TUint64 aLba, TInt aCount);
 
 // ---- the window
 TInt A64Blk_Start();										// backend init + the board's window
 TUint64 A64Blk_Sectors();								// the window's size, 0 if none
+TUint64 A64Blk_First();									// the window's first sector on the device
 TInt A64Blk_Read(TUint64 aLba, TInt aCount, TUint8* aBuf);			// window-relative
 TInt A64Blk_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf);	// window-relative
+TInt A64Blk_Discard(TUint64 aLba, TInt aCount);						// window-relative
 #endif

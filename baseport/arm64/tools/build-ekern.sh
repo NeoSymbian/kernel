@@ -59,6 +59,7 @@ $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medrofs -DKernelModule
 $EKXX $DEFS $INCS $MED $PRE -DInitExtension=InitExtension_medverity -DKernelModuleEntry=KernelModuleEntry_medverity \
 	-DCreatePhysicalDevice=CreatePhysicalDevice_medverity -I "$EKA/include/kernel" \
 	-c "$BSP/common/specific/a64_medverity.cpp" -o "$I/a64_medverity.o"
+$AS -march=armv8.2-a+sha2 "$BSP/common/specific/a64_sha256.S" -o "$I/a64_sha256.o"	# FS5a: the CPU's SHA-256
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_blk.cpp" -o "$I/a64_blk.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$BSP/common/specific/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_display.cpp" -o "$I/a64_display.o"

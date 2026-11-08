@@ -54,7 +54,9 @@ public:
 //                      launcher is drawn). KErrNone if done or already set; KErrNotSupported without A/B slots
 // Reading needs ReadDeviceData, switching the console and ENeoHalBootOk WriteDeviceData. Each read fills at most
 // 1024 bytes. 0x4e04/0x4e05 are kept for the dev-mode switch.
-enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalBootOk = 0x4e06 };
+//   ENeoHalSlotInfo    a1 = TDes8* -> one line: the booted A/B slot and both slots' state (ReadDeviceData)
+enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalBootOk = 0x4e06,
+	ENeoHalSlotInfo = 0x4e09 };
 
 static TInt LogToUser(TBool aLast, TAny* aCursor, TAny* aDes)
 	{
@@ -88,6 +90,14 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 			return KErrPermissionDenied;
 		TBuf8<800> b;
 		return A64Slot_MarkOk(EFalse, b);
+		}
+	case ENeoHalSlotInfo:
+		{
+		if (!Kern::CurrentThreadHasCapability(ECapabilityReadDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian slot info")))
+			return KErrPermissionDenied;
+		TBuf8<400> b;
+		A64Slot_Show(b);
+		return Kern::ThreadDesWrite(&Kern::CurrentThread(), a1, b, 0, KChunkShiftBy0, NULL);
 		}
 	case ENeoHalConsoleGet:
 		{

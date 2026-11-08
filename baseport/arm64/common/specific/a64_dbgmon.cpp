@@ -329,9 +329,9 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 			Write(d, k * KA64BlkSector);
 			done += k;
 			}
-		const TDesC8& hash = sha->Final();
+		const TUint8* hash = sha->Final().Ptr();			// Ptr(): the descriptor's length stays 0 (as a64_medverity.cpp)
 		TBuf8<80> hex;
-		for (TInt i = 0; i < hash.Length(); ++i)
+		for (TInt i = 0; i < KSHA256HashSize; ++i)
 			Fmt(hex, "%02x", hash[i]);
 		delete sha;
 		Say("\ndump sha256 %S err %d", &hex, err);

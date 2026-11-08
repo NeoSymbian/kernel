@@ -167,12 +167,12 @@ TInt Arc_Vote(const char* aName, TUint32 aVlvl, TDes8* aOut)
 	for (TInt i = 0; r == KErrNone && i < len / 2 && i < 32; ++i)
 		{
 		TUint32 v = aux[2 * i] | (aux[2 * i + 1] << 8);
+		if (i && !v)
+			break;											// past the rail's last level
+		hlvl = i;											// above every level: the highest one (Linux INT_MAX)
+		got = v;
 		if (v >= aVlvl)
-			{
-			hlvl = i;
-			got = v;
 			break;
-			}
 		}
 	if (r == KErrNone && hlvl < 0)
 		r = KErrNotFound;

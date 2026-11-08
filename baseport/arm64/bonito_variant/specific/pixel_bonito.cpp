@@ -49,6 +49,18 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x179e0000, 0x00010000, 1 },		// apps RSC DRV2: RPMh bus votes (qcom_rpmh.cpp)
 	{ 0x17d41000, 0x00006000, 1 },		// OSM: L3 (+0), silver (+0x2000) and gold (+0x4800) clock steps (qcom_cpufreq.cpp)
 	{ 0x85fe0000, 0x00020000, 2 },		// the AOP command DB (DTB aop-cmd-db-mem, no-map): RPMh resource addresses
+	{ 0x86000000, 0x00200000, 2 },		// SMEM, shared with the modem and the DSPs (qcom_smem.cpp; DTB no-map)
+	{ 0x01f43000, 0x00001000, 1 },		// TCSR mutex 3: SMEM's hardware lock
+	{ 0x17990000, 0x00001000, 1 },		// APCS IPC doorbell to the remote processors (qcom_ipc.h)
+	{ 0x0c300000, 0x00001000, 1 },		// AOP message RAM: QMP (qcom_qmp.cpp)
+	{ 0x04080000, 0x00001000, 1 },		// modem QDSP6 subsystem registers (qcom_mss.cpp)
+	{ 0x04180000, 0x00001000, 1 },		// modem RMB: the MBA's command/status registers
+	{ 0x01f63000, 0x00003000, 1 },		// TCSR: the modem's AXI halt ports (q6 +0, nc +0x1000, modem +0x2000)
+	{ 0x0c2b0000, 0x00001000, 1 },		// AOSS clock controller: mss_restart
+	{ 0x0b2e0000, 0x00001000, 1 },		// PDC global: sync resets (modem bit 9 at +0x100)
+	{ 0x0018a000, 0x00001000, 1 },		// GCC: the modem's AHB/AXI clock branches
+	{ 0x00134000, 0x00001000, 1 },		// GCC: prng AHB branch (status)
+	{ 0x00138000, 0x00001000, 1 },		// GCC: boot ROM AHB branch (status)
 	{ 0x9e3e0000, 0x00020000, 2 },		// the log ring that survives a reset (a64_dbgmon.cpp lastlog): the tail of
 										// the DTB's no-map framebuffer-region, kept by ABL across PSCI and watchdog resets
 	};

@@ -5,7 +5,7 @@
 // log. Commands come as text lines from a transport -- the PL011 on QEMU (Ctrl-B, then a line), USB CDC-ACM on the
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
-//   rpmh <bcm> (vote a bus clock manager, Pixel)
+//   rpmh <bcm> (vote a bus clock manager, Pixel) | scm | smem | fw ls|sha | smp2p | qmp | mss | glink (telephony, Pixel: qcom_telmon.cpp)
 //   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
 //   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | rtc | date <unix UTC s> [UTC offset s]
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; "blk dump" sends "DUMP <n>\n", n*512 raw bytes,
@@ -189,6 +189,17 @@ static void Say(const char* aFmt, ...)
 	Write(b.Ptr(), b.Length());
 	}
 
+void A64Mon_Say(const char* aFmt, ...)						// Say for board files' commands (a64_dbgmon.h)
+	{
+	VA_LIST list;
+	VA_START(list, aFmt);
+	TBuf8<256> b;
+	Kern::AppendFormat(b, aFmt, list);
+	VA_END(list);
+	b.Append('\n');
+	Write(b.Ptr(), b.Length());
+	}
+
 // ---- hooks other board files provide (weak: absent on some boards)
 __attribute__((weak)) void A64TouchDump() {}
 __attribute__((weak)) void A64BlkDump() {}
@@ -210,6 +221,8 @@ __attribute__((weak)) TInt A64BlkDev_Monitor(TInt, const TPtrC8*, const TUint64*
 __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
 __attribute__((weak)) void A64UsbCold(TDes8& aOut, TInt) { aOut.Copy((const TUint8*)"usb cold: not on this board", 27); }
 __attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((const TUint8*)"rpmh: not on this board", 23); }
+// qcom_telmon.cpp on the Pixel: the modem path (docs/telephony.md C2/C3)
+__attribute__((weak)) void A64Tel_Monitor(TInt, const TPtrC8*, const TUint64*) { Say("telephony: not on this board"); }
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
 __attribute__((weak)) int Spmi_Write(unsigned, unsigned, unsigned) { return KErrNotSupported; }
 void A64DumpThreads();										// below, needs scheduler internals
@@ -455,7 +468,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console peek poke spmi rpmh blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt rtc date");
+		Say("help log lastlog console peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt rtc date");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -511,6 +524,13 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	else if (Eq(c, "spmi") && argc >= 5 && Eq(arg[1], "w"))
 		Say("spmi %d:%04x <- %02x -> %d", (TInt)num[2], (TInt)num[3], (TInt)num[4],
 			Spmi_Write((TUint)num[2], (TUint)num[3], (TUint)num[4]));
+	else if (Eq(c, "scm") || Eq(c, "smem") || Eq(c, "fw") || Eq(c, "smp2p") || Eq(c, "qmp") || Eq(c, "mss") || Eq(c, "glink"))	// telephony (qcom_telmon.cpp)
+		{
+		TInt x;
+		XTRAP(x, XT_DEFAULT, A64Tel_Monitor(argc, arg, num));
+		if (x)
+			Say("%S: trap %d", &c, x);
+		}
 	else if (Eq(c, "rpmh") && argc >= 2)
 		{
 		TBuf8<120> b;

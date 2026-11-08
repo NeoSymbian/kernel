@@ -11,5 +11,7 @@ TInt A64Log_Read(TUint32& aPos, TUint8* aBuf, TInt aMax);
 TInt A64Log_LastRead(TUint32& aPos, TUint8* aBuf, TInt aMax);	// the previous boot's (lastlog)	// from a reader's cursor (start at 0: the whole ring)
 void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite);	// run one command line; thread context
 void A64DumpThreads();
-void A64Key_Type(TUint8 aChar);								// one ASCII character as a paced key press (thread)
+void A64Key_Type(TUint8 aChar);
+void A64Mon_Say(const char* aFmt, ...);					// one answer line (< 256 bytes), for board files' commands
+void A64Tel_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum);	// qcom_telmon.cpp								// one ASCII character as a paced key press (thread)
 #endif

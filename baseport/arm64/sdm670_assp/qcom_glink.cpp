@@ -26,6 +26,8 @@ const TInt KChannels = 8, KIntents = 4, KRemoteIntents = 8, KIntentSize = 2048, 
 struct SMsg { TUint16 iCmd, iParam1; TUint32 iParam2; };
 
 struct SIntent { TUint32 iId, iSize; TUint8* iBuf; TUint32 iFill; };
+enum { EFree, EAvailable, EInUse };
+struct SRemoteIntent { TUint32 iId, iSize, iState; };
 struct SChannel
 	{
 	TUint8 iName[KName];			// not a TBuf8: NewChannel memclr()s the struct, which would zero its max length
@@ -35,7 +37,7 @@ struct SChannel
 	TGlinkRx iRx;
 	TAny* iPtr;
 	SIntent iIn[KIntents];			// our receive buffers, advertised to the remote
-	TUint32 iRemote[KRemoteIntents][2];	// the remote's {id, size}; size 0 = free slot
+	SRemoteIntent iRemote[KRemoteIntents];	// the remote's receive buffers we may send into
 	TInt iRxCount, iTxCount;
 	};
 
@@ -103,11 +105,17 @@ static TUint32 TxWriteOne(TUint32 aHead, const TAny* aData, TUint32 aCount)
 	return aHead >= KFifoSize ? aHead - KFifoSize : aHead;
 	}
 
+static NFastMutex TxLock;										// the GLINK thread and user threads (QrtrSend) both send
+
 static TInt Tx(const TAny* aHdr, TUint32 aHlen, const TAny* aData = NULL, TUint32 aDlen = 0)
 	{
 	TUint32 need = (aHlen + aDlen + 7) & ~7u;
-	for (TInt i = 0; TxAvail() < need; ++i)					// the modem drains it; wait up to ~100 ms
+	for (TInt i = 0; ; ++i)									// the modem drains it; wait up to ~100 ms
 		{
+		NKern::FMWait(&TxLock);
+		if (TxAvail() >= need)
+			break;											// keep the lock for the write
+		NKern::FMSignal(&TxLock);
 		if (i >= 100)
 			return KErrOverflow;
 		NKern::Sleep(NKern::TimerTicks(1));
@@ -120,6 +128,7 @@ static TInt Tx(const TAny* aHdr, TUint32 aHlen, const TAny* aData = NULL, TUint3
 		head -= KFifoSize;
 	__e32_memory_barrier();									// the data before the head that publishes it
 	E.iDesc[1] = head;
+	NKern::FMSignal(&TxLock);
 	Ipc_Kick(KIpcModemGlink);
 	return KErrNone;
 	}
@@ -257,18 +266,21 @@ static TBool RxOne()										// one command; EFalse if it is not all there yet
 		if (avail < len)
 			return EFalse;
 		SChannel* c = ByRcid(m.iParam1);
+		NKern::FMWait(&TxLock);								// the intent table is shared with Glink_Send
 		for (TUint32 i = 0; c && i < m.iParam2; ++i)
 			{
 			TUint32 pair[2];								// {size, id}
 			RxPeek(pair, sizeof(m) + 8 * i, 8);
 			for (TInt k = 0; k < KRemoteIntents; ++k)
-				if (!c->iRemote[k][1])
+				if (c->iRemote[k].iState == EFree)
 					{
-					c->iRemote[k][0] = pair[1];
-					c->iRemote[k][1] = pair[0];
+					c->iRemote[k].iId = pair[1];
+					c->iRemote[k].iSize = pair[0];
+					c->iRemote[k].iState = EAvailable;
 					break;
 					}
 			}
+		NKern::FMSignal(&TxLock);
 		RxAdvance(len);
 		return ETrue;
 		}
@@ -343,8 +355,18 @@ static TBool RxOne()										// one command; EFalse if it is not all there yet
 			}
 		return ETrue;
 		}
-	case ERxDone:											// no reuse (features 0): the remote advertises afresh
-	case ERxDoneReuse:
+	case ERxDone:											// the remote consumed our message in intent param2:
+	case ERxDoneReuse:										// with reuse it stays ours to send into, else it is gone
+		{
+		RxAdvance(sizeof(m));
+		SChannel* c = ByRcid(m.iParam1);
+		NKern::FMWait(&TxLock);
+		for (TInt k = 0; c && k < KRemoteIntents; ++k)
+			if (c->iRemote[k].iState == EInUse && c->iRemote[k].iId == m.iParam2)
+				c->iRemote[k].iState = m.iCmd == ERxDoneReuse ? EAvailable : EFree;
+		NKern::FMSignal(&TxLock);
+		return ETrue;
+		}
 	case ECloseAck:
 	case EReadNotif:
 	case ESignals:
@@ -425,15 +447,30 @@ TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
 	SChannel* c = ByLcid(aChannel);
 	if (!c || !c->iRcid || !c->iOpenAcked)
 		return KErrNotReady;
-	for (TInt k = 0; k < KRemoteIntents; ++k)
-		if (c->iRemote[k][1] >= (TUint32)aLen)
-			{
-			struct { SMsg iM; TUint32 iChunk, iLeft; } h = { { ETxData, c->iLcid, c->iRemote[k][0] }, (TUint32)aLen, 0 };
-			c->iRemote[k][1] = 0;							// used until the remote advertises again
-			++c->iTxCount;
-			return Tx(&h, sizeof(h), aData, aLen);
-			}
-	return KErrNotReady;
+	TUint32 id = 0;
+	TBool found = EFalse;
+	for (TInt tries = 0; !found && tries < 200; ++tries)		// none free: ask for one, the GLINK thread files it
+		{
+		NKern::FMWait(&TxLock);
+		for (TInt k = 0; k < KRemoteIntents && !found; ++k)
+			if (c->iRemote[k].iState == EAvailable && c->iRemote[k].iSize >= (TUint32)aLen)
+				{
+				id = c->iRemote[k].iId;
+				c->iRemote[k].iState = EInUse;			// until RX_DONE gives it back (or not)
+				found = ETrue;
+				}
+		NKern::FMSignal(&TxLock);
+		if (found)
+			break;
+		if (tries % 50 == 0)
+			Cmd(EIntentReq, c->iLcid, aLen);				// RX_INTENT_REQ: our id, the size we need
+		NKern::Sleep(NKern::TimerTicks(1));
+		}
+	if (!found)
+		return KErrNotReady;
+	struct { SMsg iM; TUint32 iChunk, iLeft; } h = { { ETxData, c->iLcid, id }, (TUint32)aLen, 0 };
+	++c->iTxCount;
+	return Tx(&h, sizeof(h), aData, aLen);
 	}
 
 void Glink_Dump(void (*aSay)(const char*, ...))
@@ -450,7 +487,7 @@ void Glink_Dump(void (*aSay)(const char*, ...))
 		const SChannel& c = E.iCh[i];
 		TInt remote = 0;
 		for (TInt k = 0; k < KRemoteIntents; ++k)
-			remote += c.iRemote[k][1] != 0;
+			remote += c.iRemote[k].iState == EAvailable;
 		TPtrC8 n(c.iName, c.iNameLen);
 		aSay("  \"%S\" lcid %d rcid %d open sent %d acked %d; rx %d tx %d; remote intents %d", &n, c.iLcid,
 			c.iRcid, c.iOpenSent, c.iOpenAcked, c.iRxCount, c.iTxCount, remote);

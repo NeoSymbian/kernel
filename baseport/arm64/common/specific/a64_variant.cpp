@@ -62,10 +62,13 @@ enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalCo
 //   ENeoHalPower       a1 = 0 restart, 1 restart to fastboot, 2 power off (PowerMgmt). Returns only on a failure; the
 //                      caller finalises the drives first (neoui's Power menu)
 //   ENeoHalRtcRead     a1 = TUint32* -> the PMIC RTC's raw seconds; KErrNotSupported without one (QEMU)
+//   0x4e0d..0x4e12     the modem (telephony C4): boot, state, QRTR send/receive, EFS partition reads, the rmtfs
+//                      carve-out; CommDD. qcom_telhal.cpp on the Pixel, KErrNotSupported elsewhere
 void A64_RebootNormal();									// a64_reboot.cpp (weak QEMU defaults: a64_dbgmon.cpp)
 void A64_RebootToFastboot();
 TInt A64_PowerOff();
 TInt A64_RtcSeconds(TUint32& aSecs);						// qcom_rtc.cpp
+__attribute__((weak)) TInt A64Tel_Hal(TInt, TAny*, TAny*) { return KErrNotSupported; }	// qcom_telhal.cpp
 #ifndef NEO_BUILD_KERNEL
 #define NEO_BUILD_KERNEL "kernel unknown"				// build-ekern.sh passes the real one
 #endif
@@ -147,6 +150,8 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 			kumemput32(a1, &secs, sizeof(secs));
 		return r;
 		}
+	case 0x4e0d: case 0x4e0e: case 0x4e0f: case 0x4e10: case 0x4e11: case 0x4e12:
+		return A64Tel_Hal(aFunction, a1, a2);
 	case ENeoHalConsoleGet:
 		{
 		TInt on = A64_ConsoleShown();

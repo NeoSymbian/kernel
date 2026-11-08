@@ -15,6 +15,8 @@
 // Written from the sequence in Linux drivers/remoteproc/qcom_q6v5_mss.c (sdm845_mss data, q6v5_mba_load,
 // q6v5_mpss_init_image, q6v5_mpss_load), qcom_q6v5.c and drivers/soc/qcom/mdt_loader.c; registers of the clocks
 // and resets from Linux gcc-sdm845.c, reset-qcom-aoss.c and reset-qcom-pdc.c. Telephony stage C3 (docs/telephony.md).
+// Before all that, the Pixel's board record goes into SMEM item 134 (BoardInfo): the modem's RF task reads it to
+// pick the RF card, and faults without it (C4: ":0:[rf]EX:kernel:0:rf:171" 0.5 s after ready).
 // shortcut: the proxy votes and clocks stay on after handover (RPMh votes are never dropped yet, qcom_rpmh.cpp).
 #include <kernel/kern_priv.h>
 #include <platform.h>
@@ -26,6 +28,8 @@
 #include "qcom_rpmh.h"
 #include "qcom_fat16.h"
 #include "qcom_glink.h"
+#include "qcom_llcc.h"
+#include "qcom_telhal.h"
 #include "qcom_mss.h"
 
 const TUint32 KQdsp6 = 0x04080000, KRmb = 0x04180000;
@@ -200,16 +204,35 @@ static TInt LoadSegment(TInt aIndex, const SPhdr& aP, TUint32 aOffset)
 	return KErrNone;
 	}
 
-// C3's exit test: log the modem's first QRTR packets (v1 header: version, type, src node, src port, confirm_rx,
-// size, dst node, dst port; type 2 = HELLO). C4 hands IPCRTR to the user-side QRTR router instead.
-static TInt QrtrSeen;
-static void QrtrRx(TAny*, const TUint8* aData, TInt aLen)
+// The Pixel board record in SMEM item 134 (SMEM_ID_VENDOR0, global partition, 32 bytes): { version, modem_flag,
+// major_id, minor_id, subtype, platform, efs_magic, ftm_magic }, filled from socinfo (item 137). Facts from what the
+// postmarketOS sdm670 kernel's "google,modemsmem" driver writes (DTB modemsmem { qcom,smem = <134>; }); the flags and
+// magics stay 0 as there.
+static TInt BoardInfo()
 	{
-	if (++QrtrSeen > 8 || aLen < 32)
-		return;
-	const TUint32* h = (const TUint32*)aData;
-	Kern::Printf("[qrtr] rx %d bytes: version %d type %d src %d:%d confirm %d size %d dst %d:%d", aLen, h[0], h[1],
-		h[2], h[3], h[4], h[5], h[6], h[7]);
+	TInt r = Smem_Alloc(KSmemHostGlobal, 134, 32);
+	if (r != KErrNone && r != KErrAlreadyExists)
+		return r;
+	TUint32 len = 0, ilen = 0;
+	TUint32* info = (TUint32*)Smem_Get(KSmemHostGlobal, 134, &ilen);
+	const TUint8* soc = (const TUint8*)Smem_Get(KSmemHostGlobal, 137, &len);
+	if (!info || ilen < 32)
+		return KErrCorrupt;
+	if (!soc || len < 0x44)
+		{
+		Kern::Printf("[mss] board info: socinfo missing or short (%d bytes); smem 134 left zero", len);
+		return KErrNone;
+		}
+	TUint32 platform = *(const TUint32*)(soc + 0x34), platVer = *(const TUint32*)(soc + 0x38);
+	TUint32 subtype = *(const TUint32*)(soc + 0x40);
+	info[0] = 0;
+	info[2] = platVer >> 16 & 0xff;
+	info[3] = platVer & 0xff;
+	info[4] = subtype;
+	info[5] = platform;
+	__e32_memory_barrier();
+	Kern::Printf("[mss] board info (smem 134): platform %d subtype %d version %d.%d", platform, subtype, info[2], info[3]);
+	return KErrNone;
 	}
 
 static TInt Boot()
@@ -219,6 +242,8 @@ static TInt Boot()
 	Step = 1;												// firmware files and the SMEM/SMP2P side
 	if ((r = Smp2p_Start(KSmemHostModem)) != KErrNone)
 		return Fail(Step, r, "smp2p");
+	if ((r = BoardInfo()) != KErrNone)
+		return Fail(Step, r, "smem 134");
 	if ((r = Fat_Mount("modem_a")) != KErrNone)
 		return Fail(Step, r, "mount modem_a");
 	SFatFile mba, mdt;
@@ -259,9 +284,11 @@ static TInt Boot()
 	Step = 3;												// power, clocks, reset
 	if ((r = Qmp_Send("{class: image, res: load_state, name: modem, val: on}")) != KErrNone)
 		return Fail(Step, r, "qmp load_state");
+	Llcc_Init();											// the system cache's slices, the modem's included
 	Arc_Vote("mx.lvl", 0xffff);
 	Arc_Vote("cx.lvl", 0xffff);
 	Arc_Vote("mss.lvl", 0xffff);
+	Rpmh_Set("xo.lvl", 0, 3);								// the "xo" proxy clock (Linux clk-rpmh bi_tcxo, on = 3)
 	ClocksOn(KProxyClks, sizeof(KProxyClks) / sizeof(SClk));
 	ClocksOn(KResetClks, sizeof(KResetClks) / sizeof(SClk));
 	AltReset();
@@ -404,20 +431,24 @@ static TInt Boot()
 		Kern::Printf("[mss] slave-kernel %08x; crash reason: %s", v, why && len ? why : "(none)");
 		return Fail(Step, v & KMssFatal ? KErrDied : KErrTimedOut, "ready");
 		}
-	for (i = 0; !(v & KMssHandover) && i < 5000; ++i)
-		{
-		NKern::Sleep(NKern::TimerTicks(1));
-		Smp2p_In(KSmemHostModem, "slave-kernel", v);
-		}
+	// GLINK right away, as Linux starts the rproc's glink subdevice at "up"; handover comes after (~1 s there)
+	r = Glink_Start(KSmemHostModem);
+	TInt ch = r == KErrNone ? Glink_Open(KSmemHostModem, "IPCRTR", Qrtr_Rx, NULL) : r;
+	if (ch > 0)
+		Qrtr_SetChannel(ch);								// MODEMD's QRTR router reads it (qcom_telhal.cpp)
 	Xfer(MbaPerm, ETrue, EFalse, KMbaPhys, KMbaSize);
 	NKern::ThreadEnterCS();
 	Kern::Free(hdr);
 	NKern::ThreadLeaveCS();
 	Step = 8;
-	Kern::Printf("[mss] modem running (slave-kernel %08x%s)", v, v & KMssHandover ? ", handover" : "");
-	r = Glink_Start(KSmemHostModem);
-	TInt ch = r == KErrNone ? Glink_Open(KSmemHostModem, "IPCRTR", QrtrRx, NULL) : r;
-	Kern::Printf("[mss] glink start %d, IPCRTR %d", r, ch);
+	Kern::Printf("[mss] modem running (slave-kernel %08x); glink start %d, IPCRTR %d", v, r, ch);
+	for (i = 0; !(v & (KMssHandover | KMssFatal)) && i < 30000; ++i)
+		{
+		NKern::Sleep(NKern::TimerTicks(1));
+		Smp2p_Poll(KSmemHostModem);
+		Smp2p_In(KSmemHostModem, "slave-kernel", v);
+		}
+	Kern::Printf("[mss] after %d ms: slave-kernel %08x%s", i, v, v & KMssHandover ? " (handover)" : "");
 	return KErrNone;
 	}
 

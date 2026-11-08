@@ -211,6 +211,20 @@ TInt Vrm_Vote(const char* aName, TUint32 aMilliVolts, TDes8* aOut)
 	return r;
 	}
 
+// one raw active-only write to a resource by name (+ aOffset): the XO clock is the ARC "xo.lvl", on = 3 (Linux
+// clk-rpmh bi_tcxo), which has no level table for Arc_Vote
+TInt Rpmh_Set(const char* aName, TUint32 aOffset, TUint32 aValue)
+	{
+	TUint32 addr = 0;
+	const TUint8* aux = NULL;
+	TInt len = 0;
+	TInt r = Find(aName, addr, aux, len);
+	if (r == KErrNone)
+		r = Rpmh_Write(addr + aOffset, aValue);
+	Kern::Printf("[rpmh] %s+%d = %d -> %d", aName, aOffset, aValue, r);
+	return r;
+	}
+
 TInt Vrm_Off(const char* aName)
 	{
 	TUint32 addr = 0;

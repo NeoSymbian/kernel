@@ -21,6 +21,7 @@
 #include "qcom_qmp.h"
 #include "qcom_mss.h"
 #include "qcom_glink.h"
+#include "qcom_rpmh.h"
 
 static TBool Eq(const TPtrC8& aWord, const char* aLit)
 	{

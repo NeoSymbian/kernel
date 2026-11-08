@@ -7,6 +7,8 @@
 // Triggers: Volume Up + Volume Down held 2 s (a64_keys.cpp), the debug monitor's "fastboot" command, and debug
 // builds with AUTOFASTBOOT=<s> (-DA64_AUTOFASTBOOT): a timer, so a test image that hangs or loses its USB link
 // can't strand the phone.
+// Also the user's restart and power off (HAL ENeoHalPower from neoui's Power menu, monitor reboot/poweroff), and
+// Kern::Restart (A64_Restart: the end of Kern::Fault).
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "qcom_spmi.h"
@@ -14,7 +16,7 @@
 
 const TUint32 KPonSoftRbSpare = 0x088f;				// PM660 (SID 0) PON 0x800 + 0x8F
 const TUint32 KReasonBootloader = 2, KReasonShift = 1;
-const TUint64 KPsciSystemReset = 0x84000009;
+const TUint64 KPsciSystemOff = 0x84000008, KPsciSystemReset = 0x84000009;
 // the APSS watchdog (Linux qcom-wdt.c, KPSS layout, 32768 Hz; at 0x17980000 as on SDM845 -- the DTB has no node):
 // a bite resets the SoC even when a CPU is wedged on the bus and PSCI SYSTEM_RESET can't complete
 const TUint32 KWdt = 0x17980000;
@@ -74,13 +76,42 @@ void A64_RebootNormal()
 	A64_Psci(KPsciSystemReset, 0, 0, 0);
 	}
 
+// power off (the Power menu, the monitor's "poweroff"). Thread context. No watchdog backup: a bite would turn the
+// phone back on. TrustZone drops PS_HOLD for SYSTEM_OFF; the PMIC then waits for the Power key (or a charger, when
+// ABL boots into off-mode charging)
+TInt A64_PowerOff()
+	{
+	TInt old = Spmi_Read(0, KPonSoftRbSpare);
+	TInt r = Spmi_Write(0, KPonSoftRbSpare, (old < 0 ? 0 : old) & 1);
+	Kern::Printf("[reboot] power off (reason write -> %d)", r);
+	A64_Psci(KPsciSystemOff, 0, 0, 0);
+	Kern::Printf("[reboot] SYSTEM_OFF returned");
+	return KErrGeneral;
+	}
+
 // a kernel fault (NotifyCrash, interrupts off): register writes only. The bite restarts the phone 10 s later -- time
 // to read the FAULT on screen -- and ABL then boots the active slot normally (an install image cleared the reason at
 // boot), counting a failed try on a slot not yet marked successful: the FS5b rollback. Test images keep petting the
 // watchdog from the other CPUs and stay on the screen until AUTOFASTBOOT.
+static volatile TBool CrashBiteArmed;
 extern "C" void A64_CrashReset()
 	{
+	CrashBiteArmed = ETrue;
 	A64_WatchdogBite(10000);
+	}
+
+// Kern::Restart (Kern::Fault ends there): registers only. After a crash the bite above is already counting down, so
+// the FAULT stays on screen; otherwise a reset now, the bite as backup. The reason is left as it is (test images
+// keep "bootloader")
+extern "C" void A64_Restart(int)
+	{
+	if (!CrashBiteArmed)
+		{
+		A64_WatchdogBite(2000);
+		A64_Psci(KPsciSystemReset, 0, 0, 0);
+		}
+	for (;;)
+		__asm__ __volatile__("wfi");
 	}
 
 void A64StartReboot()

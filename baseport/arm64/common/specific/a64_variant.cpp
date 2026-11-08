@@ -37,7 +37,8 @@ public:
 	virtual void DebugOutput(TUint aChar)					{ DebugOutputChar(aChar); }
 	virtual void Idle()										{ __asm__ __volatile__("dsb sy\n\twfi" ::: "memory"); }
 	virtual TInt MsTickPeriod()								{ return KTickUs; }
-	// no RTC driver yet: P::DefaultInitialTime then starts the clock from the ROM header's build time
+	// the PMIC RTC can't be set: the kernel boots on the ROM header's time, then neoui sets the real one from the RTC
+	// and its saved offset (ENeoHalRtcRead, clock.dat)
 	virtual TInt SystemTimeInSecondsFrom2000(TInt&)			{ return KErrNotSupported; }
 	virtual TInt SetSystemTimeInSecondsFrom2000(TInt)		{ return KErrNone; }
 	// K::DoNanoWait counts the generic timer (a64e_nkern.cpp), so the calibration is never used
@@ -57,7 +58,14 @@ public:
 //   ENeoHalSlotInfo    a1 = TDes8* -> one line: the booted A/B slot and both slots' state (ReadDeviceData)
 //   ENeoHalBuildInfo   a1 = TDes8* -> this kernel's build: "kernel <commit>[+dirty] <UTC time> <board>" (no capability)
 enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalBootOk = 0x4e06,
-	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a };
+	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c };
+//   ENeoHalPower       a1 = 0 restart, 1 restart to fastboot, 2 power off (PowerMgmt). Returns only on a failure; the
+//                      caller finalises the drives first (neoui's Power menu)
+//   ENeoHalRtcRead     a1 = TUint32* -> the PMIC RTC's raw seconds; KErrNotSupported without one (QEMU)
+void A64_RebootNormal();									// a64_reboot.cpp (weak QEMU defaults: a64_dbgmon.cpp)
+void A64_RebootToFastboot();
+TInt A64_PowerOff();
+TInt A64_RtcSeconds(TUint32& aSecs);						// qcom_rtc.cpp
 #ifndef NEO_BUILD_KERNEL
 #define NEO_BUILD_KERNEL "kernel unknown"				// build-ekern.sh passes the real one
 #endif
@@ -112,6 +120,32 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 		{
 		TPtrC8 b((const TUint8*)NEO_BUILD_KERNEL);
 		return Kern::ThreadDesWrite(&Kern::CurrentThread(), a1, b, 0, KChunkShiftBy0, NULL);
+		}
+	case ENeoHalPower:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityPowerMgmt, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian power")))
+			return KErrPermissionDenied;
+		Kern::Printf("[power] request %d", (TInt)a1);
+		switch ((TInt)a1)
+			{
+		case 0:
+			A64_RebootNormal();
+			break;
+		case 1:
+			A64_RebootToFastboot();
+			break;
+		case 2:
+			return A64_PowerOff();
+		default:
+			return KErrArgument;
+			}
+		return KErrGeneral;									// a reset that came back
+	case ENeoHalRtcRead:
+		{
+		TUint32 secs = 0;
+		TInt r = A64_RtcSeconds(secs);
+		if (r == KErrNone)
+			kumemput32(a1, &secs, sizeof(secs));
+		return r;
 		}
 	case ENeoHalConsoleGet:
 		{

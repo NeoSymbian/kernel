@@ -7,7 +7,7 @@
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel)
 //   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
-//   key <scancode> | type <text> | shot | reboot | fastboot
+//   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | rtc | date <unix UTC s> [UTC offset s]
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
 #include <kernel/kern_priv.h>
@@ -192,6 +192,10 @@ __attribute__((weak)) void A64TouchDump() {}
 __attribute__((weak)) void A64BlkDump() {}
 __attribute__((weak)) void A64KeysDump() {}
 __attribute__((weak)) void A64_RebootToFastboot() { Say("fastboot: not on this board"); }
+// QEMU virt: PSCI resets or stops the guest (a64_reboot.cpp on the Pixel, with the PMIC's reboot reason)
+__attribute__((weak)) void A64_RebootNormal() { A64_Psci(0x84000009, 0, 0, 0); }
+__attribute__((weak)) TInt A64_PowerOff() { A64_Psci(0x84000008, 0, 0, 0); return KErrGeneral; }
+__attribute__((weak)) TInt A64_RtcSeconds(TUint32&) { return KErrNotSupported; }	// qcom_rtc.cpp
 __attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
 __attribute__((weak)) void A64_WatchdogBite(TInt) { Say("wdt: not on this board"); }
 __attribute__((weak)) TInt A64BlkDev_Probe() { return KErrNotSupported; }
@@ -414,7 +418,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console peek poke spmi rpmh blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot fastboot wdt");
+		Say("help log lastlog console peek poke spmi rpmh blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt rtc date");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -562,7 +566,32 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	else if (Eq(c, "reboot"))
 		{
 		Say("rebooting");
-		A64_Psci(0x84000009, 0, 0, 0);
+		A64_RebootNormal();
+		}
+	else if (Eq(c, "poweroff"))
+		{
+		Say("powering off");
+		Say("poweroff failed (%d)", A64_PowerOff());
+		}
+	else if (Eq(c, "rtc"))								// the PMIC RTC's raw seconds (Pixel)
+		{
+		TUint32 secs = 0;
+		TInt r = A64_RtcSeconds(secs);
+		Say("rtc %u (%d)", secs, r);
+		}
+	else if (Eq(c, "date") && argc >= 2)				// date <unix UTC s> [UTC offset s]: tools/phone.py sends the Mac's
+		{
+		TInt off = argc < 3 ? 0 : arg[2][0] == '-' ? -(TInt)Num(arg[2].Mid(1)) : (TInt)num[2];
+		const TInt64 KSecs0To1970 = TInt64(719540) * 86400;	// Symbian's day count (e32-rs time.rs DAYS_0_TO_1970)
+		TTimeK t = ((TInt64)num[1] + KSecs0To1970) * 1000000;
+		NKern::LockSystem();								// the locale offset too, as ExecHandler::SetUTCTimeAndOffset
+		TheMachineConfig().iLocale.iUniversalTimeOffset = off;
+		TheMachineConfig().iLocale.iDaylightSaving = EDstNone;
+		NKern::UnlockSystem();
+		TUint changes = 0;
+		TInt r = K::SetSystemTimeAndOffset(t, off, 0, changes, ETimeSetTime | ETimeSetOffset);
+		Kern::NotifyChanges(changes | EChangesLocale);
+		Say("date set: %u UTC, offset %d s (%d)", (TUint32)num[1], off, r);
 		}
 	else
 		Say("unknown: %S (try help)", &c);

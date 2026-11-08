@@ -3,9 +3,10 @@
 """phone.py -- drive the Pixel running the AArch64 Symbian kernel over its USB debug console (board/qcom_dwc3_acm.cpp),
 with nothing but the Python standard library and the fastboot tool.
 
-  phone.py run IMG [--cmd C]... [--log F] [--secs N] [--stay]
+  phone.py run IMG [--cmd C]... [--log F] [--secs N] [--stay] [--no-date]
       fastboot-boot IMG (RAM only), wait for the console, save its log, run the commands, then send the phone back
       to fastboot (unless --stay) and wait until fastboot answers again
+      first it sets the phone's clock to the Mac's (monitor "date"; neoui then keeps it), unless --no-date
   phone.py cmd C...          run commands on a phone already up
   phone.py shot OUT.png      the framebuffer as a PNG
   phone.py console           interactive (Ctrl-D ends)
@@ -182,7 +183,7 @@ def main(argv):
         selftest()
         return 0
     if verb == "run":
-        img, cmds, log, secs, stay = args[0], [], None, 5.0, False
+        img, cmds, log, secs, stay, date = args[0], [], None, 5.0, False, True
         i = 1
         while i < len(args):
             if args[i] == "--cmd":
@@ -196,6 +197,9 @@ def main(argv):
                 i += 2
             elif args[i] == "--stay":
                 stay = True
+                i += 1
+            elif args[i] == "--no-date":
+                date = False
                 i += 1
             else:
                 raise SystemExit("unknown option " + args[i])
@@ -214,6 +218,10 @@ def main(argv):
             )
         con = Console(port)
         con.log += con.read(secs)
+        if date:
+            c = f"date {int(time.time())} {time.localtime().tm_gmtoff}"
+            print("== " + c)
+            print(con.cmd(c).decode(errors="replace").strip())
         for c in cmds:
             if c.startswith("shot"):
                 out = c.split(None, 1)[1] if " " in c else "shot.png"

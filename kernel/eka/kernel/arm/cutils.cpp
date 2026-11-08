@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): Kern::Restart calls the arm64 board (A64_Restart), the ROM header has no code.
 // Description:
 // e32\kernel\arm\cutils.cpp
 // 
@@ -132,10 +132,17 @@ Note, aMode is set to zero when this function is used by Kern::Fault()
 @param aMode Argument passed to the restart routine. The meaning of this value
 depends on the bootstrap implementation. 		
 */
+#ifdef __CPU_ARM64
+extern "C" void A64_Restart(int aMode);	// NeoSymbian, board.h: a64boot.cpp builds the ROM header as data, with no restart code in it
+#endif
 EXPORT_C void Kern::Restart(TInt aMode)
 	{
+#ifdef __CPU_ARM64
+	A64_Restart(aMode);
+#else
 	TLinAddr f = (TLinAddr)&TheRomHeader().iRestartVector;
 	(*(void (*)(TInt))f)(aMode);
+#endif
 	}
 
 

@@ -9,7 +9,7 @@
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): every input event boosts the CPU clocks on arm64 boards (smooth-ui S3c).
+// The NeoSymbian Authors (2026): every input event boosts the CPU clocks on arm64 boards (smooth-ui S3c; not the 32-bit ARM build).
 // Description:
 // e32\kernel\eventq.cpp
 // 
@@ -19,7 +19,9 @@
 #include "execs.h"
 #include <e32btrace.h>
 
+#ifdef __CPU_ARM64
 void A64CpuBoost();	// NeoSymbian: the board's touch boost (baseport/arm64; a no-op on boards without cpufreq)
+#endif
 #include <kerncorestats.h>
 /******************************************************
  * Event Queue
@@ -113,7 +115,9 @@ EXPORT_C TInt Kern::AddEvent(const TRawEvent& aEvent, TBool aResetUserActivity)
 		K::InactivityQ->Reset();
 		if (K::PowerModel)
 			K::PowerModel->RegisterUserActivity(aEvent);
+#ifdef __CPU_ARM64
 		A64CpuBoost();	// NeoSymbian: top CPU and L3 clocks while the user touches the phone (smooth-ui S3c)
+#endif
 		}
 #ifdef BTRACE_TRAWEVENT		
 	BTraceContext4(BTrace::ERawEvent, BTrace::EKernelAddEvent ,(TUint32)aEvent.Type());

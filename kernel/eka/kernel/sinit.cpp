@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): a 256-event raw event queue (smooth-ui S1).
 // Description:
 // e32\kernel\sinit.cpp
 //
@@ -43,7 +43,7 @@ _LIT(KDShBufThreadName,"DShBufThread");
 const TInt KDShBufThreadPriority = 7; // same priority as normal background thread
 const TInt KDfcThread0Priority=27;
 const TInt KDfcThread1Priority=48;
-const TInt KMaxEventQueue=40;
+const TInt KMaxEventQueue=256;	// NeoSymbian: was 40; a busy UI must not lose touch releases (smooth-ui S1)
 
 #ifdef __SMP__
 _LIT(KRebalanceName, "LB");

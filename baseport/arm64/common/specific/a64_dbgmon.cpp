@@ -6,7 +6,7 @@
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel)
-//   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2>
+//   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
 //   key <scancode> | type <text> | shot | reboot | fastboot
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
@@ -251,7 +251,7 @@ static TUint64 Num(const TDesC8& aWord)					// 0x... hex, else decimal; stops at
 	return v;
 	}
 
-const TInt KMaxArgs = 6;
+const TInt KMaxArgs = 7;							// swipe x1 y1 x2 y2 moves ms
 
 static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 	{
@@ -469,12 +469,16 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		}
 	else if (Eq(c, "swipe") && argc >= 5)
 		{
+		// moves default 10, `ms` apart (default 16): "swipe 900 900 180 900 600" is a 10 s drag (smooth-ui S1)
+		TInt n = argc >= 6 ? (TInt)num[5] : 10, ms = argc >= 7 ? (TInt)num[6] : 16;
+		n = n < 1 ? 1 : n > 2000 ? 2000 : n;
+		ms = ms < 1 ? 1 : ms > 1000 ? 1000 : ms;
 		Post(TRawEvent::EButton1Down, (TInt)num[1], (TInt)num[2]);
-		for (TInt k = 1; k <= 10; ++k)
+		for (TInt k = 1; k <= n; ++k)
 			{
-			NKern::Sleep(NKern::TimerTicks(16));
-			Post(TRawEvent::EPointerMove, (TInt)(num[1] + ((TInt)num[3] - (TInt)num[1]) * k / 10),
-				(TInt)(num[2] + ((TInt)num[4] - (TInt)num[2]) * k / 10));
+			NKern::Sleep(NKern::TimerTicks(ms));
+			Post(TRawEvent::EPointerMove, (TInt)(num[1] + ((TInt)num[3] - (TInt)num[1]) * k / n),
+				(TInt)(num[2] + ((TInt)num[4] - (TInt)num[2]) * k / n));
 			}
 		Post(TRawEvent::EButton1Up, (TInt)num[3], (TInt)num[4]);
 		}

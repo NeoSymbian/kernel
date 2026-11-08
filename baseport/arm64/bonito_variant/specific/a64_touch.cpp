@@ -51,11 +51,14 @@ static void Step(const char* aStep)
 	Kern::Printf("[touch] step: %s", aStep);
 	}
 
+static TInt Logged, Dropped;							// presses + releases seen; events the full queue refused
+
 void A64TouchDump()
 	{
 	Kern::Printf("[touch] last step: %s", CurStep);
 	for (TInt i = 0; i < NLines; ++i)
 		Kern::Printf("[touch] %S", &Lines[i]);
+	Kern::Printf("[touch] presses+releases %d, events dropped %d", Logged, Dropped);
 	}
 
 static TBool ClocksOn()
@@ -288,13 +291,14 @@ static TDfc PollDfc(PollDfcFn, NULL, 1);
 static void PollTimerFn(TAny*) { PollDfc.Add(); }
 static NTimer PollTimer(PollTimerFn, NULL);
 static TBool Down;
-static TInt LastX, LastY, Quiet, Errors, Logged, AttnSeen;
+static TInt LastX, LastY, Quiet, Errors, AttnSeen;
 
 static void Post(TRawEvent::TType aType, TInt aX, TInt aY)
 	{
 	TRawEvent e;
 	e.Set(aType, aX, aY);
-	Kern::AddEvent(e);
+	if (Kern::AddEvent(e) == KErrOverflow)
+		++Dropped;
 	}
 
 static void PollDfcFn(TAny*)
@@ -342,8 +346,10 @@ static void PollDfcFn(TAny*)
 				Post(TRawEvent::EPointerMove, x, y);
 			else if (!down && Down)
 				Post(TRawEvent::EButton1Up, LastX, LastY);
-			if (down != Down)								// every press and release: taps come at human pace
-				Kern::Printf("[touch] %d %s %d %d (type %d, attn %d)", ++Logged, down ? "down" : "up",
+			// the first presses and releases only (bring-up evidence): Kern::Printf runs with interrupts off, and a
+			// print per tap slows a busy UI (smooth-ui S1); the monitor's `touch` shows the counts
+			if (down != Down && ++Logged <= 10)
+				Kern::Printf("[touch] %d %s %d %d (type %d, attn %d)", Logged, down ? "down" : "up",
 					down ? x : LastX, down ? y : LastY, o[0], AttnSeen);
 			Down = down;
 			if (down)

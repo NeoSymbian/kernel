@@ -71,6 +71,11 @@ static TInt LogToUser(TBool aLast, TAny* aCursor, TAny* aDes)
 	return Kern::ThreadDesWrite(&Kern::CurrentThread(), aDes, b, 0, KChunkShiftBy0, NULL);
 	}
 
+// qcom_cpufreq.cpp on the Pixel (smooth-ui S3c); boards without one keep these
+__attribute__((weak)) TUint A64CpuMaxKHz() { return 0; }		// the fastest core's top clock; 0 = unknown
+__attribute__((weak)) void A64CpuBoost() {}					// every input event (Kern::AddEvent)
+__attribute__((weak)) void A64CpufreqDump() { Kern::Printf("[cpufreq] none on this board"); }	// monitor `cpufreq`
+
 // EHalGroupVariant. EVariantHalVariantInfo is the one UserHal::MachineInfo() requires (us_exec.cpp); Phorepoc's shape
 TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 	{
@@ -109,7 +114,9 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 		{
 		TVariantInfoV01Buf infoBuf;
 		TVariantInfoV01& info = infoBuf();
-		const TUint clockKHz = 1800000;				// shortcut: nominal Cortex-A55 clock, until a cpufreq driver reads it
+		TUint clockKHz = A64CpuMaxKHz();				// the fastest core's top step (qcom_cpufreq.cpp)
+		if (!clockKHz)
+			clockKHz = 1800000;							// shortcut: nominal, on boards without a cpufreq driver
 		info.iRomVersion = Epoc::RomHeader().iVersion;
 		info.iMachineUniqueId = TInt64(0x10005152) << 32;
 		info.iLedCapabilities = 0;
@@ -265,6 +272,8 @@ __attribute__((weak)) void A64StartTouch() {}
 __attribute__((weak)) void A64StartReboot() {}
 // qcom_dwc3_acm.cpp on the Pixel: the USB debug console (tools/phone.py)
 __attribute__((weak)) void A64StartUsbConsole() {}
+// qcom_cpufreq.cpp on the Pixel: CPU and L3 clocks with touch boost (smooth-ui S3c)
+__attribute__((weak)) void A64StartCpufreq() {}
 
 // The one kernel extension the ROM must carry (P::StartExtensions sizes an RArray by the count: zero panics).
 extern "C" TInt A64ExtensionEntry(TInt aReason)
@@ -272,6 +281,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	if (aReason != KModuleEntryReasonExtensionInit1)
 		return KErrNone;
 	A64Log_Report();									// the first point where Kern::Printf reaches the log ring
+	A64StartCpufreq();									// before the input drivers: their events boost the clocks
 	A64StartDisplay();									// the screen's HAL, for the window server
 	A64StartSerialKeyboard();
 	A64StartKeys();

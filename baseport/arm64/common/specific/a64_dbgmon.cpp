@@ -6,7 +6,7 @@
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel)
-//   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
+//   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
 //   key <scancode> | type <text> | shot | reboot | fastboot
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
@@ -207,6 +207,7 @@ __attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
 __attribute__((weak)) int Spmi_Write(unsigned, unsigned, unsigned) { return KErrNotSupported; }
 void A64DumpThreads();										// below, needs scheduler internals
+void A64CpufreqDump();										// qcom_cpufreq.cpp (a weak default in a64_variant.cpp)
 
 // ---- physical access: the board's IO regions, else pages mapped on first use
 static TLinAddr Map(TUint32 aPhys)
@@ -413,7 +414,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console peek poke spmi rpmh blk slot touch keys threads cpus usb tap swipe key type shot reboot fastboot wdt");
+		Say("help log lastlog console peek poke spmi rpmh blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot fastboot wdt");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -497,6 +498,8 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		A64DumpThreads();
 	else if (Eq(c, "cpus"))
 		Cpus();
+	else if (Eq(c, "cpufreq"))
+		A64CpufreqDump();
 	else if (Eq(c, "tap") && argc >= 3)
 		{
 		Post(TRawEvent::EButton1Down, (TInt)num[1], (TInt)num[2]);

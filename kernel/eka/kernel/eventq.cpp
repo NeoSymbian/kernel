@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): every input event boosts the CPU clocks on arm64 boards (smooth-ui S3c).
 // Description:
 // e32\kernel\eventq.cpp
 // 
@@ -18,6 +18,8 @@
 #include <kernel/kern_priv.h>
 #include "execs.h"
 #include <e32btrace.h>
+
+void A64CpuBoost();	// NeoSymbian: the board's touch boost (baseport/arm64; a no-op on boards without cpufreq)
 #include <kerncorestats.h>
 /******************************************************
  * Event Queue
@@ -111,6 +113,7 @@ EXPORT_C TInt Kern::AddEvent(const TRawEvent& aEvent, TBool aResetUserActivity)
 		K::InactivityQ->Reset();
 		if (K::PowerModel)
 			K::PowerModel->RegisterUserActivity(aEvent);
+		A64CpuBoost();	// NeoSymbian: top CPU and L3 clocks while the user touches the phone (smooth-ui S3c)
 		}
 #ifdef BTRACE_TRAWEVENT		
 	BTraceContext4(BTrace::ERawEvent, BTrace::EKernelAddEvent ,(TUint32)aEvent.Type());

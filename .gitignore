@@ -1,3 +1,29 @@
 /out/
 __pycache__/
 .ruff_cache/
+
+# build output outside /out/ (the scripts write there; these catch builds by hand)
+*.o
+*.elf
+*.map
+/Image
+/Image.gz
+boot.img
+
+# device data that must never be committed: the phone's DTB lives in ../private, Qualcomm firmware and partition
+# dumps (IMEI/ICCID, EFS) stay off every repo. Not *.img/*.bin: Symbian test fixtures under kerneltest/ use them.
+*.dtb
+*.dtbo
+*.mbn
+*.mdt
+*.[bB][0-9][0-9]
+*.dump
+dumps/
+
+# OS and editors
+.DS_Store
+*.swp
+.vscode/
+.idea/
+.cache/
+compile_commands.json

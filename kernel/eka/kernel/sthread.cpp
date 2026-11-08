@@ -9,7 +9,7 @@
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): with KPANIC defined, thread exits are always printed.
+// The NeoSymbian Authors (2026): with KPANIC defined, thread exits are always printed; user threads take the arm64 board's default CPU affinity (A64_UserCpuAffinity).
 // Description:
 // e32\kernel\sthread.cpp
 // 
@@ -18,7 +18,7 @@
 #include <kernel/kern_priv.h>
 #include "execs.h"
 #include <kernel/emi.h>
-
+extern "C" const unsigned int A64_UserCpuAffinity;	// NeoSymbian: board.h; this tree builds the arm64 kernel only
 #define iMState				iWaitLink.iSpare1		// Allow a sensible name to be used for iMState
 #define iExiting			iWaitLink.iSpare2		// Allow a sensible name to be used for iExiting
 #define iWaitListReserved	iWaitLink.iSpare3		// Allow a sensible name to be used for iWaitListReserved
@@ -614,7 +614,7 @@ TInt DThread::DoCreate(SThreadCreateInfo& aInfo)
 	ni.iCpuAffinity = KCpuAffinityAny;
 	if (iThreadType==EThreadUser)
 		{
-		// user thread
+		ni.iCpuAffinity = A64_UserCpuAffinity;	// user thread; NeoSymbian: the Pixel keeps them off the gold cores (smooth-ui S3)
 		if ((config & EKernelConfigSMPUnsafeCPU0) && iOwningProcess->iSMPUnsafeCount)
 			{
 			ni.iCpuAffinity = 0; // compatibility mode

@@ -14,6 +14,7 @@ const unsigned long A64_HeapBase = 0x41000000, A64_HeapSize = 0x06000000;	// bel
 const int A64_PsciSmc = 0;
 const int A64_HoldResults = 0;		// serial log: power off (QEMU exits) at once
 const unsigned int A64_TimerPpi = 27;
+const unsigned int A64_UserCpuAffinity = 0xffffffff;	// any CPU
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu; }			// Aff0 = CPU number
 const SA64IoRegion A64_IoRegions[] = {
 	{ 0x08000000, 0x00200000, 1 },		// GICv3 distributor + 8 redistributor frames

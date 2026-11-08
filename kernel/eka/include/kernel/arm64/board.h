@@ -21,6 +21,7 @@ extern const unsigned long A64_HeapBase, A64_HeapSize;		// RAM for the nanokerne
 extern const int A64_HoldResults;							// 1: keep the final screen until the user powers off
 extern const int A64_PsciSmc;								// PSCI conduit: 1 = SMC, 0 = HVC
 extern const unsigned int A64_TimerPpi;					// EL1 virtual timer INTID (DTB arm,armv8-timer, 3rd entry + 16)
+extern const unsigned int A64_UserCpuAffinity;			// default CPU affinity of user threads (0xffffffff = any CPU)
 unsigned int A64_CpuMpidr(int aCpu);						// PSCI target_cpu affinity of logical CPU aCpu
 int A64_CpuCount();										// CPUs present (platform layer, PSCI AFFINITY_INFO)
 

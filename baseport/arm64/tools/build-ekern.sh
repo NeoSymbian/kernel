@@ -42,7 +42,11 @@ AS="${X}gcc-14 $ARCH -c"
 I=$OUT/img
 # the bootstrap runs with the MMU off: no unaligned accesses, and no calls a loop could turn into memset/memcpy
 $EKXX $DEFS $INCS $PRE $BDEF -mstrict-align -fno-tree-loop-distribute-patterns -c "$K64/a64boot.cpp" -o "$I/a64boot.o"
-$EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_variant.cpp" -o "$I/a64_variant.o"
+# build info (boot log "[neo] kernel ...", HAL ENeoHalBuildInfo): this tree's commit (+dirty), the build time, the board
+KREV=$(git -c safe.directory='*' -C "$HERE" rev-parse --short HEAD 2>/dev/null) || KREV=unknown
+[ "$KREV" = unknown ] || git -c safe.directory='*' -C "$HERE" diff --quiet HEAD -- 2>/dev/null || KREV="$KREV+dirty"
+NEO_BUILD="kernel $KREV $(date -u +%Y-%m-%dT%H:%MZ) $BOARD"
+$EKXX $DEFS $INCS $PRE "-DNEO_BUILD_KERNEL=\"$NEO_BUILD\"" -c "$BSP/common/specific/a64_variant.cpp" -o "$I/a64_variant.o"
 # the local-media stack as built-in extensions (a64_media.cpp): the unmodified ELOCD and internal RAM drive, entry
 # points renamed (each is its own DLL in a real ROM)
 MED="-I $EKA/drivers/locmedia -I $EKA/drivers/locmedia/traces -I $EKA/include/drivers -I $BSP/common/inc"

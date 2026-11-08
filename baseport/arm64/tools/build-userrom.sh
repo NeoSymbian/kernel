@@ -79,7 +79,8 @@ if rofs:
                        "time=01/01/2026 00:00:00"]
     for o, v in pairs:
         z, _, path = v.partition("=")
-        if z.lower() in core or z.lower() == r"sys\data\estart.txt":
+        # build.txt changes with every build: in the ROFS it would make every image differ (ROFS=flash)
+        if z.lower() in core or z.lower() in (r"sys\data\estart.txt", r"resource\neosymbian\build.txt"):
             keep += [o, v]
         else:
             # executables get every capability, as the XIP ROM's (rombuild.py --xinfo cap1/cap2): the images' own

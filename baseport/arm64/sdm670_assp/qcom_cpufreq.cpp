@@ -22,8 +22,10 @@ struct SDomain
 	const char* iName;
 	TUint32 iBase;
 	TInt iTop, iIdle;										// LUT rows; iTop < 0: the block is off, left alone
+	TInt iTopMHz, iIdleMHz;
 	};
-static SDomain Domains[] = { { "silver", 0x17d43000, -1, 0 }, { "gold", 0x17d45800, -1, 0 }, { "L3", 0x17d41000, -1, 0 } };
+static SDomain Domains[] = { { "silver", 0x17d43000, -1, 0, 0, 0 }, { "gold", 0x17d45800, -1, 0, 0, 0 },
+	{ "L3", 0x17d41000, -1, 0, 0, 0 } };
 const TInt KDomains = sizeof(Domains) / sizeof(Domains[0]);
 
 static volatile TUint32& Reg(TUint32 aPhys) { return *(volatile TUint32*)A64_Io(aPhys); }
@@ -82,6 +84,20 @@ TUint A64CpuMaxKHz()
 	return Ready && Domains[1].iTop >= 0 ? (TUint)StepMHz(Domains[1], Domains[1].iTop) * 1000 : 0;
 	}
 
+// The load balancer's weight for each CPU (nk_bal.cpp, smooth-ui S3d): DTB capacity-dmips-mhz (silver 610, gold 1024)
+// x the clock it runs at now, 1024 = gold at its top step. Gold boosted 1024, silver 522, gold at ABL's 300 MHz 153: busy
+// threads go to gold while the user touches the phone, and stay on silver otherwise.
+unsigned int A64CpuCapacity(int aCpu)
+	{
+	const SDomain& d = Domains[aCpu < 6 ? 0 : 1];			// DTB: cpu@0..500 freq-domain 0, cpu@600..700 freq-domain 1
+	const SDomain& g = Domains[1];
+	if (!Ready || d.iTop < 0 || g.iTop < 0)
+		return 1024;
+	TInt mhz = Boosted ? d.iTopMHz : d.iIdleMHz;
+	TInt cap = (aCpu < 6 ? 610 : 1024) * mhz / g.iTopMHz;
+	return cap < 1 ? 1 : cap > 1024 ? 1024 : (unsigned int)cap;
+	}
+
 void A64StartCpufreq()
 	{
 	for (TInt i = 0; i < KDomains; ++i)
@@ -104,6 +120,8 @@ void A64StartCpufreq()
 			}
 		d.iIdle = (TInt)Reg(d.iBase + EPerfState);
 		d.iTop = top;
+		d.iTopMHz = StepMHz(d, top);
+		d.iIdleMHz = StepMHz(d, d.iIdle);
 		Kern::Printf("[cpufreq] %s: %d steps, %d-%d MHz, ABL left step %d (%d MHz)", d.iName, top + 1, StepMHz(d, 0),
 			StepMHz(d, top), d.iIdle, StepMHz(d, d.iIdle));
 		}

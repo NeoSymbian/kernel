@@ -23,6 +23,7 @@ extern const int A64_PsciSmc;								// PSCI conduit: 1 = SMC, 0 = HVC
 extern const unsigned int A64_TimerPpi;					// EL1 virtual timer INTID (DTB arm,armv8-timer, 3rd entry + 16)
 extern const unsigned int A64_UserCpuAffinity;			// default CPU affinity of user threads (0xffffffff = any CPU)
 unsigned int A64_CpuMpidr(int aCpu);						// PSCI target_cpu affinity of logical CPU aCpu
+unsigned int A64CpuCapacity(int aCpu);					// CPU aCpu's speed now, 1024 = the fastest core at its top clock
 int A64_CpuCount();										// CPUs present (platform layer, PSCI AFFINITY_INFO)
 
 // Device memory. Board code reaches its registers through A64_Io(physical address). The nanokernel test image runs

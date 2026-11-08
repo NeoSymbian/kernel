@@ -18,9 +18,8 @@ const unsigned long A64_HeapBase = 0xA2000000, A64_HeapSize = 0x06000000;	// fre
 const int A64_PsciSmc = 1;
 const int A64_HoldResults = 1;		// a human reads the result off the screen, maybe hours later
 const unsigned int A64_TimerPpi = 19;	// Qualcomm wires the virtual timer to PPI 3 (DTB: <1 3 8>), not the usual 11
-// shortcut: user threads on the silver cores 0-5 (mask, bit 31): the gold cores 6-7 run 2.2x slower at ABL's clock
-// and the balancer favours them; back to any CPU once cpufreq and capacity-aware balancing land (smooth-ui S3d)
-const unsigned int A64_UserCpuAffinity = 0x8000003F;
+// any CPU: the balancer weighs each by its capacity now (qcom_cpufreq.cpp A64CpuCapacity, smooth-ui S3d)
+const unsigned int A64_UserCpuAffinity = 0xffffffff;
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu << 8; }		// Aff1 = core
 const SA64IoRegion A64_IoRegions[] = {
 	{ 0x17a00000, 0x00200000, 1 },		// GICv3 distributor + redistributors

@@ -15,6 +15,8 @@ extern "C" void run_event_handlers(TSubScheduler* aS);	// nkernsmp/nk_irq.cpp
 extern "C" void resched_ipi_ack(TSubScheduler* aSS);		// a64s_ncsched.cpp
 extern "C" void send_resched_ipis(TUint32 aMask);
 extern "C" TUint32 A64_MpidrIndex(TUint32 aMpidr);
+// the load balancer's per-CPU capacity (nk_bal.cpp); qcom_cpufreq.cpp gives the Pixel's, other boards: all alike
+extern "C" __attribute__((weak)) unsigned int A64CpuCapacity(int) { return 1024; }
 TSubScheduler& SubScheduler();
 
 /* ---- GIC ----------------------------------------------------------------------------------------------- */

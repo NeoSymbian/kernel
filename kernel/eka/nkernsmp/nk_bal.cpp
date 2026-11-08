@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): each CPU's share is scaled by its capacity now (big.LITTLE, clocks; smooth-ui S3d).
 // Description:
 // e32\nkernsmp\nk_bal.cpp
 // 
@@ -25,7 +25,7 @@
 
 #include "nk_priv.h"
 #include "nk_irq.h"
-
+extern "C" unsigned int A64CpuCapacity(int aCpu);	// NeoSymbian: board.h; 1024 = the fastest core at its top clock
 #include <e32cmn.h>
 
 /******************************************************************************
@@ -394,8 +394,8 @@ void SCpuAvailability::Init(TUint32 a)
 		{
 		if (a & (1<<i))
 			{
-			iRemain[i] = EIdle;
-			iTotalRemain += EIdle;
+			iRemain[i] = EIdle * (TInt)A64CpuCapacity(i) / 1024;	// NeoSymbian: a slower core has less to give
+			iTotalRemain += iRemain[i];
 			}
 		else
 			iRemain[i] = EUnavailable;

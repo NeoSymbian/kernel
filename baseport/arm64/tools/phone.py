@@ -9,15 +9,19 @@ with nothing but the Python standard library and the fastboot tool.
       first it sets the phone's clock to the Mac's (monitor "date"; neoui then keeps it), unless --no-date
   phone.py cmd C...          run commands on a phone already up
   phone.py shot OUT.png      the framebuffer as a PNG
+  phone.py dump PART OUT     a GPT partition by name (or FIRST:COUNT sectors), read-only, checked against the
+                             kernel's SHA-256; prints the hash (docs telephony.md C0: radio partition backups)
   phone.py console           interactive (Ctrl-D ends)
   phone.py selftest          checks the PNG writer
 
-Monitor answers end with "\\n.\\n"; "shot" answers "SHOT w h\\n" and w*h*4 bytes of BGRX. Everything else on the line is
-the kernel log, streamed live.
+Monitor answers end with "\\n.\\n"; "shot" answers "SHOT w h\\n" and w*h*4 bytes of BGRX; "blk dump" answers "DUMP n\\n",
+n*512 raw bytes and "dump sha256 HEX err E". Everything else on the line is the kernel log, streamed live.
 """
 
 import glob
+import hashlib
 import os
+import re
 import select
 import struct
 import subprocess
@@ -122,6 +126,57 @@ class Console:
             raise SystemExit(f"shot: {len(data)} of {w * h * 4} bytes")
         write_png(png, w, h, data[: w * h * 4])
         return w, h
+
+    def parts(self):
+        """name -> (first, last) from the monitor's "blk gpt" """
+        out = self.cmd("blk gpt").decode(errors="replace")
+        return {m[1]: (int(m[2]), int(m[3])) for m in re.finditer(r"^\d+ (\S+) (\d+)\.\.(\d+)", out, re.M)}
+
+    def dump(self, first, count, path, idle=20):
+        """count sectors from first into path; returns the SHA-256 hex, after checking it against the kernel's"""
+        self.log += self.read(0.3)
+        self.send(f"blk dump {first} {count}")
+        head = self.read_until(b"\n", 10)
+        i = head.find(b"DUMP ")
+        if i < 0:
+            raise SystemExit(f"dump: no header ({head[-200:]!r})")
+        line, rest = head[i:].split(b"\n", 1)
+        if int(line.split()[1]) != count:
+            raise SystemExit(f"dump: header {line!r}, asked {count}")
+        total, h, got, t0, last = count * 512, hashlib.sha256(), 0, time.time(), time.time()
+        with open(path, "wb") as f:
+            buf = rest
+            while True:
+                take = buf[: total - got]
+                f.write(take)
+                h.update(take)
+                got += len(take)
+                if got == total:
+                    tail = buf[len(take) :]
+                    break
+                if time.time() - last > idle:
+                    raise SystemExit(f"dump: stalled at {got} of {total} bytes")
+                buf = b""
+                r, _, _ = select.select([self.fd], [], [], 0.5)
+                if r:
+                    try:
+                        buf = os.read(self.fd, 1 << 20)
+                        last = time.time()
+                    except (BlockingIOError, OSError):
+                        pass
+                if got >> 23 != (got + len(buf)) >> 23:
+                    print(f"  {(got + len(buf)) >> 20} of {total >> 20} MB", file=sys.stderr)
+        tail += self.read_until(END, 30)
+        m = re.search(rb"dump sha256 ([0-9a-f]{64}) err (-?\d+)", tail)
+        if not m:
+            raise SystemExit(f"dump: no trailer ({tail[-200:]!r})")
+        if int(m[2]):
+            raise SystemExit(f"dump: read error {int(m[2])} on the phone (zeros in the file)")
+        if m[1].decode() != h.hexdigest():
+            raise SystemExit(f"dump: SHA-256 mismatch, phone {m[1].decode()} Mac {h.hexdigest()}")
+        secs = time.time() - t0
+        print(f"  {total >> 20} MB in {secs:.0f} s ({total / secs / 1e6:.1f} MB/s)", file=sys.stderr)
+        return h.hexdigest()
 
     def close(self):
         os.close(self.fd)
@@ -248,6 +303,16 @@ def main(argv):
         for c in args:
             print("== " + c)
             print(con.cmd(c).decode(errors="replace").strip())
+    elif verb == "dump":
+        what, out = args
+        if ":" in what:
+            first, count = map(int, what.split(":"))
+        else:
+            parts = con.parts()
+            if what not in parts:
+                raise SystemExit(f"no partition {what!r} (have: {' '.join(sorted(parts))})")
+            first, count = parts[what][0], parts[what][1] - parts[what][0] + 1
+        print(f"{con.dump(first, count, out)}  {os.path.basename(out)}")
     elif verb == "shot":
         out = args[0] if args else "shot.png"
         w, h = con.shot(out)

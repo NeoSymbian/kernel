@@ -6,13 +6,15 @@
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel)
-//   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
+//   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
 //   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | rtc | date <unix UTC s> [UTC offset s]
-// "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
+// "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; "blk dump" sends "DUMP <n>\n", n*512 raw bytes,
+// then a text line with their SHA-256; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
 #include <kernel/kern_priv.h>
 #include <mmboot.h>
 #include <e32keys.h>
+#include <sha256.h>
 #include "board.h"
 #include "a64_blk.h"
 #include "a64_dbgmon.h"
@@ -299,6 +301,41 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 				}
 			}
 		}
+	else if (aArgc >= 4 && Eq(aArg[1], "dump"))			// raw sectors, read-only (telephony C0: radio partition backups)
+		{
+		static TUint8 d[128 * KA64BlkSector];
+		SHA256* sha = new SHA256;							// heap: a static would need a C++ constructor run
+		if (!sha)
+			{
+			Say("dump: no memory");
+			return;
+			}
+		TUint32 n = (TUint32)aNum[3];
+		TBuf8<40> h;
+		Fmt(h, "DUMP %u\n", n);
+		Write(h.Ptr(), h.Length());
+		TInt err = KErrNone;
+		for (TUint32 done = 0; done < n; )					// always n*512 bytes, so the host never waits forever
+			{
+			TInt k = (TInt)Min(n - done, (TUint32)128);
+			TInt r = A64BlkDev_Read(aNum[2] + done, k, d);
+			if (r != KErrNone)
+				{
+				memclr(d, k * KA64BlkSector);
+				if (err == KErrNone)
+					err = r;
+				}
+			sha->Update(d, k * KA64BlkSector);
+			Write(d, k * KA64BlkSector);
+			done += k;
+			}
+		const TDesC8& hash = sha->Final();
+		TBuf8<80> hex;
+		for (TInt i = 0; i < hash.Length(); ++i)
+			Fmt(hex, "%02x", hash[i]);
+		delete sha;
+		Say("\ndump sha256 %S err %d", &hex, err);
+		}
 	else if (aArgc >= 2 && Eq(aArg[1], "gpt"))			// every partition: name, first, last sector
 		{
 		TInt r = A64BlkDev_Read(1, 1, s);
@@ -334,7 +371,7 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		Say("%S (%d, trap %d)", &b, r, x);
 		}
 	else
-		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk wtest | blk speed | blk guard <lba> | blk mode <0-2>");
+		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk wtest | blk speed | blk guard <lba> | blk mode <0-2>");
 	}
 
 // smooth-ui S3b: per CPU, the core type (MIDR part) and the real clock: PMU cycles over 5 ms of the generic timer,

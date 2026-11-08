@@ -28,7 +28,12 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x00118000, 0x00001000, 1 },		// GCC: QUP wrapper 1 AHB + SE1 clock branches and RCG (a64_touch.cpp)
 	{ 0x00152000, 0x00001000, 1 },		// GCC: APCS clock branch enable vote 1
 	{ 0x00126000, 0x00001000, 1 },		// GCC: sdcc1 (eMMC) clock branches and RCG (qcom_sdhci.cpp)
-	{ 0x0010f000, 0x00001000, 1 },		// GCC: usb30_prim GDSC + master clock (qcom_dwc3_acm.cpp: is USB powered?)
+	{ 0x0010f000, 0x00001000, 1 },		// GCC: usb30_prim BCR, GDSC, clock branches and RCGs (qcom_usbpower.cpp)
+	{ 0x00105000, 0x00001000, 1 },		// GCC: cfg_noc_usb3_prim_axi clock branch
+	{ 0x00112000, 0x00001000, 1 },		// GCC: QUSB2 PHY (prim) BCR
+	{ 0x0016a000, 0x00001000, 1 },		// GCC: usb_phy_cfg_ahb2phy clock branch
+	{ 0x00182000, 0x00001000, 1 },		// GCC: aggre_usb3_prim_axi clock branch
+	{ 0x0018c000, 0x00001000, 1 },		// GCC: the USB reference clock gates (clkref)
 	{ 0x17980000, 0x00001000, 1 },		// APSS watchdog (a64_reboot.cpp: the reset fallback)
 	{ 0x00a84000, 0x00004000, 1 },		// GENI serial engine 1 of QUP wrapper 1: the touchscreen's I2C
 	{ 0x03906000, 0x00002000, 1 },		// TLMM north tile: gpio6, gpio7 (I2C SDA/SCL)

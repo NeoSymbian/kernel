@@ -435,17 +435,29 @@ void A64UsbDump()
 
 static TDynamicDfcQue* UsbQ;
 
+TInt A64UsbPowerOn(TUint32& aPll);						// qcom_usbpower.cpp
+
 void A64StartUsbConsole()
 	{
-	// ABL powers the USB controller only for fastboot: after a normal boot (the phone installed, boot_a) its power
-	// domain and clocks are off, and a DWC3 register access would stall the bus -- so look at them first (gcc-sdm845.c
-	// usb30_prim_gdsc 0xf004 PWR_ON bit 31, gcc_usb30_prim_master_clk 0xf00c CLK_OFF bit 31).
-	// shortcut: no console then; bringing the controller and its PHY up ourselves is a follow-up
+	// ABL powers the USB controller only for fastboot: after a normal boot (the phone installed) its power domain and
+	// clocks are off, and a DWC3 register access would stall the bus -- so look at them first (usb30_prim GDSC 0xf004
+	// PWR_ON bit 31, master clock 0xf00c CLK_OFF bit 31). Off: only in dev mode (the kernel console on at boot,
+	// CONSOLE=1) does the debug console power USB itself (qcom_usbpower.cpp) -- it gives full control of the phone.
+	// A fastboot RAM boot keeps it as before: whoever can RAM-boot holds the phone already.
 	const TUint32 gdsc = *(volatile TUint32*)A64_Io(0x0010f004), master = *(volatile TUint32*)A64_Io(0x0010f00c);
 	if (!(gdsc & (1u << 31)) || (master & (1u << 31)))
 		{
-		Kern::Printf("[usb] controller off (gdsc %08x, master clock %08x): a normal boot, no USB console", gdsc, master);
-		return;
+		if (!A64_ConsoleShown())
+			{
+			Kern::Printf("[usb] controller off (a normal boot) and not in dev mode: no USB debug console");
+			return;
+			}
+		TUint32 pll = 0;
+		TInt r = A64UsbPowerOn(pll);
+		Kern::Printf("[usb] controller off (gdsc %08x, master clock %08x): powered up -> %d, QUSB2 PLL status %02x (ABL's: 17)",
+			gdsc, master, r, pll);
+		if (r != KErrNone)
+			return;
 		}
 	TUint32 id = R(EGsnpsid);
 	Kern::Printf("[usb] DWC3 id %08x, ABL left dctl %08x dsts %08x dcfg %08x gctl %08x", id, R(EDctl), R(EDsts),

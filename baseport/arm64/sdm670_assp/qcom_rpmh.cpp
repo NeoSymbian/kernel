@@ -142,7 +142,14 @@ void A64RpmhVote(const TDesC8& aName, TDes8& aOut)
 		n[i] = (char)aName[i];
 		arc = arc || n[i] == '.';
 		}
-	if (arc)
+	if (n[0] == 'l' && n[1] == 'd' && n[2] == 'o')			// "ldob7": a regulator, looked up only (no vote)
+		{
+		TUint32 addr = 0, aux[2];
+		TInt r = CmdDb_Find(n, addr, aux);
+		TPtrC8 name((const TUint8*)n);
+		Fmt(aOut, "%S: cmd-db addr %05x -> %d (lookup only)", &name, addr, r);
+		}
+	else if (arc)
 		Arc_Vote(n, 64, &aOut);								// "cx.lvl": low_svs, the eMMC's DT opp at 20 MHz
 	else
 		Bcm_Vote(n, 52286, 80000, 16, &aOut);
@@ -175,6 +182,29 @@ TInt Arc_Vote(const char* aName, TUint32 aVlvl, TDes8* aOut)
 	TPtrC8 name((const TUint8*)aName);
 	Fmt(b, "[rpmh] %S: addr %05x, %d levels, vlvl %d -> corner %d (vlvl %d) -> %d", &name, addr, len / 2, aVlvl,
 		hlvl, got, r);
+	Kern::Printf("%S", &b);
+	if (aOut)
+		aOut->Copy(b);
+	return r;
+	}
+
+// a VRM regulator (an LDO or SMPS by its cmd-db name, e.g. "ldob7" = pm660l ldo7): voltage (mV) at +0, mode at +8
+// (7 = an LDO's high-power mode), enable at +4 -- the layout of the RPMh VRM resource
+TInt Vrm_Vote(const char* aName, TUint32 aMilliVolts, TDes8* aOut)
+	{
+	TUint32 addr = 0;
+	const TUint8* aux = NULL;
+	TInt len = 0;
+	TInt r = Find(aName, addr, aux, len);
+	if (r == KErrNone)
+		r = Rpmh_Write(addr + 0, aMilliVolts);
+	if (r == KErrNone)
+		r = Rpmh_Write(addr + 8, 7);
+	if (r == KErrNone)
+		r = Rpmh_Write(addr + 4, 1);
+	TBuf8<120> b;
+	TPtrC8 name((const TUint8*)aName);
+	Fmt(b, "[rpmh] %S: addr %05x, %d mV, HPM, on -> %d", &name, addr, aMilliVolts, r);
 	Kern::Printf("%S", &b);
 	if (aOut)
 		aOut->Copy(b);

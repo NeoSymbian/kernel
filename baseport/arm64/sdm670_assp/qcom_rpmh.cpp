@@ -210,3 +210,15 @@ TInt Vrm_Vote(const char* aName, TUint32 aMilliVolts, TDes8* aOut)
 		aOut->Copy(b);
 	return r;
 	}
+
+TInt Vrm_Off(const char* aName)
+	{
+	TUint32 addr = 0;
+	const TUint8* aux = NULL;
+	TInt len = 0;
+	TInt r = Find(aName, addr, aux, len);
+	if (r == KErrNone)
+		r = Rpmh_Write(addr + 4, 0);
+	Kern::Printf("[rpmh] %s: off -> %d", aName, r);
+	return r;
+	}

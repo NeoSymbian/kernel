@@ -11,6 +11,7 @@
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_dbgmon.h"
+#include "qcom_rpmh.h"
 
 const TUint32 KDwc3 = 0x0a600000;
 const TUint32 KQscratch = 0x0a6f8800, KQusb2 = 0x088e2000;	// the Qualcomm wrapper; the HS PHY (qusb2-v2)
@@ -437,6 +438,73 @@ static TDynamicDfcQue* UsbQ;
 
 TInt A64UsbPowerOn(TUint32& aPll);						// qcom_usbpower.cpp
 
+// reset the device controller and start it as the debug console's gadget (the PHY setup stays)
+static void Bringup()
+	{
+	R(EDctl) &= ~(1u << 31);								// RunStop off
+	for (TInt i = 0; i < 1000000 && !(R(EDsts) & (1u << 22)); ++i)		// until halted
+		{}
+	TUint32 phy = R(EGusb2PhyCfg);
+	R(EDctl) |= 1u << 30;									// CSFTRST
+	for (TInt i = 0; i < 1000000 && (R(EDctl) & (1u << 30)); ++i)
+		{}
+	R(EGusb2PhyCfg) = phy & ~((1u << 6) | (1u << 8));		// DTB: dis_u2_susphy_quirk, dis_enblslpm_quirk
+	R(EGctl) = (R(EGctl) & ~(3u << 12)) | (2u << 12);		// device mode
+	R(EGevntAdrLo) = AreaPhys + EOffEv;
+	R(EGevntAdrHi) = 0;
+	R(EGevntSiz) = (1u << 31) | KEvSize;					// interrupt masked: polled
+	R(EGevntCount) = R(EGevntCount) & 0xffff;				// drop stale events
+	EvPos = 0;
+	R(EDcfg) = (R(EDcfg) & ~((7u) | (0x7f << 3))) | 0;		// high speed, address 0
+	R(EDevten) = (1u << 0) | (1u << 1) | (1u << 2);			// disconnect, reset, connect done
+	// ABL drops the session when it leaves fastboot: no VBUS sensing in device mode, so override it as Linux
+	// dwc3-qcom does (vbus_override_enable), and power the HS PHY back up if ABL powered it down
+	Kern::Printf("[usb] ABL left hsphy %08x ssphy %08x qusb2 pd %08x pll %08x", Q(EHsPhyCtrl), Q(ESsPhyCtrl),
+		P(EPhyPowerDown), P(EPhyPllStatus));
+	Q(ESsPhyCtrl) |= 1u << 24;								// LANE0_PWR_PRESENT
+	Q(EHsPhyCtrl) |= (1u << 20) | (1u << 28);				// UTMI_OTG_VBUS_VALID, SW_SESSVLD_SEL
+	if (P(EPhyPowerDown) & 1)
+		P(EPhyPowerDown) &= ~1u;
+	DepCmd(EPhysEp0Out, ECmdStartCfg);
+	EpConfig(EPhysEp0Out, 0, KEp0Max, 0);
+	EpConfig(EPhysEp0In, 0, KEp0Max, 0);
+	DepCmd(EPhysEp0Out, ECmdSetXferRes, 1);
+	DepCmd(EPhysEp0In, ECmdSetXferRes, 1);
+	R(EDalepena) = 3;
+	StartSetup();
+	R(EDctl) = (R(EDctl) & ~(1u << 30)) | (1u << 31);		// RunStop: connect
+	}
+
+void A64UsbPowerOff();									// qcom_usbpower.cpp
+void A64UsbPowerDiag(TDes8& aOut);
+
+// the monitor's "usb cold" (debug, a fastboot RAM boot): turn USB off the way a normal boot finds it, then bring it up
+// ourselves (qcom_usbpower.cpp) and restart the console -- one RAM boot per try instead of a flash and a normal boot.
+// Runs in the poll DFC (the monitor line came from it); the host sees the console vanish and come back.
+extern TInt UsbVoteMask;
+void A64UsbCold(TDes8& aOut, TInt aMask)
+	{
+	UsbVoteMask = aMask;
+	R(EDctl) &= ~(1u << 31);
+	for (TInt i = 0; i < 1000000 && !(R(EDsts) & (1u << 22)); ++i)
+		{}
+	A64UsbPowerOff();
+	NKern::Sleep(NKern::TimerTicks(200));
+	TUint32 pll = 0;
+	TInt r = A64UsbPowerOn(pll);
+	TBuf8<200> d;
+	A64UsbPowerDiag(d);
+	Kern::Printf("[usb] cold (votes %d): powered up -> %d, PLL %02x; %S", aMask, r, pll, &d);
+	Append(aOut, "usb cold: powered up -> %d, PLL %02x", r, pll);
+	if (r != KErrNone)
+		return;
+	Ep0 = ESetup;
+	Configured = Dtr = InBusy = OutBusy = AbortIn = EFalse;
+	memclr((TAny*)Area, KAreaSize);
+	Bringup();
+	A64UsbDump();
+	}
+
 void A64StartUsbConsole()
 	{
 	// ABL powers the USB controller only for fastboot: after a normal boot (the phone installed) its power domain and
@@ -481,39 +549,7 @@ void A64StartUsbConsole()
 	Area = chunk->LinearAddress();
 	memclr((TAny*)Area, KAreaSize);
 
-	// stop what ABL left running, then reset the device controller (the PHY setup stays)
-	R(EDctl) &= ~(1u << 31);								// RunStop off
-	for (TInt i = 0; i < 1000000 && !(R(EDsts) & (1u << 22)); ++i)		// until halted
-		{}
-	TUint32 phy = R(EGusb2PhyCfg);
-	R(EDctl) |= 1u << 30;									// CSFTRST
-	for (TInt i = 0; i < 1000000 && (R(EDctl) & (1u << 30)); ++i)
-		{}
-	R(EGusb2PhyCfg) = phy & ~((1u << 6) | (1u << 8));		// DTB: dis_u2_susphy_quirk, dis_enblslpm_quirk
-	R(EGctl) = (R(EGctl) & ~(3u << 12)) | (2u << 12);		// device mode
-	R(EGevntAdrLo) = AreaPhys + EOffEv;
-	R(EGevntAdrHi) = 0;
-	R(EGevntSiz) = (1u << 31) | KEvSize;					// interrupt masked: polled
-	R(EGevntCount) = R(EGevntCount) & 0xffff;				// drop stale events
-	EvPos = 0;
-	R(EDcfg) = (R(EDcfg) & ~((7u) | (0x7f << 3))) | 0;		// high speed, address 0
-	R(EDevten) = (1u << 0) | (1u << 1) | (1u << 2);			// disconnect, reset, connect done
-	// ABL drops the session when it leaves fastboot: no VBUS sensing in device mode, so override it as Linux
-	// dwc3-qcom does (vbus_override_enable), and power the HS PHY back up if ABL powered it down
-	Kern::Printf("[usb] ABL left hsphy %08x ssphy %08x qusb2 pd %08x pll %08x", Q(EHsPhyCtrl), Q(ESsPhyCtrl),
-		P(EPhyPowerDown), P(EPhyPllStatus));
-	Q(ESsPhyCtrl) |= 1u << 24;								// LANE0_PWR_PRESENT
-	Q(EHsPhyCtrl) |= (1u << 20) | (1u << 28);				// UTMI_OTG_VBUS_VALID, SW_SESSVLD_SEL
-	if (P(EPhyPowerDown) & 1)
-		P(EPhyPowerDown) &= ~1u;
-	DepCmd(EPhysEp0Out, ECmdStartCfg);
-	EpConfig(EPhysEp0Out, 0, KEp0Max, 0);
-	EpConfig(EPhysEp0In, 0, KEp0Max, 0);
-	DepCmd(EPhysEp0Out, ECmdSetXferRes, 1);
-	DepCmd(EPhysEp0In, ECmdSetXferRes, 1);
-	R(EDalepena) = 3;
-	StartSetup();
-	R(EDctl) = (R(EDctl) & ~(1u << 30)) | (1u << 31);		// RunStop: connect
+	Bringup();
 	A64UsbDump();
 
 	PollDfc.SetDfcQ(UsbQ);

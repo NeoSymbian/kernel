@@ -202,6 +202,7 @@ __attribute__((weak)) TInt A64BlkDev_Monitor(TInt, const TPtrC8*, const TUint64*
 	return KErrNotSupported;
 	}
 __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
+__attribute__((weak)) void A64UsbCold(TDes8& aOut, TInt) { aOut.Copy((const TUint8*)"usb cold: not on this board", 27); }
 __attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((const TUint8*)"rpmh: not on this board", 23); }
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
 __attribute__((weak)) int Spmi_Write(unsigned, unsigned, unsigned) { return KErrNotSupported; }
@@ -502,7 +503,10 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	else if (Eq(c, "usb"))
 		{
 		TBuf8<200> b;
-		A64UsbStatus(b);
+		if (argc >= 2 && Eq(arg[1], "cold"))				// Pixel: power USB off and back up ourselves (debug)
+			A64UsbCold(b, argc >= 3 ? (TInt)num[2] : 7);	// rails voted: 1 ldob1, 2 ldoa10, 4 ldob7
+		else
+			A64UsbStatus(b);
 		Say("%S", &b);
 		}
 	else if (Eq(c, "shot"))

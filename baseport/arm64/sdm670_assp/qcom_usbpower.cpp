@@ -16,6 +16,13 @@
 #include "board.h"
 #include "qcom_rpmh.h"
 
+TInt UsbVoteMask = 7;
+static void Step(const char* aWhat)					// debug: the PHY's registers after each step
+	{
+	Kern::Printf("[usb] power: %s: phy 000=%02x 210=%02x 1a0=%02x", aWhat, *(volatile TUint32*)A64_Io(0x088e2000) & 0xff,
+		*(volatile TUint32*)A64_Io(0x088e2210) & 0xff, *(volatile TUint32*)A64_Io(0x088e21a0) & 0xff);
+	}
+									// which rails A64UsbPowerOn votes (monitor "usb cold <mask>")
 static volatile TUint32& G(TUint32 aPhys) { return *(volatile TUint32*)A64_Io(aPhys); }
 const TUint32 KGcc = 0x00100000, KQusb = 0x088e2000;
 
@@ -72,8 +79,11 @@ static TInt Branch(TUint32 aCbcr, TBool aStatus = ETrue)	// clock branch: enable
 // thread context, the controller untouched since reset: KErrNone and the PHY's PLL status, or the step that failed
 TInt A64UsbPowerOn(TUint32& aPll)
 	{
-	if (Vrm_Vote("ldob1", 880) != KErrNone || Vrm_Vote("ldoa10", 1800) != KErrNone || Vrm_Vote("ldob7", 3088) != KErrNone)
-		return -99;											// the PHY's three rails (see the top)
+	if (((UsbVoteMask & 1) && Vrm_Vote("ldob1", 880) != KErrNone) ||		// the PHY's three rails (see the top)
+		((UsbVoteMask & 2) && Vrm_Vote("ldoa10", 1800) != KErrNone) ||
+		((UsbVoteMask & 4) && Vrm_Vote("ldob7", 3088) != KErrNone))
+		return -99;
+	Step("start");
 	G(KGcc + 0xf004) &= ~1u;								// GDSC: SW_COLLAPSE off
 	if (!Wait(KGcc + 0xf004, 1u << 31, ETrue))				// PWR_ON
 		return -100;
@@ -87,18 +97,61 @@ TInt A64UsbPowerOn(TUint32& aPll)
 			return -110 - (TInt)i;
 	for (TUint32 c = 0x8c000; c <= 0x8c010; c += 8)			// clkref gates: no status bit
 		Branch(c, EFalse);
+	Step("clocks on");
 	G(KGcc + 0xf000) = 1;									// controller block reset, pulsed
 	Kern::NanoWait(100000);
 	G(KGcc + 0xf000) = 0;
-	G(KGcc + 0x12000) = 1;									// PHY block reset, pulsed
-	Kern::NanoWait(100000);
-	G(KGcc + 0x12000) = 0;
-	Kern::NanoWait(100000);
+	Step("controller reset");
+	if (!(UsbVoteMask & 8))									// debug: 8 = skip the PHY's reset
+		{
+		G(KGcc + 0x12000) = 1;								// PHY block reset, pulsed
+		Kern::NanoWait(100000);
+		G(KGcc + 0x12000) = 0;
+		Kern::NanoWait(100000);
+		}
+	Step("phy reset");
 	G(KQusb + KPhyPwrCtrl1) |= 1;							// powered down while it is programmed
 	for (TUint i = 0; i < sizeof(KPhy) / sizeof(KPhy[0]); ++i)
 		G(KQusb + KPhy[i][0]) = KPhy[i][1];
+	Step("table written");
 	G(KQusb + KPhyPwrCtrl1) = KPhyPwrCtrl1Abl;				// power up (bit 0 clear), ABL's value
 	Kern::NanoWait(1000000);								// the PLL locks within ~150 us
 	aPll = G(KQusb + KPhyPllStatus) & 0xff;
 	return KErrNone;
+	}
+
+// the reverse, for the monitor's "usb cold": branches gated, the power domain collapsed, the PHY's 3.1 V rail voted off
+void A64UsbPowerOff()
+	{
+	G(KQusb + KPhyPwrCtrl1) |= 1;
+	const TUint32 branches[] = { 0x0f014, 0x0f010, 0x0f00c, 0x6a004, 0x82010, 0x0502c };
+	for (TUint i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i)
+		G(KGcc + branches[i]) &= ~1u;
+	G(KGcc + 0xf004) |= 1;									// SW_COLLAPSE
+	Wait(KGcc + 0xf004, 1u << 31, EFalse);
+	Vrm_Off("ldob7");
+	}
+
+static void Fmt(TDes8& aOut, const char* aFmt, ...)
+	{
+	VA_LIST list;
+	VA_START(list, aFmt);
+	Kern::AppendFormat(aOut, aFmt, list);
+	VA_END(list);
+	}
+
+// GCC and PHY against ABL's fastboot values: the first registers that differ
+void A64UsbPowerDiag(TDes8& aOut)
+	{
+	Fmt(aOut, "gdsc %08x cbcr %08x/%08x/%08x rcg %08x/%08x bcr %08x/%08x; phy diffs:", G(KGcc + 0xf004),
+		G(KGcc + 0xf00c), G(KGcc + 0x6a004), G(KGcc + 0x82010), G(KGcc + 0xf01c), G(KGcc + 0xf034), G(KGcc + 0xf000),
+		G(KGcc + 0x12000));
+	TInt n = 0;
+	for (TUint i = 0; i < sizeof(KPhy) / sizeof(KPhy[0]); ++i)
+		{
+		const TUint32 v = G(KQusb + KPhy[i][0]) & 0xff;
+		if (v != KPhy[i][1] && ++n <= 6)
+			Fmt(aOut, " %03x=%02x(%02x)", KPhy[i][0], v, KPhy[i][1]);
+		}
+	Fmt(aOut, " [%d]", n);
 	}

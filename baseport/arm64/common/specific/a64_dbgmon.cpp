@@ -6,7 +6,7 @@
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel)
-//   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
+//   blk info | blk gpt | blk read <lba> [n] | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
 //   key <scancode> | type <text> | shot | reboot | fastboot
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
@@ -332,6 +332,40 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk wtest | blk speed | blk guard <lba> | blk mode <0-2>");
 	}
 
+// smooth-ui S3b: per CPU, the core type (MIDR part) and the real clock: PMU cycles over 5 ms of the generic timer,
+// counted on that CPU (the monitor thread pins itself to each in turn). XTRAP in case the hypervisor traps the PMU.
+static void Cpus()
+	{
+	NThread* me = NKern::CurrentThread();
+	TUint64 hz;
+	__asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(hz));
+	for (TInt cpu = 0; cpu < NKern::NumberOfCpus(); ++cpu)
+		{
+		TUint32 old = NKern::ThreadSetCpuAffinity(me, cpu);
+		TInt on = NKern::CurrentCpu();
+		TUint64 midr, t0 = 0, t1 = 0, c0 = 0, c1 = 0;
+		__asm__ __volatile__("mrs %0, midr_el1" : "=r"(midr));
+		TInt r = KErrNone;
+		XTRAP(r, XT_DEFAULT, {
+			__asm__ __volatile__("msr pmcr_el0, %0; msr pmccfiltr_el0, xzr; msr pmcntenset_el0, %1; isb"
+				:: "r"((TUint64)5), "r"((TUint64)1 << 31));		// E + reset the cycle counter; count EL0 and EL1
+			__asm__ __volatile__("isb; mrs %0, cntvct_el0; mrs %1, pmccntr_el0" : "=r"(t0), "=r"(c0));
+			do
+				__asm__ __volatile__("isb; mrs %0, cntvct_el0" : "=r"(t1));
+			while (t1 - t0 < hz / 200);
+			__asm__ __volatile__("isb; mrs %0, pmccntr_el0" : "=r"(c1));
+			});
+		NKern::ThreadSetCpuAffinity(me, old);
+		TUint part = (TUint)(midr >> 4) & 0xfff;
+		const char* type = part == 0x803 || part == 0xd05 ? "silver (A55)" : part == 0x802 || part == 0xd0a ? "gold (A75)" : "?";	// Kryo 385 / Arm
+		if (r != KErrNone)
+			Say("cpu %d (ran on %d): MIDR %08x part %03x %s, PMU trapped (%d)", cpu, on, (TUint)midr, part, type, r);
+		else
+			Say("cpu %d (ran on %d): MIDR %08x part %03x %s, %d MHz", cpu, on, (TUint)midr, part, type,
+				(TInt)((c1 - c0) * hz / (t1 - t0) / 1000000));
+		}
+	}
+
 static void Post(TRawEvent::TType aType, TInt aX, TInt aY)
 	{
 	TRawEvent e;
@@ -379,7 +413,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console peek poke spmi rpmh blk slot touch keys threads usb tap swipe key type shot reboot fastboot wdt");
+		Say("help log lastlog console peek poke spmi rpmh blk slot touch keys threads cpus usb tap swipe key type shot reboot fastboot wdt");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -461,6 +495,8 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		A64KeysDump();
 	else if (Eq(c, "threads"))
 		A64DumpThreads();
+	else if (Eq(c, "cpus"))
+		Cpus();
 	else if (Eq(c, "tap") && argc >= 3)
 		{
 		Post(TRawEvent::EButton1Down, (TInt)num[1], (TInt)num[2]);

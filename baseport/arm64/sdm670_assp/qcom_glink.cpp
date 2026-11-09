@@ -24,6 +24,8 @@ enum { EVersion = 0, EVersionAck = 1, EOpen = 2, EClose = 3, EOpenAck = 4, EInte
 	ESignals = 15 };
 const TUint32 KFifoSize = 0x4000, KReserve = 16;			// FIFO_FULL_RESERVE + TX_BLOCKED_CMD_RESERVE
 const TInt KChannels = 8, KIntents = 4, KRemoteIntents = 16, KIntentSize = 2048, KName = 32;
+// our receive buffers per channel: KIntents advertised at open, the rest for the remote's intent requests
+const TInt KSlots = 8;
 
 struct SMsg { TUint16 iCmd, iParam1; TUint32 iParam2; };
 
@@ -38,7 +40,7 @@ struct SChannel
 	TBool iOpenSent, iOpenAcked;
 	TGlinkRx iRx;
 	TAny* iPtr;
-	SIntent iIn[KIntents];			// our receive buffers, advertised to the remote
+	SIntent iIn[KSlots];			// our receive buffers, advertised to the remote (iBuf 0: unused slot)
 	SRemoteIntent iRemote[KRemoteIntents];	// the remote's receive buffers we may send into
 	TInt iRxCount, iTxCount;
 	};
@@ -53,6 +55,7 @@ struct SEdge
 	TBool iUp, iVersionAcked;
 	TUint32 iNextIntent;
 	TInt iBadCmds;
+	TInt iLost;						// data for an intent we don't have (dropped, logged)
 	SChannel iCh[KChannels];
 	TInt iNCh;
 	};
@@ -320,9 +323,12 @@ static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all th
 			return EFalse;
 		SChannel* c = ByRcid(E, h.iM.iParam1);
 		SIntent* in = NULL;
-		for (TInt i = 0; c && i < KIntents; ++i)
+		for (TInt i = 0; c && i < KSlots; ++i)
 			if (c->iIn[i].iBuf && c->iIn[i].iId == h.iM.iParam2)
 				in = &c->iIn[i];
+		if (c && !in && ++E.iLost <= 8)						// data for an intent we don't have: say so, never silently
+			Kern::Printf("[glink %d] data for unknown intent %d on lcid %d dropped (%d lost)", E.iRemote,
+				h.iM.iParam2, c->iLcid, E.iLost);
 		if (in && in->iFill + h.iChunk <= in->iSize)
 			{
 			RxPeek(E, in->iBuf + in->iFill, sizeof(h), h.iChunk);
@@ -341,28 +347,29 @@ static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all th
 		}
 	case EIntentReq:										// the remote wants a buffer of param2 bytes
 		{
+		// A new buffer in a slot never advertised, as Linux (qcom_glink_alloc_intent). Regrowing an advertised idle
+		// one re-numbered a buffer the remote still held: what it then sent into the old id was lost, a random few
+		// of the modem's NEW_SERVERs per boot (VOICE among them: no calls, C6 2026-11-09).
 		RxAdvance(E, sizeof(m));
 		SChannel* c = ByRcid(E, m.iParam1);
 		TBool granted = EFalse;
-		for (TInt i = 0; c && i < KIntents && !granted; ++i)
-			if (!c->iIn[i].iFill)							// an idle one: regrow it
+		for (TInt i = 0; c && i < KSlots && !granted; ++i)
+			if (!c->iIn[i].iBuf)
 				{
 				SIntent& in = c->iIn[i];
 				NKern::ThreadEnterCS();
-				TUint8* b = (TUint8*)Kern::Alloc(m.iParam2);
-				if (b)
-					{
-					Kern::Free(in.iBuf);
-					in.iBuf = b;
-					in.iSize = m.iParam2;
-					}
+				in.iBuf = (TUint8*)Kern::Alloc(m.iParam2);
 				NKern::ThreadLeaveCS();
-				if (b)
+				in.iSize = in.iBuf ? m.iParam2 : 0;
+				if (in.iBuf)
 					{
 					Advertise(E, *c, in);
 					granted = ETrue;
 					}
 				}
+		if (c && !granted)
+			Kern::Printf("[glink %d] intent request for %d bytes on lcid %d refused: no free slot", E.iRemote,
+				m.iParam2, c->iLcid);
 		if (c)
 			Cmd(E, EIntentReqAck, c->iLcid, granted);
 		return ETrue;

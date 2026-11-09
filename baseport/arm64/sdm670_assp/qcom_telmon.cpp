@@ -248,6 +248,7 @@ void A64Tel_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 			A64Mon_Say("glink hello -> %d", Glink_Send(1, pkt, sizeof(pkt)));	// channel 1 = IPCRTR
 			}
 		Glink_Dump(A64Mon_Say);
+		Tel_Dump(A64Mon_Say);
 		}
 	else if (Eq(aArg[0], "mss"))
 		{

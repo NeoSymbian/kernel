@@ -88,9 +88,10 @@ void Qrtr_Rx(TAny* aRing, const TUint8* aData, TInt aLen)	// aRing NULL: the mod
 	{
 	SRing& r = *(SRing*)(aRing ? aRing : Tel_Ring(0));
 	TUint32 rec = 4 + ((aLen + 3) & ~3);
+	TUint32 drops = 0;
 	NKern::FMWait(&r.iLock);
 	if (aLen <= 0 || aLen > KMaxMsg || KRing - (r.iHead - r.iTail) < rec)
-		++r.iDrops;
+		drops = ++r.iDrops;
 	else
 		{
 		TUint32 len = aLen;
@@ -99,6 +100,32 @@ void Qrtr_Rx(TAny* aRing, const TUint8* aData, TInt aLen)	// aRing NULL: the mod
 		r.iHead += rec;
 		}
 	NKern::FMSignal(&r.iLock);
+	if (drops && (drops == 1 || drops % 64 == 0))						// a lost confirm_rx stalls the sender for good: say so
+		Kern::Printf("[tel] ring %d: message of %d bytes dropped (%d so far)", &r - Rings, aLen, drops);
+	}
+
+void Tel_Dump(void (*aSay)(const char*, ...))
+	{
+	for (TInt i = 0; i < KTelRings; ++i)
+		aSay("tel ring %d: channel %x, %d bytes queued, %d dropped", i, Rings[i].iChannel,
+			Rings[i].iHead - Rings[i].iTail, Rings[i].iDrops);
+	}
+
+// the modem's own reason, once, when it raises FATAL while running (the boot path prints it for boot failures)
+static void FatalReason(TUint32 aSlaveKernel)
+	{
+	static TBool said;
+	if (!(aSlaveKernel & KMssFatal) || said)
+		return;
+	said = ETrue;
+	TUint32 len = 0;
+	const char* why = (const char*)Smem_Get(KSmemHostGlobal, 421, &len);	// SMEM_SSR_REASON_MSS0
+	char buf[160];											// a short copy: monitor output over 256 bytes faults
+	TUint32 n = why ? Min(len, (TUint32)sizeof(buf) - 1) : 0;
+	for (TUint32 i = 0; i < n; ++i)
+		buf[i] = why[i] >= 0x20 && why[i] < 0x7f ? why[i] : '.';
+	buf[n] = 0;
+	Kern::Printf("[tel] modem FATAL (slave-kernel %08x): %s", aSlaveKernel, n ? buf : "(no reason)");
 	}
 
 static TInt RingPop(SRing& aR, TUint8* aBuf)				// aBuf holds KMaxMsg; the length, or KErrNotReady
@@ -246,6 +273,7 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		out[0] = step;
 		out[1] = err;
 		Smp2p_In(KSmemHostModem, "slave-kernel", out[2]);
+		FatalReason(out[2]);
 		kumemput32(a1, out, sizeof(out));
 		return KErrNone;
 		}

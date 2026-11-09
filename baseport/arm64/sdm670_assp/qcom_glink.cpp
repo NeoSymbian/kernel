@@ -13,6 +13,8 @@
 // Telephony C3: the QRTR channel "IPCRTR" to the modem. C6: the ADSP's "IPCRTR" and "apr_audio_svc".
 // A channel id is edge << 8 | lcid, so the modem's channels keep ids 1..8.
 // shortcut: no intent reuse (features 0).
+// What the GLINK thread sends (acks, OPEN, INTENT, RX_DONE) goes through an ordered outbox: a full FIFO delays it,
+// never loses it, and nothing counts as sent before it is (2026-11-09 review F03).
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "qcom_ipc.h"
@@ -26,6 +28,8 @@ const TUint32 KFifoSize = 0x4000, KReserve = 16;			// FIFO_FULL_RESERVE + TX_BLO
 const TInt KChannels = 8, KIntents = 4, KRemoteIntents = 16, KIntentSize = 2048, KName = 32;
 // our receive buffers per channel: KIntents advertised at open, the rest for the remote's intent requests
 const TInt KSlots = 8;
+const TInt KOutbox = 16, KOutMsg = 8 + KName;					// the longest control message: OPEN + its name
+const TInt KMostPosts = 2 + KIntents;							// one command's replies at most (OPEN_ACK, OPEN, INTENTs)
 
 struct SMsg { TUint16 iCmd, iParam1; TUint32 iParam2; };
 
@@ -43,7 +47,9 @@ struct SChannel
 	SIntent iIn[KSlots];			// our receive buffers, advertised to the remote (iBuf 0: unused slot)
 	SRemoteIntent iRemote[KRemoteIntents];	// the remote's receive buffers we may send into
 	TInt iRxCount, iTxCount;
+	TInt iRefused;					// the remote's intent requests we could not grant
 	};
+struct SOut { TUint32 iLen; TUint8 iData[KOutMsg]; };
 
 struct SEdge
 	{
@@ -56,6 +62,8 @@ struct SEdge
 	TUint32 iNextIntent;
 	TInt iBadCmds;
 	TInt iLost;						// data for an intent we don't have (dropped, logged)
+	SOut iOut[KOutbox];				// the GLINK thread's messages the FIFO did not take yet, in order
+	TInt iOutN, iOutWaits;
 	SChannel iCh[KChannels];
 	TInt iNCh;
 	};
@@ -149,10 +157,39 @@ static TInt Tx(SEdge& E, const TAny* aHdr, TUint32 aHlen, const TAny* aData = NU
 	return KErrNone;
 	}
 
-static void Cmd(SEdge& E, TUint16 aCmd, TUint16 aP1, TUint32 aP2)
+// the GLINK thread's sends: straight out if nothing waits, else after what does (Flush, every poll)
+static void Post(SEdge& E, const TAny* aMsg, TUint32 aLen)
+	{
+	if (!E.iOutN && Tx(E, aMsg, aLen) == KErrNone)
+		return;
+	if (E.iOutN == KOutbox)									// RxOne keeps KMostPosts free: a bug if it happens
+		{
+		++E.iBadCmds;
+		Kern::Printf("[glink %d] outbox full: message %d dropped", E.iRemote, *(const TUint16*)aMsg);
+		return;
+		}
+	if (!E.iOutN++)
+		Kern::Printf("[glink %d] TX FIFO full: messages wait (%d times)", E.iRemote, ++E.iOutWaits);
+	SOut& o = E.iOut[E.iOutN - 1];
+	o.iLen = aLen;
+	memcpy(o.iData, aMsg, aLen);
+	}
+
+static void Flush(SEdge& E)
+	{
+	TInt n = 0;
+	while (n < E.iOutN && Tx(E, E.iOut[n].iData, E.iOut[n].iLen) == KErrNone)
+		++n;
+	if (!n)
+		return;
+	E.iOutN -= n;
+	memmove(E.iOut, E.iOut + n, E.iOutN * sizeof(SOut));
+	}
+
+static void Cmd(SEdge& E, TUint16 aCmd, TUint16 aP1, TUint32 aP2)	// GLINK thread only
 	{
 	SMsg m = { aCmd, aP1, aP2 };
-	Tx(E, &m, sizeof(m));
+	Post(E, &m, sizeof(m));
 	}
 
 // ---- channels
@@ -184,7 +221,8 @@ static SChannel* NewChannel(SEdge& E, const TDesC8& aName)
 	return c;
 	}
 
-static void SendOpen(SEdge& E, SChannel& aC)
+// OPEN from the GLINK thread (posted: it goes) or a user's Glink_Open (sent now, or an error and not sent)
+static TInt SendOpen(SEdge& E, SChannel& aC, TBool aGlinkThread)
 	{
 	struct { SMsg iM; TUint8 iName[KName]; } m;
 	memclr(&m, sizeof(m));
@@ -192,8 +230,14 @@ static void SendOpen(SEdge& E, SChannel& aC)
 	m.iM.iParam1 = aC.iLcid;
 	m.iM.iParam2 = aC.iNameLen + 1;
 	memcpy(m.iName, aC.iName, aC.iNameLen);
-	Tx(E, &m, (sizeof(SMsg) + aC.iNameLen + 1 + 7) & ~7u);
-	aC.iOpenSent = ETrue;
+	TUint32 len = (sizeof(SMsg) + aC.iNameLen + 1 + 7) & ~7u;
+	TInt r = KErrNone;
+	if (aGlinkThread)
+		Post(E, &m, len);
+	else
+		r = Tx(E, &m, len);
+	aC.iOpenSent = r == KErrNone;
+	return r;
 	}
 
 static void Advertise(SEdge& E, SChannel& aC, SIntent& aI)
@@ -201,7 +245,7 @@ static void Advertise(SEdge& E, SChannel& aC, SIntent& aI)
 	aI.iId = ++E.iNextIntent;
 	aI.iFill = 0;
 	struct { SMsg iM; TUint32 iSize, iId; } m = { { EIntent, aC.iLcid, 1 }, aI.iSize, aI.iId };
-	Tx(E, &m, sizeof(m));
+	Post(E, &m, sizeof(m));									// GLINK thread only; the id is the remote's once it arrives
 	}
 
 static void AdvertiseAll(SEdge& E, SChannel& aC)						// once both sides opened: our receive buffers
@@ -224,6 +268,8 @@ static void AdvertiseAll(SEdge& E, SChannel& aC)						// once both sides opened:
 // ---- receive
 static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all there yet
 	{
+	if (KOutbox - E.iOutN < KMostPosts)						// no room for the replies: read on once some went
+		return EFalse;
 	TUint32 avail = RxAvail(E);
 	if (avail < sizeof(SMsg))
 		return EFalse;
@@ -262,7 +308,7 @@ static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all th
 		// driver binds): a fully opened "apr_voice_svc" told the modem the AP takes its voice APR, which went
 		// nowhere, and the ADSP's START_VOICE waited forever (C6, 2026-11-09)
 		if (c->iRx && !c->iOpenSent)
-			SendOpen(E, *c);
+			SendOpen(E, *c, ETrue);
 		if (c->iOpenAcked)
 			AdvertiseAll(E, *c);
 		return ETrue;
@@ -340,8 +386,18 @@ static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all th
 			++c->iRxCount;
 			if (c->iRx)
 				c->iRx(c->iPtr, in->iBuf, in->iFill);
-			Cmd(E, ERxDone, c->iLcid, in->iId);			// the buffer is free again: give it back under a new id
-			Advertise(E, *c, *in);
+			Cmd(E, ERxDone, c->iLcid, in->iId);
+			if (in < c->iIn + KIntents)
+				Advertise(E, *c, *in);						// one of ours: free again, given back under a new id
+			else
+				{
+				// one the remote asked for: used once, then freed, as Linux (reuseable false). Re-advertised, each
+				// used up a slot for good, and after four every request was refused (2026-11-09 review H1)
+				NKern::ThreadEnterCS();
+				Kern::Free(in->iBuf);
+				NKern::ThreadLeaveCS();
+				memclr(in, sizeof(*in));
+				}
 			}
 		return ETrue;
 		}
@@ -353,7 +409,7 @@ static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all th
 		RxAdvance(E, sizeof(m));
 		SChannel* c = ByRcid(E, m.iParam1);
 		TBool granted = EFalse;
-		for (TInt i = 0; c && i < KSlots && !granted; ++i)
+		for (TInt i = KIntents; c && i < KSlots && !granted; ++i)	// 0..KIntents-1 are AdvertiseAll's
 			if (!c->iIn[i].iBuf)
 				{
 				SIntent& in = c->iIn[i];
@@ -367,7 +423,7 @@ static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all th
 					granted = ETrue;
 					}
 				}
-		if (c && !granted)
+		if (c && !granted && ++c->iRefused <= 8)
 			Kern::Printf("[glink %d] intent request for %d bytes on lcid %d refused: no free slot", E.iRemote,
 				m.iParam2, c->iLcid);
 		if (c)
@@ -422,8 +478,12 @@ static NTimer PollTimer(PollTimerFn, NULL);
 static void PollDfcFn(TAny*)
 	{
 	for (TInt e = 0; e < KEdges; ++e)
+		{
+		if (Edges[e].iUp)
+			Flush(Edges[e]);
 		for (TInt n = 0; Edges[e].iUp && n < 64 && RxOne(Edges[e]); ++n)
 			;
+		}
 	PollTimer.OneShot(1);
 	}
 
@@ -456,11 +516,13 @@ TInt Glink_Start(TInt aRemote)
 			return r;
 		PollDfc.SetDfcQ(Queue);
 		}
+	SMsg version = { EVersion, 1, 0 };						// before iUp: the GLINK thread posts only to up edges
+	if ((r = Tx(E, &version, sizeof(version))) != KErrNone)
+		return r;
 	TBool polling = EFalse;
 	for (TInt i = 0; i < KEdges; ++i)
 		polling |= Edges[i].iUp;
 	E.iUp = ETrue;
-	Cmd(E, EVersion, 1, 0);
 	if (!polling)
 		PollTimer.OneShot(1);
 	return KErrNone;
@@ -479,7 +541,11 @@ TInt Glink_Open(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr)
 	c->iRx = aRx;
 	c->iPtr = aPtr;
 	if (!c->iOpenSent)
-		SendOpen(E, *c);
+		{
+		TInt r = SendOpen(E, *c, EFalse);
+		if (r != KErrNone)
+			return r;
+		}
 	return Id(E, *c);
 	}
 
@@ -492,29 +558,44 @@ TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
 	if (!c || !c->iRcid || !c->iOpenAcked)
 		return KErrNotReady;
 	TUint32 id = 0;
+	TInt k = 0;
 	TBool found = EFalse;
 	for (TInt tries = 0; !found && tries < 200; ++tries)		// none free: ask for one, the GLINK thread files it
 		{
 		NKern::FMWait(&TxLock);
-		for (TInt k = 0; k < KRemoteIntents && !found; ++k)
+		for (k = 0; k < KRemoteIntents; ++k)
 			if (c->iRemote[k].iState == EAvailable && c->iRemote[k].iSize >= (TUint32)aLen)
 				{
 				id = c->iRemote[k].iId;
 				c->iRemote[k].iState = EInUse;			// until RX_DONE gives it back (or not)
 				found = ETrue;
+				break;
 				}
 		NKern::FMSignal(&TxLock);
 		if (found)
 			break;
-		if (tries % 50 == 0)
-			Cmd(E, EIntentReq, c->iLcid, aLen);				// RX_INTENT_REQ: our id, the size we need
+		if (tries % 50 == 0)								// RX_INTENT_REQ: our id, the size we need (lost: asked again)
+			{
+			SMsg req = { EIntentReq, c->iLcid, (TUint32)aLen };
+			Tx(E, &req, sizeof(req));
+			}
 		NKern::Sleep(NKern::TimerTicks(1));
 		}
 	if (!found)
 		return KErrNotReady;
 	struct { SMsg iM; TUint32 iChunk, iLeft; } h = { { ETxData, c->iLcid, id }, (TUint32)aLen, 0 };
+	TInt r = Tx(E, &h, sizeof(h), aData, aLen);
+	if (r != KErrNone)
+		{
+		// never sent, so no RX_DONE will come for it: the intent is still ours to use (2026-11-09 review F03)
+		NKern::FMWait(&TxLock);
+		if (c->iRemote[k].iState == EInUse && c->iRemote[k].iId == id)
+			c->iRemote[k].iState = EAvailable;
+		NKern::FMSignal(&TxLock);
+		return r;
+		}
 	++c->iTxCount;
-	return Tx(E, &h, sizeof(h), aData, aLen);
+	return KErrNone;
 	}
 
 void Glink_Dump(void (*aSay)(const char*, ...))
@@ -530,15 +611,22 @@ void Glink_Dump(void (*aSay)(const char*, ...))
 			}
 		aSay("glink %s: version acked %d; tx tail %x head %x, rx tail %x head %x (fifo %x); bad cmds %d", KNames[e],
 			E.iVersionAcked, E.iDesc[0], E.iDesc[1], E.iDesc[2], E.iDesc[3], E.iRxLen, E.iBadCmds);
+		aSay("  data for unknown intents %d; outbox %d waiting, FIFO full %d times", E.iLost, E.iOutN, E.iOutWaits);
 		for (TInt i = 0; i < E.iNCh; ++i)
 			{
 			const SChannel& c = E.iCh[i];
-			TInt remote = 0;
+			TInt remote = 0, inUse = 0, ours = 0;
 			for (TInt k = 0; k < KRemoteIntents; ++k)
+				{
 				remote += c.iRemote[k].iState == EAvailable;
+				inUse += c.iRemote[k].iState == EInUse;
+				}
+			for (TInt k = 0; k < KSlots; ++k)
+				ours += c.iIn[k].iBuf != NULL;
 			TPtrC8 n(c.iName, c.iNameLen);
-			aSay("  \"%S\" id %x rcid %d open sent %d acked %d; rx %d tx %d; remote intents %d", &n, Id(E, c),
-				c.iRcid, c.iOpenSent, c.iOpenAcked, c.iRxCount, c.iTxCount, remote);
+			aSay("  \"%S\" id %x rcid %d open sent %d acked %d; rx %d tx %d; remote intents %d (+%d in use); ours %d/%d,"
+				" requests refused %d", &n, Id(E, c), c.iRcid, c.iOpenSent, c.iOpenAcked, c.iRxCount, c.iTxCount, remote,
+				inUse, ours, KSlots, c.iRefused);
 			}
 		}
 	}

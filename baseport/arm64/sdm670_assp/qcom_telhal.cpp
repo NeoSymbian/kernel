@@ -7,9 +7,12 @@
 //   0x4e0e ModemState  a1 = TUint32[4] out: boot step (8 = running), error, SMP2P slave-kernel bits, IPCRTR open
 //   0x4e0f QrtrSend    a1 = the packet, a2 = its length (<= 8 KB) -> GLINK IPCRTR; KErrNotReady without an intent
 //   0x4e10 QrtrRecv    a1 = buffer, a2 = its size -> the next queued packet's length, KErrNotReady if none
-//   0x4e11 PartRead    a1 = SIo { partition 0..3 = modemst1, modemst2, fsg, fsc; byte offset; len; buf }, read-only
+//   0x4e11 PartRead    a1 = SIo { partition 0..4 = modemst1, modemst2, fsg, fsc, vendor_a; byte offset; len; buf },
+//                      read-only, sector-aligned (vendor_a: the IPA/ADSP firmware, through MODEMD's ext4 reader)
 //   0x4e12 RmtfsMem    a1 = SIo { op 0 info (b = phys, len = size out), 1 read, 2 write; offset; len; buf }: the
 //                      rmtfs carve-out the modem reads its EFS through (DTB rmtfs-mem@fc201000, VMID 15)
+//   0x4e13 IpaStart    a1 = SIo { .mdt length; 0; image length; image }: IPA's GSI firmware; the kernel brings IPA up
+//                      (qcom_ipa.cpp: power, PAS 15, SMMU, config, GSI). MODEMD calls it before it boots the modem
 // The receive path is polled by the daemon; packets wait in a 64 KB ring filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
@@ -22,11 +25,12 @@
 #include "qcom_glink.h"
 #include "qcom_mss.h"
 #include "qcom_fat16.h"
+#include "qcom_ipa.h"
 #include "qcom_telhal.h"
 
 TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
 
-enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem };
+enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -104,12 +108,12 @@ static TInt RmtfsMap()
 	return r;
 	}
 
-static const char* const KParts[] = { "modemst1", "modemst2", "fsg", "fsc" };
+static const char* const KParts[] = { "modemst1", "modemst2", "fsg", "fsc", "vendor_a" };
 
 // copy between user memory and the device/carve-out in 64 KB steps through a kernel buffer
 static TInt PartRead(const SIo& aIo)
 	{
-	if (aIo.iA >= 4 || (aIo.iB | aIo.iLen) % KA64BlkSector)
+	if (aIo.iA >= sizeof(KParts) / sizeof(KParts[0]) || (aIo.iB | aIo.iLen) % KA64BlkSector)
 		return KErrArgument;
 	static TBool up;
 	if (!up)												// a RAM C: leaves the eMMC down: bring it up once
@@ -220,6 +224,27 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		SIo io;
 		kumemget32(&io, a1, sizeof(io));
 		return aFunction == EPartRead ? PartRead(io) : RmtfsMem(io, a1);
+		}
+	case EIpaStart:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		if (!io.iLen || io.iLen > 0x40000 || io.iA > io.iLen)
+			return KErrArgument;
+		NKern::ThreadEnterCS();
+		TUint8* k = (TUint8*)Kern::Alloc(io.iLen);
+		NKern::ThreadLeaveCS();
+		if (!k)
+			return KErrNoMemory;
+		kumemget(k, (const TAny*)io.iBuf, io.iLen);
+		TInt r = Ipa_SetFirmware(k, io.iLen, io.iA);
+		if (r == KErrNone)
+			r = Ipa_Start();	// before MODEMD boots the modem, as Linux; on failure MODEMD stays voice-only
+		Kern::Printf("[ipa] start from MODEMD -> %d", r);
+		NKern::ThreadEnterCS();
+		Kern::Free(k);
+		NKern::ThreadLeaveCS();
+		return r;
 		}
 		}
 	return KErrNotSupported;

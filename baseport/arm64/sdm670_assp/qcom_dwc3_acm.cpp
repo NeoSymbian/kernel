@@ -57,6 +57,15 @@ static TUint8 LineCoding[7] = { 0x00, 0xc2, 0x01, 0x00, 0, 0, 8 };	// 115200 8N1
 static TUint32 LogPos;
 static TBuf8<160> Line;
 static TBool LineReady;
+// "blk put" raw input (A64Usb_RawIn below): the stage, how much of it is filled, what is still to come
+// A transfer never splits: the stage has a transfer's worth of slack past 64 KB, and what isn't a whole sector stays
+// for the next stage. Raw transfers are 4 KB (the OUT area), lines take one packet at a time.
+const TInt KRawStage = 64 * 1024, KRawXfer = 0x1000, KSector = 512;
+static TUint8* RawStage;									// KRawStage + KRawXfer
+static TInt RawFill, RawLeft;
+static TBool RawFull;
+static TInt OutArmed = 512;								// the bytes the OUT TRB was armed with
+static TInt ArmOut();
 static TInt Events, Resets, Setups, InStarts, InDone, InFail, OutLines;
 static TUint32 SetupLog[6];
 
@@ -169,7 +178,7 @@ static void Configure()
 		}
 	Configured = ETrue;
 	InBusy = EFalse;
-	OutBusy = Start(EPhysBulkOut, ETrbNormal, EOffOut, KBulkMax) == KErrNone;
+	OutBusy = ArmOut() == KErrNone;
 	}
 
 // a SETUP packet arrived: answer it (data stage started here), or stall
@@ -308,16 +317,25 @@ static void ProcessEvents()
 				}
 			else if (type == EEvXferComplete && ep == EPhysBulkOut)
 				{
-				TInt got = KBulkMax - (Trb(EPhysBulkOut)->iSize & 0xffffff);
+				TInt got = OutArmed - (Trb(EPhysBulkOut)->iSize & 0xffffff);
 				const TUint8* p = (const TUint8*)(Area + EOffOut);
-				for (TInt i = 0; i < got; ++i)
+				if (RawLeft > 0)								// "blk put": raw bytes into the stage, no lines
 					{
-					if (p[i] == '\r' || p[i] == '\n')
-						LineReady = LineReady || Line.Length() > 0;
-					else if (!LineReady && Line.Length() < Line.MaxLength())
-						Line.Append(p[i]);
+					TInt n = Min(got, RawLeft);					// fits: the stage keeps KRawXfer of slack
+					memcpy(RawStage + RawFill, p, n);
+					RawFill += n;
+					RawLeft -= n;
+					RawFull = RawFill >= KRawStage || RawLeft == 0;	// the poll writes it, then re-arms the endpoint
 					}
-				OutBusy = Start(EPhysBulkOut, ETrbNormal, EOffOut, KBulkMax) == KErrNone;
+				else
+					for (TInt i = 0; i < got; ++i)
+						{
+						if (p[i] == '\r' || p[i] == '\n')
+							LineReady = LineReady || Line.Length() > 0;
+						else if (!LineReady && Line.Length() < Line.MaxLength())
+							Line.Append(p[i]);
+						}
+				OutBusy = !RawFull && ArmOut() == KErrNone;
 				}
 			}
 		else if (((e >> 1) & 0x7f) == 0)					// a device event
@@ -371,6 +389,32 @@ static void UsbWrite(const TUint8* aData, TInt aLen)
 		}
 	}
 
+// "blk put" (a64_dbgmon.cpp, telephony C5b): the host's next aBytes are raw data, not command lines. They gather in a
+// 64 KB stage; while it is full the OUT endpoint stays unarmed, so USB holds the host back (no loss) until the
+// monitor has written the stage (A64Mon_PutChunk, called from the poll below).
+
+TInt A64Usb_RawIn(TInt aBytes)
+	{
+	if (!RawStage)
+		{
+		NKern::ThreadEnterCS();
+		RawStage = (TUint8*)Kern::Alloc(KRawStage + KRawXfer);
+		NKern::ThreadLeaveCS();
+		if (!RawStage)
+			return KErrNoMemory;
+		}
+	RawFill = 0;
+	RawFull = EFalse;
+	RawLeft = aBytes;
+	return KErrNone;
+	}
+
+static TInt ArmOut()
+	{
+	OutArmed = RawLeft > 0 ? KRawXfer : KBulkMax;
+	return Start(EPhysBulkOut, ETrbNormal, EOffOut, OutArmed);
+	}
+
 void A64UsbDump();
 static void PollDfcFn(TAny*);
 static TDfc PollDfc(PollDfcFn, NULL, 1);
@@ -385,7 +429,17 @@ static void PollDfcFn(TAny*)
 		EndXfer(EPhysBulkIn);
 		InBusy = AbortIn = EFalse;
 		}
-	if (LineReady)
+	if (RawFull)
+		{
+		TBool last = RawLeft == 0;
+		TInt n = last ? RawFill : RawFill / KSector * KSector;	// whole sectors; the total is too
+		A64Mon_PutChunk(RawStage, n, last, UsbWrite);
+		memmove(RawStage, RawStage + n, RawFill - n);
+		RawFill -= n;
+		RawFull = EFalse;
+		OutBusy = ArmOut() == KErrNone;
+		}
+	else if (LineReady)
 		{
 		TBuf8<160> line(Line);
 		Line.Zero();

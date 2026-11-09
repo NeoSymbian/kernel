@@ -10,6 +10,12 @@
 //   qmp [modem on|off]    open the AOP link; send the modem's load_state
 //   glink [hello]         the GLINK edge to the modem: FIFO pointers, channels; hello: a QRTR HELLO from node 1
 //   mss [boot]            boot the modem (on its own thread; progress in the log); the boot's step and RMB registers
+//   ipa [clock|start]     GSI_STATUS once powered; clock: the RPMh IPA clock only; start: clock + the GSI firmware
+//                         MODEMD handed over (HAL 0x4e13) through PAS 15
+//   smmu [probe]          the apps SMMU (MMU-500 at 0x15000000), read only: global config, and the stream matches for
+//                         IPA's stream ids 0x720/0x722 with their context banks (telephony C5b I0); probe: can we
+//                         write it under the hypervisor? a pattern into the last SMR with VALID clear (no effect on
+//                         matching), read back, then cleared again
 #include <kernel/kern_priv.h>
 #include <sha256.h>
 #include "board.h"
@@ -22,6 +28,7 @@
 #include "qcom_mss.h"
 #include "qcom_glink.h"
 #include "qcom_rpmh.h"
+#include "qcom_ipa.h"
 
 static TBool Eq(const TPtrC8& aWord, const char* aLit)
 	{
@@ -37,7 +44,8 @@ static void Scm(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		{
 		TUint64 res[3] = { 0, 0, 0 };
 		TInt r = Scm_Call(2, 7, 1, &aNum[2], 1, res);
-		A64Mon_Say("scm pas %d supported -> %d, result %d", (TInt)aNum[2], r, (TInt)res[0]);
+		A64Mon_Say("scm pas %d supported -> %d (tz %d), result %d", (TInt)aNum[2], r, r ? (TInt)Scm_LastError : 0,
+			(TInt)res[0]);
 		return;
 		}
 	A64Mon_Say("scm: assign_mem %d, pas init %d, pas mem_setup %d, pas auth_reset %d, pas shutdown %d, pas supported %d",
@@ -107,8 +115,83 @@ static void Fw(TInt aArgc, const TPtrC8* aArg)
 	A64Mon_Say("fw ls %s: %d entries, %u bytes (%d)", p, i, total, r == KErrEof ? KErrNone : r);
 	}
 
+// ---- smmu: read only (Arm SMMUv2 / MMU-500 register layout: GR0 at 0, GR1 one page up, context banks in the
+// upper half). Which of IPA's streams match, and whether unmatched streams fault (sCR0.USFCFG).
+static void Smmu(TBool aProbe)
+	{
+	const TUint32 KSmmu = 0x15000000;
+	volatile TUint32* g = (volatile TUint32*)A64_Io(KSmmu);
+	TUint32 cr0 = g[0], idr0 = g[0x20 / 4], idr1 = g[0x24 / 4], gfsr = g[0x48 / 4];
+	TUint32 page = (idr1 >> 31) ? 0x10000 : 0x1000, numpage = 1u << (((idr1 >> 28) & 7) + 1);
+	TInt smrs = idr0 & 0xff, cbs = idr1 & 0xff;
+	A64Mon_Say("smmu: cr0 %08x (clientpd %d usfcfg %d) idr0 %08x idr1 %08x gfsr %08x; %d SMRs, %d CBs, page %x x %d",
+		cr0, cr0 & 1, (cr0 >> 10) & 1, idr0, idr1, gfsr, smrs, cbs, page, numpage);
+	TInt valid = 0;
+	for (TInt n = 0; n < smrs && n < 128; ++n)
+		{
+		TUint32 smr = g[(0x800 + 4 * n) / 4];
+		if (!(smr >> 31))
+			continue;
+		++valid;
+		TUint32 id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff, s2cr = g[(0xc00 + 4 * n) / 4];
+		TBool ipa = !((id ^ 0x720) & ~mask & 0x7fff) || !((id ^ 0x722) & ~mask & 0x7fff);
+		if (!ipa)
+			continue;
+		TInt cb = s2cr & 0xff;
+		volatile TUint32* c = (volatile TUint32*)A64_Io(KSmmu + numpage * page + cb * page);
+		A64Mon_Say("smmu: SMR %d id %x mask %x -> S2CR %08x (type %d cb %d): CBAR %08x, CB sctlr %08x ttbr0 %08x%08x tcr %08x",
+			n, id, mask, s2cr, (s2cr >> 16) & 3, cb, ((volatile TUint32*)A64_Io(KSmmu + page))[cb], c[0], c[0x24 / 4],
+			c[0x20 / 4], c[0x30 / 4]);
+		}
+	A64Mon_Say("smmu: %d valid SMRs; none above means IPA's streams are unmatched", valid);
+	if (!aProbe)
+		return;
+	TInt last = smrs - 1;
+	volatile TUint32& smr = g[(0x800 + 4 * last) / 4];
+	TUint32 before = smr;
+	if (before >> 31)
+		{
+		A64Mon_Say("smmu probe: SMR %d is in use (%08x): not touched", last, before);
+		return;
+		}
+	smr = 0x07ff0123;										// VALID (bit 31) clear: matches nothing
+	__e32_memory_barrier();
+	TUint32 seen = smr;
+	smr = before;
+	__e32_memory_barrier();
+	A64Mon_Say("smmu probe: SMR %d %08x -> wrote 07ff0123, read %08x, restored %08x: %s", last, before, seen, smr,
+		seen == 0x07ff0123 ? "writable" : "NOT writable");
+	}
+
 void A64Tel_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 	{
+	if (Eq(aArg[0], "ipa"))
+		{
+		if (aArgc >= 2 && Eq(aArg[1], "clock"))
+			{
+			A64Mon_Say("ipa clock -> %d", Ipa_PowerOn());
+			return;										// the registers stay unread: "ipa" alone reads them
+			}
+		else if (aArgc >= 3 && Eq(aArg[1], "reg"))
+			{
+			TUint32 v = 0;
+			TInt r = Ipa_Reg((TUint32)aNum[2], v);
+			A64Mon_Say("ipa reg %x -> %d: %08x", (TUint32)aNum[2], r, v);
+			return;
+			}
+		else if (aArgc >= 2 && Eq(aArg[1], "start"))
+			A64Mon_Say("ipa start -> %d", Ipa_Start());
+		TUint32 gsi = 0;
+		TInt r = Ipa_Status(gsi);
+		A64Mon_Say("ipa: %d, GSI_STATUS %08x (bit 0 enabled)", r, gsi);
+		Ipa_Report(A64Mon_Say);
+		return;
+		}
+	if (Eq(aArg[0], "smmu"))
+		{
+		Smmu(aArgc >= 2 && Eq(aArg[1], "probe"));
+		return;
+		}
 	if (Eq(aArg[0], "scm"))
 		Scm(aArgc, aArg, aNum);
 	else if (Eq(aArg[0], "smem"))

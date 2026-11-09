@@ -19,7 +19,9 @@ enum { EIrqEnable = 0x00, EIrqStatus = 0x04, EIrqClear = 0x08 };	// at the TCS b
 enum { EControl = 0x14, EStatus = 0x18, ECmdEnable = 0x1c, ECmdMsgId = 0x30, ECmdAddr = 0x34, ECmdData = 0x38,
 	ECmdStatus = 0x3c };
 const TUint32 KAmcEnable = 1u << 16, KAmcTrigger = 1u << 24;
-const TUint32 KMsgIdWriteRr = (1u << 16) | (1u << 8) | 4;	// write, response required, 4 bytes
+// write, response required, and Linux rpmh-rsc's CMD_MSGID_LEN (8). With 4 here RPMh acknowledged every command and
+// applied none: IPA stayed unclocked after its IP0 vote (C5b), and no earlier vote of ours had really counted.
+const TUint32 KMsgIdWriteRr = (1u << 16) | (1u << 8) | 8;
 const TUint32 KCmdCompl = 1u << 16;
 const TInt KSpin = 2000000;
 

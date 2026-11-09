@@ -6,7 +6,7 @@
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel) | scm | smem | fw ls|sha | smp2p | qmp | mss | glink (telephony, Pixel: qcom_telmon.cpp)
-//   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
+//   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> (vendor_a/_b, EMMC_C=2) | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
 //   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | rtc | date <unix UTC s> [UTC offset s]
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; "blk dump" sends "DUMP <n>\n", n*512 raw bytes,
 // then a text line with their SHA-256; every other answer is text, ending "\n.\n".
@@ -273,6 +273,8 @@ static TUint64 Num(const TDesC8& aWord)					// 0x... hex, else decimal; stops at
 
 const TInt KMaxArgs = 7;							// swipe x1 y1 x2 y2 moves ms
 
+static void BlkPut(TUint64 aLba, TUint32 aCount);
+
 static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 	{
 	static TUint8 s[KA64BlkSector];
@@ -349,6 +351,8 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		delete sha;
 		Say("\ndump sha256 %S err %d", &hex, err);
 		}
+	else if (aArgc >= 4 && Eq(aArg[1], "put"))			// raw sectors from the host (A64Mon_PutChunk)
+		BlkPut(aNum[2], (TUint32)aNum[3]);
 	else if (aArgc >= 2 && Eq(aArg[1], "gpt"))			// every partition: name, first, last sector
 		{
 		TInt r = A64BlkDev_Read(1, 1, s);
@@ -384,7 +388,7 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		Say("%S (%d, trap %d)", &b, r, x);
 		}
 	else
-		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk wtest | blk speed | blk guard <lba> | blk mode <0-2>");
+		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> | blk wtest | blk speed | blk guard <lba> | blk mode <0-2>");
 	}
 
 // smooth-ui S3b: per CPU, the core type (MIDR part) and the real clock: PMU cycles over 5 ms of the generic timer,
@@ -441,6 +445,77 @@ static void Shot()
 	Write(h.Ptr(), h.Length());
 	for (TInt y = 0; y < A64_FbHeight; ++y)
 		Write((const TAny*)(fb + y * A64_FbStride), A64_FbWidth * 4);
+	}
+
+// ---- "blk put <lba> <n>" (telephony C5b): n sectors from the host, written from lba on. Only into vendor_a or vendor_b
+// (the firmware ext4), and only where the eMMC driver's allow-list lets a write through (an EMMC_C=2 build). The host
+// waits for "PUT <n>", sends n*512 raw bytes, and gets "put sha256 <hex> err <e> written <bytes>": SHA-256 of what
+// arrived; every 64 KB stage is written, read back and compared.
+__attribute__((weak)) TInt A64Usb_RawIn(TInt) { return KErrNotSupported; }
+static TUint64 PutLba;
+static TInt PutErr, PutWritten;
+static SHA256* PutSha;
+static TUint8* PutCheck;
+
+static void BlkPut(TUint64 aLba, TUint32 aCount)
+	{
+	TUint64 first = 0, count = 0;
+	TBool inside = EFalse;
+	const char* const KTargets[] = { "vendor_a", "vendor_b" };
+	for (TInt i = 0; i < 2; ++i)
+		if (A64BlkDev_Partition(KTargets[i], first, count) == KErrNone && aLba >= first && aLba + aCount <= first + count)
+			inside = ETrue;
+	if (!inside || !aCount || aCount > 0x400000)			// up to 2 GB, inside one vendor partition
+		{
+		Say("put: %u sectors at %u: only inside vendor_a or vendor_b", aCount, (TUint32)aLba);
+		return;
+		}
+	if (!PutSha)
+		{
+		NKern::ThreadEnterCS();
+		PutSha = new SHA256;
+		PutCheck = (TUint8*)Kern::Alloc(64 * 1024);
+		NKern::ThreadLeaveCS();
+		}
+	else
+		PutSha->Reset();
+	TInt r = PutSha && PutCheck ? A64Usb_RawIn(aCount * KA64BlkSector) : KErrNoMemory;
+	if (r != KErrNone)
+		{
+		Say("put: %d", r);
+		return;
+		}
+	PutLba = aLba;
+	PutErr = KErrNone;
+	PutWritten = 0;
+	TBuf8<40> h;
+	Fmt(h, "PUT %u\n", aCount);
+	Write(h.Ptr(), h.Length());
+	}
+
+void A64Mon_PutChunk(const TUint8* aData, TInt aLen, TBool aLast, TMonWrite aWrite)
+	{
+	Out = aWrite;
+	PutSha->Update(aData, aLen);
+	TInt sectors = aLen / KA64BlkSector;
+	if (PutErr == KErrNone)								// after a failure the rest only drains (the host never waits)
+		{
+		PutErr = A64BlkDev_Write(PutLba, sectors, aData);
+		if (PutErr == KErrNone)
+			PutErr = A64BlkDev_Read(PutLba, sectors, PutCheck);
+		if (PutErr == KErrNone && memcompare(PutCheck, aLen, aData, aLen) != 0)
+			PutErr = KErrCorrupt;
+		if (PutErr == KErrNone)
+			PutWritten += aLen;
+		}
+	PutLba += sectors;
+	if (!aLast)
+		return;
+	const TUint8* hash = PutSha->Final().Ptr();
+	TBuf8<80> hex;
+	for (TInt i = 0; i < KSHA256HashSize; ++i)
+		Fmt(hex, "%02x", hash[i]);
+	Say("put sha256 %S err %d written %d", &hex, PutErr, PutWritten);
 	}
 
 void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
@@ -524,7 +599,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	else if (Eq(c, "spmi") && argc >= 5 && Eq(arg[1], "w"))
 		Say("spmi %d:%04x <- %02x -> %d", (TInt)num[2], (TInt)num[3], (TInt)num[4],
 			Spmi_Write((TUint)num[2], (TUint)num[3], (TUint)num[4]));
-	else if (Eq(c, "scm") || Eq(c, "smem") || Eq(c, "fw") || Eq(c, "smp2p") || Eq(c, "qmp") || Eq(c, "mss") || Eq(c, "glink"))	// telephony (qcom_telmon.cpp)
+	else if (Eq(c, "scm") || Eq(c, "smem") || Eq(c, "fw") || Eq(c, "smp2p") || Eq(c, "qmp") || Eq(c, "mss") || Eq(c, "glink") || Eq(c, "smmu") || Eq(c, "ipa"))	// telephony (qcom_telmon.cpp)
 		{
 		TInt x;
 		XTRAP(x, XT_DEFAULT, A64Tel_Monitor(argc, arg, num));

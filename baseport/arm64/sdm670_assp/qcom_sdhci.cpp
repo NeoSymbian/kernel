@@ -48,6 +48,15 @@ static TInt Trims, TrimErrors;
 static TUint64 TrimSectors;
 static TUint32 EraseBytes;								// EXT_CSD HC_ERASE_GRP_SIZE, if it divides KAlign
 
+// vendor_a/_b: the firmware ext4 (the factory image's /vendor/firmware: IPA, ADSP), owner's OK 2026-11-09. ABL refuses
+// to flash them outside fastbootd, whose partition map our ROFS replaced, so only the monitor's "blk put" writes them,
+// and only in an EMMC_C=2 build (telephony C5b)
+#if defined(A64_EMMC_C) && A64_EMMC_C == 2
+const TBool KVendorWritable = ETrue;
+#else
+const TBool KVendorWritable = EFalse;
+#endif
+
 // the partitions a write may reach (docs/filesystem.md "allow-list"); found by GPT name, each exactly once.
 // system_a/_b hold Z:'s ROFS image, one per A/B slot (FS4b, gate G1 approved by the owner 2026-11-07; system_b for
 // FS5b 2026-11-08: ABL refuses to flash system_* outside fastbootd, so the ROFS installer image writes the booted
@@ -55,7 +64,8 @@ static TUint32 EraseBytes;								// EXT_CSD HC_ERASE_GRP_SIZE, if it divides KA
 struct TPart { const char* iName; TBool iWritable; TInt iFound; TUint64 iFirst, iLast; };
 static TPart Parts[] =
 	{
-	{ "userdata", ETrue }, { "system_a", ETrue }, { "system_b", ETrue }, { "vendor_a", EFalse }, { "vendor_b", EFalse },
+	{ "userdata", ETrue }, { "system_a", ETrue }, { "system_b", ETrue },
+	{ "vendor_a", KVendorWritable }, { "vendor_b", KVendorWritable },
 	};
 const TInt KParts = sizeof(Parts) / sizeof(Parts[0]);
 

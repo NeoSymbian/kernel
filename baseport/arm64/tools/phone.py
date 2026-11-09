@@ -9,6 +9,7 @@ with nothing but the Python standard library and the fastboot tool.
       first it sets the phone's clock to the Mac's (monitor "date"; neoui then keeps it), unless --no-date
   phone.py cmd C...          run commands on a phone already up
   phone.py shot OUT.png      the framebuffer as a PNG
+  phone.py put vendor_a|vendor_b FILE   FILE onto the partition (kernel "blk put", EMMC_C=2 builds), verified
   phone.py dump PART OUT     a GPT partition by name (or FIRST:COUNT sectors), read-only, checked against the
                              kernel's SHA-256; prints the hash (docs telephony.md C0: radio partition backups)
   phone.py console           interactive (Ctrl-D ends)
@@ -111,6 +112,41 @@ class Console:
         self.send(line)
         out = self.read_until(END, secs)
         return out[: out.rfind(END)] if END in out else out
+
+    def put(self, first, data, secs=600):
+        """data (padded to whole sectors) onto the eMMC from sector first: "blk put", which the kernel allows only
+        inside vendor_a/vendor_b in an EMMC_C=2 build; returns the SHA-256, checked against the kernel's"""
+        data = data + bytes(-len(data) % 512)
+        n = len(data) // 512
+        self.log += self.read(0.3)
+        self.send(f"blk put {first} {n}")
+        head = self.read_until(b"\n", 10)
+        if f"PUT {n}".encode() not in head:
+            raise SystemExit(f"put: refused ({head[-200:]!r})")
+        view, t0 = memoryview(data), time.time()
+        while view:
+            _, w, _ = select.select([], [self.fd], [], 5)
+            if not w:
+                raise SystemExit(f"put: stalled with {len(view)} bytes left")
+            try:
+                view = view[os.write(self.fd, view[: 1 << 16]) :]
+            except BlockingIOError:
+                pass
+            done = len(data) - len(view)
+            if done % (4 << 20) < (1 << 16):
+                print(f"  {done >> 20} MB in {time.time() - t0:.0f} s", file=sys.stderr)
+        # the command's own answer ended right after "PUT n": wait for the trailer line itself
+        tail = self.read_until(b"put sha256", secs)
+        tail += self.read_until(b"\n", 10)
+        m = re.search(rb"put sha256 ([0-9a-f]{64}) err (-?\d+) written (\d+)", tail)
+        if not m:
+            raise SystemExit(f"put: no trailer ({tail[-200:]!r})")
+        want = hashlib.sha256(data).hexdigest()
+        if m[1].decode() != want:
+            raise SystemExit(f"put: the phone got sha256 {m[1].decode()}, sent {want}")
+        if int(m[2]) or int(m[3]) != len(data):
+            raise SystemExit(f"put: error {int(m[2])}, {int(m[3])} of {len(data)} bytes written and verified")
+        return want
 
     def shot(self, png, secs=120):
         self.log += self.read(0.3)
@@ -313,6 +349,16 @@ def main(argv):
                 raise SystemExit(f"no partition {what!r} (have: {' '.join(sorted(parts))})")
             first, count = parts[what][0], parts[what][1] - parts[what][0] + 1
         print(f"{con.dump(first, count, out)}  {os.path.basename(out)}")
+    elif verb == "put":
+        what, path = args
+        parts = con.parts()
+        if what not in ("vendor_a", "vendor_b") or what not in parts:
+            raise SystemExit("put: only vendor_a or vendor_b")
+        data = open(path, "rb").read()
+        first, last = parts[what]
+        if len(data) > (last - first + 1) * 512:
+            raise SystemExit(f"put: {len(data)} bytes don't fit in {what}")
+        print(f"{con.put(first, data)}  {os.path.basename(path)} -> {what}")
     elif verb == "shot":
         out = args[0] if args else "shot.png"
         w, h = con.shot(out)

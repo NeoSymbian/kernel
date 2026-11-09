@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// qcom_glink.cpp -- GLINK over SMEM to the modem (DTB glink-edge "modem", remote pid 1, doorbell bit 12):
+// qcom_glink.cpp -- GLINK over SMEM to the remote processors: the modem (DTB glink-edge "modem", remote pid 1,
+//   doorbell bit 12) and the ADSP ("lpass", remote pid 2, doorbell bit 24); each edge has its own FIFOs and channels:
 //   transport  SMEM item 478 = 4 words {our TX tail, our TX head, our RX tail, our RX head}; item 479 = our TX
 //              FIFO (16 KB, ours to allocate), 480 = our RX FIFO (the remote's). Every command is 8-byte aligned.
 //   protocol   commands {u16 cmd, u16 param1, u32 param2, data}: VERSION / VERSION_ACK; a channel is open when
@@ -9,8 +10,9 @@
 //              TX_DATA_CONT; RX_DONE gives the intent back. RX_INTENT_REQ asks for a bigger buffer.
 // Polled from its own thread every millisecond (docs/telephony.md C2: GIC lines over 255 come with C12).
 // Written from the protocol as described by Linux drivers/rpmsg/qcom_glink_smem.c and qcom_glink_native.c.
-// Telephony stage C3: the QRTR channel "IPCRTR" to the modem.
-// shortcut: no intent reuse (features 0) and one edge (the modem); the ADSP edge comes with C6.
+// Telephony C3: the QRTR channel "IPCRTR" to the modem. C6: the ADSP's "IPCRTR" and "apr_audio_svc".
+// A channel id is edge << 8 | lcid, so the modem's channels keep ids 1..8.
+// shortcut: no intent reuse (features 0).
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "qcom_ipc.h"
@@ -21,7 +23,7 @@ enum { EVersion = 0, EVersionAck = 1, EOpen = 2, EClose = 3, EOpenAck = 4, EInte
 	EIntentReqAck = 8, ETxData = 9, ECloseAck = 11, ETxDataCont = 12, EReadNotif = 13, ERxDoneReuse = 14,
 	ESignals = 15 };
 const TUint32 KFifoSize = 0x4000, KReserve = 16;			// FIFO_FULL_RESERVE + TX_BLOCKED_CMD_RESERVE
-const TInt KChannels = 8, KIntents = 4, KRemoteIntents = 8, KIntentSize = 2048, KName = 32;
+const TInt KChannels = 8, KIntents = 4, KRemoteIntents = 16, KIntentSize = 2048, KName = 32;
 
 struct SMsg { TUint16 iCmd, iParam1; TUint32 iParam2; };
 
@@ -41,8 +43,9 @@ struct SChannel
 	TInt iRxCount, iTxCount;
 	};
 
-static struct
+struct SEdge
 	{
+	TInt iRemote, iIpcBit;
 	volatile TUint32* iDesc;		// item 478
 	TUint8* iTx;					// item 479
 	TUint8* iRx;					// item 480
@@ -52,15 +55,25 @@ static struct
 	TInt iBadCmds;
 	SChannel iCh[KChannels];
 	TInt iNCh;
-	} E;
+	};
+static SEdge Edges[] = { { KSmemHostModem, KIpcModemGlink }, { KSmemHostAdsp, KIpcAdspGlink } };
+const TInt KEdges = sizeof(Edges) / sizeof(Edges[0]);
+static SEdge* EdgeOf(TInt aRemote)
+	{
+	for (TInt i = 0; i < KEdges; ++i)
+		if (Edges[i].iRemote == aRemote)
+			return &Edges[i];
+	return NULL;
+	}
+static TInt Id(const SEdge& aE, const SChannel& aC) { return (TInt)(&aE - Edges) << 8 | aC.iLcid; }
 
 // ---- the FIFOs
-static TUint32 RxAvail()
+static TUint32 RxAvail(SEdge& E)
 	{
 	if (!E.iRx)
 		{
 		TUint32 len = 0;
-		E.iRx = (TUint8*)Smem_Get(KSmemHostModem, 480, &len);
+		E.iRx = (TUint8*)Smem_Get(E.iRemote, 480, &len);
 		E.iRxLen = len;
 		if (!E.iRx)
 			return 0;
@@ -69,7 +82,7 @@ static TUint32 RxAvail()
 	return head >= tail ? head - tail : E.iRxLen - tail + head;
 	}
 
-static void RxPeek(TAny* aData, TUint32 aOffset, TUint32 aCount)
+static void RxPeek(SEdge& E, TAny* aData, TUint32 aOffset, TUint32 aCount)
 	{
 	TUint32 tail = E.iDesc[2] + aOffset;
 	if (tail >= E.iRxLen)
@@ -80,7 +93,7 @@ static void RxPeek(TAny* aData, TUint32 aOffset, TUint32 aCount)
 		memcpy((TUint8*)aData + n, E.iRx, aCount - n);
 	}
 
-static void RxAdvance(TUint32 aCount)
+static void RxAdvance(SEdge& E, TUint32 aCount)
 	{
 	TUint32 tail = E.iDesc[2] + ((aCount + 7) & ~7u);
 	if (tail >= E.iRxLen)
@@ -88,14 +101,14 @@ static void RxAdvance(TUint32 aCount)
 	E.iDesc[2] = tail;
 	}
 
-static TUint32 TxAvail()
+static TUint32 TxAvail(SEdge& E)
 	{
 	TUint32 head = E.iDesc[1], tail = E.iDesc[0];
 	TUint32 avail = tail <= head ? KFifoSize - head + tail : tail - head;
 	return avail > KReserve ? avail - KReserve : 0;
 	}
 
-static TUint32 TxWriteOne(TUint32 aHead, const TAny* aData, TUint32 aCount)
+static TUint32 TxWriteOne(SEdge& E, TUint32 aHead, const TAny* aData, TUint32 aCount)
 	{
 	TUint32 n = Min(aCount, KFifoSize - aHead);
 	memcpy(E.iTx + aHead, aData, n);
@@ -107,48 +120,48 @@ static TUint32 TxWriteOne(TUint32 aHead, const TAny* aData, TUint32 aCount)
 
 static NFastMutex TxLock;										// the GLINK thread and user threads (QrtrSend) both send
 
-static TInt Tx(const TAny* aHdr, TUint32 aHlen, const TAny* aData = NULL, TUint32 aDlen = 0)
+static TInt Tx(SEdge& E, const TAny* aHdr, TUint32 aHlen, const TAny* aData = NULL, TUint32 aDlen = 0)
 	{
 	TUint32 need = (aHlen + aDlen + 7) & ~7u;
 	for (TInt i = 0; ; ++i)									// the modem drains it; wait up to ~100 ms
 		{
 		NKern::FMWait(&TxLock);
-		if (TxAvail() >= need)
+		if (TxAvail(E) >= need)
 			break;											// keep the lock for the write
 		NKern::FMSignal(&TxLock);
 		if (i >= 100)
 			return KErrOverflow;
 		NKern::Sleep(NKern::TimerTicks(1));
 		}
-	TUint32 head = TxWriteOne(E.iDesc[1], aHdr, aHlen);
+	TUint32 head = TxWriteOne(E, E.iDesc[1], aHdr, aHlen);
 	if (aDlen)
-		head = TxWriteOne(head, aData, aDlen);
+		head = TxWriteOne(E, head, aData, aDlen);
 	head = (head + 7) & ~7u;
 	if (head >= KFifoSize)
 		head -= KFifoSize;
 	__e32_memory_barrier();									// the data before the head that publishes it
 	E.iDesc[1] = head;
 	NKern::FMSignal(&TxLock);
-	Ipc_Kick(KIpcModemGlink);
+	Ipc_Kick(E.iIpcBit);
 	return KErrNone;
 	}
 
-static void Cmd(TUint16 aCmd, TUint16 aP1, TUint32 aP2)
+static void Cmd(SEdge& E, TUint16 aCmd, TUint16 aP1, TUint32 aP2)
 	{
 	SMsg m = { aCmd, aP1, aP2 };
-	Tx(&m, sizeof(m));
+	Tx(E, &m, sizeof(m));
 	}
 
 // ---- channels
-static SChannel* ByName(const TDesC8& aName)
+static SChannel* ByName(SEdge& E, const TDesC8& aName)
 	{
 	for (TInt i = 0; i < E.iNCh; ++i)
 		if (TPtrC8(E.iCh[i].iName, E.iCh[i].iNameLen) == aName)
 			return &E.iCh[i];
 	return NULL;
 	}
-static SChannel* ByLcid(TUint aLcid) { return aLcid >= 1 && aLcid <= (TUint)E.iNCh ? &E.iCh[aLcid - 1] : NULL; }
-static SChannel* ByRcid(TUint aRcid)
+static SChannel* ByLcid(SEdge& E, TUint aLcid) { return aLcid >= 1 && aLcid <= (TUint)E.iNCh ? &E.iCh[aLcid - 1] : NULL; }
+static SChannel* ByRcid(SEdge& E, TUint aRcid)
 	{
 	for (TInt i = 0; i < E.iNCh; ++i)
 		if (E.iCh[i].iRcid == aRcid)
@@ -156,7 +169,7 @@ static SChannel* ByRcid(TUint aRcid)
 	return NULL;
 	}
 
-static SChannel* NewChannel(const TDesC8& aName)
+static SChannel* NewChannel(SEdge& E, const TDesC8& aName)
 	{
 	if (E.iNCh >= KChannels)
 		return NULL;
@@ -168,7 +181,7 @@ static SChannel* NewChannel(const TDesC8& aName)
 	return c;
 	}
 
-static void SendOpen(SChannel& aC)
+static void SendOpen(SEdge& E, SChannel& aC)
 	{
 	struct { SMsg iM; TUint8 iName[KName]; } m;
 	memclr(&m, sizeof(m));
@@ -176,19 +189,19 @@ static void SendOpen(SChannel& aC)
 	m.iM.iParam1 = aC.iLcid;
 	m.iM.iParam2 = aC.iNameLen + 1;
 	memcpy(m.iName, aC.iName, aC.iNameLen);
-	Tx(&m, (sizeof(SMsg) + aC.iNameLen + 1 + 7) & ~7u);
+	Tx(E, &m, (sizeof(SMsg) + aC.iNameLen + 1 + 7) & ~7u);
 	aC.iOpenSent = ETrue;
 	}
 
-static void Advertise(SChannel& aC, SIntent& aI)
+static void Advertise(SEdge& E, SChannel& aC, SIntent& aI)
 	{
 	aI.iId = ++E.iNextIntent;
 	aI.iFill = 0;
 	struct { SMsg iM; TUint32 iSize, iId; } m = { { EIntent, aC.iLcid, 1 }, aI.iSize, aI.iId };
-	Tx(&m, sizeof(m));
+	Tx(E, &m, sizeof(m));
 	}
 
-static void AdvertiseAll(SChannel& aC)						// once both sides opened: our receive buffers
+static void AdvertiseAll(SEdge& E, SChannel& aC)						// once both sides opened: our receive buffers
 	{
 	for (TInt i = 0; i < KIntents; ++i)
 		{
@@ -201,26 +214,26 @@ static void AdvertiseAll(SChannel& aC)						// once both sides opened: our recei
 			in.iSize = in.iBuf ? KIntentSize : 0;
 			}
 		if (in.iBuf)
-			Advertise(aC, in);
+			Advertise(E, aC, in);
 		}
 	}
 
 // ---- receive
-static TBool RxOne()										// one command; EFalse if it is not all there yet
+static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all there yet
 	{
-	TUint32 avail = RxAvail();
+	TUint32 avail = RxAvail(E);
 	if (avail < sizeof(SMsg))
 		return EFalse;
 	SMsg m;
-	RxPeek(&m, 0, sizeof(m));
+	RxPeek(E, &m, 0, sizeof(m));
 	switch (m.iCmd)
 		{
 	case EVersion:
-		RxAdvance(sizeof(m));
-		Cmd(EVersionAck, 1, 0);								// version 1, no features
+		RxAdvance(E, sizeof(m));
+		Cmd(E, EVersionAck, 1, 0);								// version 1, no features
 		return ETrue;
 	case EVersionAck:
-		RxAdvance(sizeof(m));
+		RxAdvance(E, sizeof(m));
 		E.iVersionAcked = ETrue;
 		return ETrue;
 	case EOpen:
@@ -230,33 +243,36 @@ static TBool RxOne()										// one command; EFalse if it is not all there yet
 			return EFalse;
 		TBuf8<KName> name;
 		TUint8 buf[KName];
-		RxPeek(buf, sizeof(m), Min(len, (TUint32)KName));
+		RxPeek(E, buf, sizeof(m), Min(len, (TUint32)KName));
 		for (TUint32 i = 0; i < len && i < (TUint32)KName && buf[i]; ++i)
 			name.Append(buf[i]);
-		RxAdvance(sizeof(m) + len);
-		SChannel* c = ByName(name);
+		RxAdvance(E, sizeof(m) + len);
+		SChannel* c = ByName(E, name);
 		if (!c)
-			c = NewChannel(name);
+			c = NewChannel(E, name);
 		if (!c)
 			return ETrue;
 		c->iRcid = m.iParam1;
-		Kern::Printf("[glink] remote opened \"%S\" (rcid %d, lcid %d)", &name, c->iRcid, c->iLcid);
-		Cmd(EOpenAck, c->iRcid, 0);
-		if (!c->iOpenSent)
-			SendOpen(*c);
+		Kern::Printf("[glink %d] remote opened \"%S\" (rcid %d, id %x)", E.iRemote, &name, c->iRcid, Id(E, *c));
+		Cmd(E, EOpenAck, c->iRcid, 0);
+		// our side opens only for a channel someone here uses (Glink_Open), as Linux (its rpmsg device opens when a
+		// driver binds): a fully opened "apr_voice_svc" told the modem the AP takes its voice APR, which went
+		// nowhere, and the ADSP's START_VOICE waited forever (C6, 2026-11-09)
+		if (c->iRx && !c->iOpenSent)
+			SendOpen(E, *c);
 		if (c->iOpenAcked)
-			AdvertiseAll(*c);
+			AdvertiseAll(E, *c);
 		return ETrue;
 		}
 	case EOpenAck:
 		{
-		RxAdvance(sizeof(m));
-		SChannel* c = ByLcid(m.iParam1);
+		RxAdvance(E, sizeof(m));
+		SChannel* c = ByLcid(E, m.iParam1);
 		if (c)
 			{
 			c->iOpenAcked = ETrue;
 			if (c->iRcid)
-				AdvertiseAll(*c);
+				AdvertiseAll(E, *c);
 			}
 		return ETrue;
 		}
@@ -265,23 +281,32 @@ static TBool RxOne()										// one command; EFalse if it is not all there yet
 		TUint32 len = sizeof(m) + 8 * m.iParam2;
 		if (avail < len)
 			return EFalse;
-		SChannel* c = ByRcid(m.iParam1);
+		SChannel* c = ByRcid(E, m.iParam1);
 		NKern::FMWait(&TxLock);								// the intent table is shared with Glink_Send
 		for (TUint32 i = 0; c && i < m.iParam2; ++i)
 			{
 			TUint32 pair[2];								// {size, id}
-			RxPeek(pair, sizeof(m) + 8 * i, 8);
-			for (TInt k = 0; k < KRemoteIntents; ++k)
+			RxPeek(E, pair, sizeof(m) + 8 * i, 8);
+			// a free slot; with none, the smallest idle one gives way to a bigger intent (the one an INTENT_REQ asked
+			// for: a full table of small intents dropped it, and big sends never went: C6, 2026-11-09)
+			TInt slot = -1;
+			for (TInt k = 0; k < KRemoteIntents && slot < 0; ++k)
 				if (c->iRemote[k].iState == EFree)
-					{
-					c->iRemote[k].iId = pair[1];
-					c->iRemote[k].iSize = pair[0];
-					c->iRemote[k].iState = EAvailable;
-					break;
-					}
+					slot = k;
+			if (slot < 0)
+				for (TInt k = 0; k < KRemoteIntents; ++k)
+					if (c->iRemote[k].iState == EAvailable && c->iRemote[k].iSize < pair[0]
+						&& (slot < 0 || c->iRemote[k].iSize < c->iRemote[slot].iSize))
+						slot = k;
+			if (slot >= 0)
+				{
+				c->iRemote[slot].iId = pair[1];
+				c->iRemote[slot].iSize = pair[0];
+				c->iRemote[slot].iState = EAvailable;
+				}
 			}
 		NKern::FMSignal(&TxLock);
-		RxAdvance(len);
+		RxAdvance(E, len);
 		return ETrue;
 		}
 	case ETxData:
@@ -290,34 +315,34 @@ static TBool RxOne()										// one command; EFalse if it is not all there yet
 		struct { SMsg iM; TUint32 iChunk, iLeft; } h;
 		if (avail < sizeof(h))
 			return EFalse;
-		RxPeek(&h, 0, sizeof(h));
+		RxPeek(E, &h, 0, sizeof(h));
 		if (avail < sizeof(h) + h.iChunk)
 			return EFalse;
-		SChannel* c = ByRcid(h.iM.iParam1);
+		SChannel* c = ByRcid(E, h.iM.iParam1);
 		SIntent* in = NULL;
 		for (TInt i = 0; c && i < KIntents; ++i)
 			if (c->iIn[i].iBuf && c->iIn[i].iId == h.iM.iParam2)
 				in = &c->iIn[i];
 		if (in && in->iFill + h.iChunk <= in->iSize)
 			{
-			RxPeek(in->iBuf + in->iFill, sizeof(h), h.iChunk);
+			RxPeek(E, in->iBuf + in->iFill, sizeof(h), h.iChunk);
 			in->iFill += h.iChunk;
 			}
-		RxAdvance(sizeof(h) + h.iChunk);
+		RxAdvance(E, sizeof(h) + h.iChunk);
 		if (in && !h.iLeft)
 			{
 			++c->iRxCount;
 			if (c->iRx)
 				c->iRx(c->iPtr, in->iBuf, in->iFill);
-			Cmd(ERxDone, c->iLcid, in->iId);			// the buffer is free again: give it back under a new id
-			Advertise(*c, *in);
+			Cmd(E, ERxDone, c->iLcid, in->iId);			// the buffer is free again: give it back under a new id
+			Advertise(E, *c, *in);
 			}
 		return ETrue;
 		}
 	case EIntentReq:										// the remote wants a buffer of param2 bytes
 		{
-		RxAdvance(sizeof(m));
-		SChannel* c = ByRcid(m.iParam1);
+		RxAdvance(E, sizeof(m));
+		SChannel* c = ByRcid(E, m.iParam1);
 		TBool granted = EFalse;
 		for (TInt i = 0; c && i < KIntents && !granted; ++i)
 			if (!c->iIn[i].iFill)							// an idle one: regrow it
@@ -334,32 +359,32 @@ static TBool RxOne()										// one command; EFalse if it is not all there yet
 				NKern::ThreadLeaveCS();
 				if (b)
 					{
-					Advertise(*c, in);
+					Advertise(E, *c, in);
 					granted = ETrue;
 					}
 				}
 		if (c)
-			Cmd(EIntentReqAck, c->iLcid, granted);
+			Cmd(E, EIntentReqAck, c->iLcid, granted);
 		return ETrue;
 		}
 	case EClose:
 		{
-		RxAdvance(sizeof(m));
-		SChannel* c = ByRcid(m.iParam1);
+		RxAdvance(E, sizeof(m));
+		SChannel* c = ByRcid(E, m.iParam1);
 		if (c)
 			{
 			TPtrC8 n(c->iName, c->iNameLen);
-			Kern::Printf("[glink] remote closed \"%S\"", &n);
+			Kern::Printf("[glink %d] remote closed \"%S\"", E.iRemote, &n);
 			c->iRcid = 0;
-			Cmd(ECloseAck, m.iParam1, 0);
+			Cmd(E, ECloseAck, m.iParam1, 0);
 			}
 		return ETrue;
 		}
 	case ERxDone:											// the remote consumed our message in intent param2:
 	case ERxDoneReuse:										// with reuse it stays ours to send into, else it is gone
 		{
-		RxAdvance(sizeof(m));
-		SChannel* c = ByRcid(m.iParam1);
+		RxAdvance(E, sizeof(m));
+		SChannel* c = ByRcid(E, m.iParam1);
 		NKern::FMWait(&TxLock);
 		for (TInt k = 0; c && k < KRemoteIntents; ++k)
 			if (c->iRemote[k].iState == EInUse && c->iRemote[k].iId == m.iParam2)
@@ -371,12 +396,12 @@ static TBool RxOne()										// one command; EFalse if it is not all there yet
 	case EReadNotif:
 	case ESignals:
 	case EIntentReqAck:
-		RxAdvance(sizeof(m));
+		RxAdvance(E, sizeof(m));
 		return ETrue;
 	default:
 		++E.iBadCmds;
 		Kern::Printf("[glink] unknown command %d: dropping the FIFO's contents", m.iCmd);
-		RxAdvance(avail);
+		RxAdvance(E, avail);
 		return EFalse;
 		}
 	}
@@ -389,15 +414,18 @@ static void PollTimerFn(TAny*) { PollDfc.Add(); }
 static NTimer PollTimer(PollTimerFn, NULL);
 static void PollDfcFn(TAny*)
 	{
-	for (TInt n = 0; n < 64 && RxOne(); ++n)
-		;
+	for (TInt e = 0; e < KEdges; ++e)
+		for (TInt n = 0; Edges[e].iUp && n < 64 && RxOne(Edges[e]); ++n)
+			;
 	PollTimer.OneShot(1);
 	}
 
 TInt Glink_Start(TInt aRemote)
 	{
-	if (aRemote != KSmemHostModem)
+	SEdge* e = EdgeOf(aRemote);
+	if (!e)
 		return KErrNotSupported;
+	SEdge& E = *e;
 	if (E.iUp)
 		return KErrNone;
 	TInt r = Smem_Alloc(aRemote, 478, 32);
@@ -421,30 +449,39 @@ TInt Glink_Start(TInt aRemote)
 			return r;
 		PollDfc.SetDfcQ(Queue);
 		}
+	TBool polling = EFalse;
+	for (TInt i = 0; i < KEdges; ++i)
+		polling |= Edges[i].iUp;
 	E.iUp = ETrue;
-	Cmd(EVersion, 1, 0);
-	PollTimer.OneShot(1);
+	Cmd(E, EVersion, 1, 0);
+	if (!polling)
+		PollTimer.OneShot(1);
 	return KErrNone;
 	}
 
 TInt Glink_Open(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr)
 	{
-	if (aRemote != KSmemHostModem || !E.iUp)
+	SEdge* e = EdgeOf(aRemote);
+	if (!e || !e->iUp)
 		return KErrNotReady;
+	SEdge& E = *e;
 	TPtrC8 name((const TUint8*)aName);
-	SChannel* c = ByName(name);
-	if (!c && !(c = NewChannel(name)))
+	SChannel* c = ByName(E, name);
+	if (!c && !(c = NewChannel(E, name)))
 		return KErrOverflow;
 	c->iRx = aRx;
 	c->iPtr = aPtr;
 	if (!c->iOpenSent)
-		SendOpen(*c);
-	return c->iLcid;
+		SendOpen(E, *c);
+	return Id(E, *c);
 	}
 
 TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
 	{
-	SChannel* c = ByLcid(aChannel);
+	if ((aChannel >> 8) >= KEdges)
+		return KErrNotReady;
+	SEdge& E = Edges[aChannel >> 8];
+	SChannel* c = ByLcid(E, aChannel & 0xff);
 	if (!c || !c->iRcid || !c->iOpenAcked)
 		return KErrNotReady;
 	TUint32 id = 0;
@@ -463,33 +500,38 @@ TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
 		if (found)
 			break;
 		if (tries % 50 == 0)
-			Cmd(EIntentReq, c->iLcid, aLen);				// RX_INTENT_REQ: our id, the size we need
+			Cmd(E, EIntentReq, c->iLcid, aLen);				// RX_INTENT_REQ: our id, the size we need
 		NKern::Sleep(NKern::TimerTicks(1));
 		}
 	if (!found)
 		return KErrNotReady;
 	struct { SMsg iM; TUint32 iChunk, iLeft; } h = { { ETxData, c->iLcid, id }, (TUint32)aLen, 0 };
 	++c->iTxCount;
-	return Tx(&h, sizeof(h), aData, aLen);
+	return Tx(E, &h, sizeof(h), aData, aLen);
 	}
 
 void Glink_Dump(void (*aSay)(const char*, ...))
 	{
-	if (!E.iUp)
+	static const char* const KNames[] = { "modem", "lpass" };
+	for (TInt e = 0; e < KEdges; ++e)
 		{
-		aSay("glink: not started");
-		return;
-		}
-	aSay("glink modem: version acked %d; tx tail %x head %x, rx tail %x head %x (fifo %x); bad cmds %d",
-		E.iVersionAcked, E.iDesc[0], E.iDesc[1], E.iDesc[2], E.iDesc[3], E.iRxLen, E.iBadCmds);
-	for (TInt i = 0; i < E.iNCh; ++i)
-		{
-		const SChannel& c = E.iCh[i];
-		TInt remote = 0;
-		for (TInt k = 0; k < KRemoteIntents; ++k)
-			remote += c.iRemote[k].iState == EAvailable;
-		TPtrC8 n(c.iName, c.iNameLen);
-		aSay("  \"%S\" lcid %d rcid %d open sent %d acked %d; rx %d tx %d; remote intents %d", &n, c.iLcid,
-			c.iRcid, c.iOpenSent, c.iOpenAcked, c.iRxCount, c.iTxCount, remote);
+		SEdge& E = Edges[e];
+		if (!E.iUp)
+			{
+			aSay("glink %s: not started", KNames[e]);
+			continue;
+			}
+		aSay("glink %s: version acked %d; tx tail %x head %x, rx tail %x head %x (fifo %x); bad cmds %d", KNames[e],
+			E.iVersionAcked, E.iDesc[0], E.iDesc[1], E.iDesc[2], E.iDesc[3], E.iRxLen, E.iBadCmds);
+		for (TInt i = 0; i < E.iNCh; ++i)
+			{
+			const SChannel& c = E.iCh[i];
+			TInt remote = 0;
+			for (TInt k = 0; k < KRemoteIntents; ++k)
+				remote += c.iRemote[k].iState == EAvailable;
+			TPtrC8 n(c.iName, c.iNameLen);
+			aSay("  \"%S\" id %x rcid %d open sent %d acked %d; rx %d tx %d; remote intents %d", &n, Id(E, c),
+				c.iRcid, c.iOpenSent, c.iOpenAcked, c.iRxCount, c.iTxCount, remote);
+			}
 		}
 	}

@@ -4,7 +4,9 @@
 // drivers/i2c/busses/i2c-qcom-geni.c and drivers/soc/qcom/qcom-geni-se.c in FIFO mode: geni_se_init +
 // geni_se_config_packing(8 bits, 4 per word, msb-to-lsb) + qcom_geni_i2c_conf, then per message an M command
 // (I2C_WRITE / I2C_READ with the address in the params, STOP_STRETCH for a repeated start) and the FIFOs.
-// shortcut: polled with a bounded spin, one engine; upgrade to the SE interrupt (DTB SPI 354) if touch polling costs.
+// Two engines: 0 = touch (SE1, 100 kHz), 1 = the audio codecs (I2C10, SE2 0xa88000, 400 kHz; telephony C6). Each is
+// driven by one thread at a time (its owner).
+// shortcut: polled with a bounded spin; upgrade to the SE interrupt (DTB SPI 354) if touch polling costs.
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "qcom_geni_i2c.h"
@@ -26,12 +28,15 @@ const TUint32 KMDone = 1u << 0, KMErr = (1u << 1) | (1u << 2) | (1u << 3) | (1u 
 const TUint32 KMIrqFifo = KMDone | KMErr | (0x3fu << 9) | (1u << 26) | (1u << 27) | (1u << 30);
 const TInt KSpin = 2000000;								// ~a few ms at most; a byte at 100 kHz is ~90 us
 
-static TLinAddr Se;
+struct SEngine { TLinAddr iSe; TUint32 iTxDepth; };
+static SEngine Engines[2];
+static NFastMutex Lock;										// touch's thread and the audio thread take turns
+static TLinAddr Se;											// the engine of the call in progress (under Lock)
 static TUint32 TxDepth;
 
 static volatile TUint32& R(TUint32 aOff) { return *(volatile TUint32*)(Se + aOff); }
 
-int I2c_Init(unsigned long aSe)
+static int Open(TInt aEngine, unsigned long aSe, TInt aKhz)
 	{
 	Se = A64_Io(aSe);
 	TUint32 proto = (R(EFwRev) >> 8) & 0xff;
@@ -60,12 +65,34 @@ int I2c_Init(unsigned long aSe)
 	R(ERxPack0) = 0x0007f8fe;
 	R(ERxPack1) = 0x000ffefe;
 	R(EByteGran) = 0;
-	// 100 kHz from 19.2 MHz: divider 7, SCL high 10, low 11, cycle 26 (geni_i2c_clk_map)
+	// from 19.2 MHz (geni_i2c_clk_map): 100 kHz = divider 7, SCL high 10, low 11, cycle 26; 400 kHz = 2, 5, 11, 22
 	R(EClkSel) = 0;
-	R(EMClkCfg) = (7u << 4) | 1;
-	R(EI2cSclCounters) = (10u << 20) | (11u << 10) | 26;
+	if (aKhz >= 400)
+		{
+		R(EMClkCfg) = (2u << 4) | 1;
+		R(EI2cSclCounters) = (5u << 20) | (11u << 10) | 22;
+		}
+	else
+		{
+		R(EMClkCfg) = (7u << 4) | 1;
+		R(EI2cSclCounters) = (10u << 20) | (11u << 10) | 26;
+		}
+	Engines[aEngine].iSe = Se;
+	Engines[aEngine].iTxDepth = TxDepth;
 	return (int)proto;
 	}
+
+int I2c_Open(TInt aEngine, unsigned long aSe, TInt aKhz)
+	{
+	if (aEngine < 0 || aEngine > 1)
+		return KErrArgument;
+	NKern::FMWait(&Lock);
+	int r = Open(aEngine, aSe, aKhz);
+	NKern::FMSignal(&Lock);
+	return r;
+	}
+
+int I2c_Init(unsigned long aSe) { return I2c_Open(0, aSe, 100); }
 
 // wait for the M command to finish, moving RX data meanwhile: KErrNone, KErrNotFound (NACK) or an error
 static TInt Finish(TUint8* aR, TInt aRn)
@@ -97,8 +124,10 @@ static TInt Finish(TUint8* aR, TInt aRn)
 	return KErrTimedOut;
 	}
 
-int I2c_WriteRead(unsigned aAddr, const unsigned char* aW, int aWn, unsigned char* aR, int aRn)
+static int Xfer(TInt aEngine, unsigned aAddr, const unsigned char* aW, int aWn, unsigned char* aR, int aRn)
 	{
+	Se = Engines[aEngine].iSe;
+	TxDepth = Engines[aEngine].iTxDepth;
 	if (!Se || aWn > 4 * (TInt)TxDepth)
 		return KErrArgument;
 	TUint32 addr = (aAddr & 0x7f) << KSlvAddrShift;
@@ -121,4 +150,19 @@ int I2c_WriteRead(unsigned aAddr, const unsigned char* aW, int aWn, unsigned cha
 	R(EI2cRxLen) = aRn;
 	R(EMCmd0) = (EI2cRead << 27) | addr;
 	return Finish(aR, aRn);
+	}
+
+int I2c_Xfer(TInt aEngine, unsigned aAddr, const unsigned char* aW, int aWn, unsigned char* aR, int aRn)
+	{
+	if (aEngine < 0 || aEngine > 1)
+		return KErrArgument;
+	NKern::FMWait(&Lock);
+	int r = Xfer(aEngine, aAddr, aW, aWn, aR, aRn);
+	NKern::FMSignal(&Lock);
+	return r;
+	}
+
+int I2c_WriteRead(unsigned aAddr, const unsigned char* aW, int aWn, unsigned char* aR, int aRn)
+	{
+	return I2c_Xfer(0, aAddr, aW, aWn, aR, aRn);
 	}

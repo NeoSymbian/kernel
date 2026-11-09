@@ -3,12 +3,14 @@
 // qcom_telmon.cpp -- the debug monitor's telephony commands (docs/telephony.md C2/C3), so each piece of the modem
 // path can be tried on the phone before the user side exists:
 //   scm [pas <id>]        which TrustZone calls exist (assign_mem, PAS); PAS support for a peripheral
-//   smem                  SMEM's version, partitions and their items
+//   smem [item]           SMEM's version, partitions and their items; an item as text (421 = the modem's crash reason)
 //   fw ls [dir]           the modem_a files (default IMAGE)
 //   fw sha <path>         SHA-256 of a modem_a file, read by the kernel's own FAT16 reader
 //   smp2p [start]         the modem pair's SMP2P items (start: create ours)
 //   qmp [modem on|off]    open the AOP link; send the modem's load_state
-//   glink [hello]         the GLINK edge to the modem: FIFO pointers, channels; hello: a QRTR HELLO from node 1
+//   glink [hello]         the GLINK edges (modem, lpass): FIFO pointers, channels; hello: a QRTR HELLO from node 1
+//   adsp                  the ADSP (C6): boot step, error, SMP2P bits (MODEMD loads it through HAL AdspLoad)
+//   audio [probe|start [speaker]|stop|vol <0-10>|mute|unmute]   the board's call-audio codecs (a64_audio.cpp)
 //   mss [boot]            boot the modem (on its own thread; progress in the log); the boot's step and RMB registers
 //   ipa [clock|start]     GSI_STATUS once powered; clock: the RPMh IPA clock only; start: clock + the GSI firmware
 //                         MODEMD handed over (HAL 0x4e13) through PAS 15
@@ -27,6 +29,8 @@
 #include "qcom_qmp.h"
 #include "qcom_mss.h"
 #include "qcom_glink.h"
+#include "qcom_adsp.h"
+#include "qcom_telhal.h"
 #include "qcom_rpmh.h"
 #include "qcom_ipa.h"
 
@@ -163,9 +167,30 @@ static void Smmu(TBool aProbe)
 		seen == 0x07ff0123 ? "writable" : "NOT writable");
 	}
 
+__attribute__((weak)) void A64Audio_Report(void (*aSay)(const char*, ...)) { aSay("audio: no codecs on this board"); }
+
 void A64Tel_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 	{
-	if (Eq(aArg[0], "ipa"))
+	if (Eq(aArg[0], "adsp"))
+		Adsp_Report(A64Mon_Say);
+	else if (Eq(aArg[0], "audio"))
+		{
+		TInt r = KErrNone;
+		if (aArgc >= 2 && Eq(aArg[1], "probe"))
+			r = A64Audio_Control(0, 0);
+		else if (aArgc >= 2 && Eq(aArg[1], "start"))
+			r = A64Audio_Control(1, aArgc >= 3 && Eq(aArg[2], "speaker"));
+		else if (aArgc >= 2 && Eq(aArg[1], "stop"))
+			r = A64Audio_Control(2, 0);
+		else if (aArgc >= 3 && Eq(aArg[1], "vol"))
+			r = A64Audio_Control(4, (TInt)aNum[2]);
+		else if (aArgc >= 2 && (Eq(aArg[1], "mute") || Eq(aArg[1], "unmute")))
+			r = A64Audio_Control(5, Eq(aArg[1], "mute"));
+		if (aArgc >= 2)
+			A64Mon_Say("audio %S -> %d", &aArg[1], r);
+		A64Audio_Report(A64Mon_Say);
+		}
+	else if (Eq(aArg[0], "ipa"))
 		{
 		if (aArgc >= 2 && Eq(aArg[1], "clock"))
 			{
@@ -194,6 +219,15 @@ void A64Tel_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		}
 	if (Eq(aArg[0], "scm"))
 		Scm(aArgc, aArg, aNum);
+	else if (Eq(aArg[0], "smem") && aArgc >= 2)
+		{
+		TUint32 len = 0;										// an item as text: 421 = the modem's crash reason
+		const TUint8* p = (const TUint8*)Smem_Get(KSmemHostGlobal, (TUint)aNum[1], &len);
+		TBuf8<200> t;
+		for (TUint32 i = 0; p && i < len && t.Length() < t.MaxLength() && p[i]; ++i)
+			t.Append(p[i] >= 0x20 && p[i] < 0x7f ? p[i] : '.');
+		A64Mon_Say("smem %d: %d bytes: %S", (TInt)aNum[1], p ? (TInt)len : -1, &t);
+		}
 	else if (Eq(aArg[0], "smem"))
 		Smem_Dump(A64Mon_Say);
 	else if (Eq(aArg[0], "fw"))

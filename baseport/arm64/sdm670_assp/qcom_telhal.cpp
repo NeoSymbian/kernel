@@ -13,7 +13,14 @@
 //                      rmtfs carve-out the modem reads its EFS through (DTB rmtfs-mem@fc201000, VMID 15)
 //   0x4e13 IpaStart    a1 = SIo { .mdt length; 0; image length; image }: IPA's GSI firmware; the kernel brings IPA up
 //                      (qcom_ipa.cpp: power, PAS 15, SMMU, config, GSI). MODEMD calls it before it boots the modem
-// The receive path is polled by the daemon; packets wait in a 64 KB ring filled by the GLINK thread.
+//   0x4e14 AdspLoad    a1 = SIo { op | segment << 8; offset; len; buf }: the ADSP's firmware through TrustZone PAS 1
+//                      (qcom_adsp.cpp): op 0 = the .mdt (QMP, SMP2P, init_image), 1 = len bytes of program header
+//                      `segment` at `offset`, 2 = done (auth_and_reset, then ready/GLINK on the ADSP's thread)
+//   0x4e15 AdspState   a1 = TUint32[4] out: step (4 = running), error, SMP2P slave-kernel bits, open channels mask
+//   0x4e16 ChanSend    a1 = SIo { channel 1 = the ADSP's IPCRTR, 2 = APR (apr_audio_svc); 0; len; buf }
+//   0x4e17 ChanRecv    a1 = SIo { channel; 0; size; buf } -> the next queued message's length, KErrNotReady if none
+//   0x4e18 Audio       a1 = SIo { op; arg; 0; 0 }: the board's codecs and amps (A64Audio_Control, a64_audio.cpp)
+// The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
 #include <platform.h>
@@ -26,64 +33,117 @@
 #include "qcom_mss.h"
 #include "qcom_fat16.h"
 #include "qcom_ipa.h"
+#include "qcom_adsp.h"
 #include "qcom_telhal.h"
 
 TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
+// the board's codecs (bonito a64_audio.cpp); a board without call audio has none
+__attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupported; }
 
-enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart };
+enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
+	EChanRecv, EAudio };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
 
-// ---- the QRTR receive ring: [u32 length][bytes, padded to 4] records
+// ---- the receive rings, one per channel: [u32 length][bytes, padded to 4] records. 0 = the modem's IPCRTR,
+// 1 = the ADSP's IPCRTR, 2 = APR (apr_audio_svc)
 const TUint32 KRing = 0x10000;
-static TUint8 Ring[KRing];
-static TUint32 RingHead, RingTail, RingDrops;					// byte counters, wrap at 2^32
-static NFastMutex RingLock;
-static TInt Channel = -1;
+struct SRing
+	{
+	TUint8 iBuf[KRing];
+	TUint32 iHead, iTail, iDrops;							// byte counters, wrap at 2^32
+	NFastMutex iLock;
+	TInt iChannel;											// its GLINK channel id once open, else -1
+	};
+static SRing Rings[KTelRings];
+static TBool RingsInit;
 
-void Qrtr_SetChannel(TInt aChannel) { Channel = aChannel; }
+TAny* Tel_Ring(TInt aRing)
+	{
+	if (!RingsInit)
+		{
+		for (TInt i = 0; i < KTelRings; ++i)
+			Rings[i].iChannel = -1;
+		RingsInit = ETrue;
+		}
+	return aRing >= 0 && aRing < KTelRings ? &Rings[aRing] : NULL;
+	}
+void Tel_SetChannel(TInt aRing, TInt aChannel) { ((SRing*)Tel_Ring(aRing))->iChannel = aChannel; }
+void Qrtr_SetChannel(TInt aChannel) { Tel_SetChannel(0, aChannel); }
+TBool Tel_Open(TInt aRing) { return ((SRing*)Tel_Ring(aRing))->iChannel >= 0; }
 
-static void RingCopyIn(TUint32 aPos, const TAny* aSrc, TUint32 aLen)
+static void RingCopyIn(SRing& aR, TUint32 aPos, const TAny* aSrc, TUint32 aLen)
 	{
 	for (TUint32 i = 0; i < aLen; ++i)
-		Ring[(aPos + i) % KRing] = ((const TUint8*)aSrc)[i];
+		aR.iBuf[(aPos + i) % KRing] = ((const TUint8*)aSrc)[i];
 	}
-static void RingCopyOut(TAny* aDst, TUint32 aPos, TUint32 aLen)
+static void RingCopyOut(SRing& aR, TAny* aDst, TUint32 aPos, TUint32 aLen)
 	{
 	for (TUint32 i = 0; i < aLen; ++i)
-		((TUint8*)aDst)[i] = Ring[(aPos + i) % KRing];
+		((TUint8*)aDst)[i] = aR.iBuf[(aPos + i) % KRing];
 	}
 
-void Qrtr_Rx(TAny*, const TUint8* aData, TInt aLen)
+void Qrtr_Rx(TAny* aRing, const TUint8* aData, TInt aLen)	// aRing NULL: the modem's (qcom_mss.cpp)
 	{
+	SRing& r = *(SRing*)(aRing ? aRing : Tel_Ring(0));
 	TUint32 rec = 4 + ((aLen + 3) & ~3);
-	NKern::FMWait(&RingLock);
-	if (aLen <= 0 || aLen > KMaxMsg || KRing - (RingHead - RingTail) < rec)
-		++RingDrops;
+	NKern::FMWait(&r.iLock);
+	if (aLen <= 0 || aLen > KMaxMsg || KRing - (r.iHead - r.iTail) < rec)
+		++r.iDrops;
 	else
 		{
 		TUint32 len = aLen;
-		RingCopyIn(RingHead, &len, 4);
-		RingCopyIn(RingHead + 4, aData, aLen);
-		RingHead += rec;
+		RingCopyIn(r, r.iHead, &len, 4);
+		RingCopyIn(r, r.iHead + 4, aData, aLen);
+		r.iHead += rec;
 		}
-	NKern::FMSignal(&RingLock);
+	NKern::FMSignal(&r.iLock);
 	}
 
-static TInt RingPop(TUint8* aBuf)							// aBuf holds KMaxMsg; the length, or KErrNotReady
+static TInt RingPop(SRing& aR, TUint8* aBuf)				// aBuf holds KMaxMsg; the length, or KErrNotReady
 	{
-	NKern::FMWait(&RingLock);
+	NKern::FMWait(&aR.iLock);
 	TInt r = KErrNotReady;
-	if (RingHead != RingTail)
+	if (aR.iHead != aR.iTail)
 		{
 		TUint32 len;
-		RingCopyOut(&len, RingTail, 4);
-		RingCopyOut(aBuf, RingTail + 4, len);
-		RingTail += 4 + ((len + 3) & ~3);
+		RingCopyOut(aR, &len, aR.iTail, 4);
+		RingCopyOut(aR, aBuf, aR.iTail + 4, len);
+		aR.iTail += 4 + ((len + 3) & ~3);
 		r = len;
 		}
-	NKern::FMSignal(&RingLock);
+	NKern::FMSignal(&aR.iLock);
+	return r;
+	}
+
+// a send or a receive between user memory and ring/channel aRing, through a kernel buffer
+static TInt ChanIo(TBool aSend, TInt aRing, TAny* aBuf, TInt aLen)
+	{
+	SRing* ring = (SRing*)Tel_Ring(aRing);
+	if (!ring || aLen <= 0 || (aSend && aLen > KMaxMsg))
+		return KErrArgument;
+	NKern::ThreadEnterCS();
+	TUint8* k = (TUint8*)Kern::Alloc(KMaxMsg);
+	NKern::ThreadLeaveCS();
+	if (!k)
+		return KErrNoMemory;
+	TInt r;
+	if (aSend)
+		{
+		kumemget(k, aBuf, aLen);
+		r = ring->iChannel >= 0 ? Glink_Send(ring->iChannel, k, aLen) : KErrNotReady;
+		}
+	else if ((r = RingPop(*ring, k)) > 0)
+		{
+		if (r > aLen)
+			r = KErrOverflow;								// dropped: the caller's buffer is too small
+		else
+			kumemput(aBuf, k, r);
+		}
+	NKern::ThreadEnterCS();
+	Kern::Free(k);
+	NKern::ThreadLeaveCS();
 	return r;
 	}
 
@@ -181,7 +241,7 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 	case EState:
 		{
 		TInt step, err;
-		TUint32 rmb[4], out[4] = { 0, 0, 0, Channel >= 0 };
+		TUint32 rmb[4], out[4] = { 0, 0, 0, Tel_Open(0) };
 		Mss_State(step, err, rmb);
 		out[0] = step;
 		out[1] = err;
@@ -191,33 +251,7 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		}
 	case EQrtrSend:
 	case EQrtrRecv:
-		{
-		TInt len = (TInt)a2;
-		if (len <= 0 || (aFunction == EQrtrSend && len > KMaxMsg))
-			return KErrArgument;
-		NKern::ThreadEnterCS();
-		TUint8* k = (TUint8*)Kern::Alloc(KMaxMsg);
-		NKern::ThreadLeaveCS();
-		if (!k)
-			return KErrNoMemory;
-		TInt r;
-		if (aFunction == EQrtrSend)
-			{
-			kumemget(k, a1, len);
-			r = Channel >= 0 ? Glink_Send(Channel, k, len) : KErrNotReady;
-			}
-		else if ((r = RingPop(k)) > 0)
-			{
-			if (r > len)
-				r = KErrOverflow;							// dropped: the caller's buffer is too small
-			else
-				kumemput(a1, k, r);
-			}
-		NKern::ThreadEnterCS();
-		Kern::Free(k);
-		NKern::ThreadLeaveCS();
-		return r;
-		}
+		return ChanIo(aFunction == EQrtrSend, 0, a1, (TInt)a2);
 	case EPartRead:
 	case ERmtfsMem:
 		{
@@ -245,6 +279,55 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		Kern::Free(k);
 		NKern::ThreadLeaveCS();
 		return r;
+		}
+	case EAdspLoad:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		if (io.iLen > KChunk)
+			return KErrArgument;
+		TUint8* k = NULL;
+		if (io.iLen)
+			{
+			NKern::ThreadEnterCS();
+			k = (TUint8*)Kern::Alloc(io.iLen);
+			NKern::ThreadLeaveCS();
+			if (!k)
+				return KErrNoMemory;
+			kumemget(k, (const TAny*)io.iBuf, io.iLen);
+			}
+		TInt r = Adsp_Load(io.iA & 0xff, io.iA >> 8, io.iB, k, io.iLen);
+		NKern::ThreadEnterCS();
+		Kern::Free(k);
+		NKern::ThreadLeaveCS();
+		return r;
+		}
+	case EAdspState:
+		{
+		TUint32 out[4] = { 0, 0, 0, 0 };
+		TInt step, err;
+		Adsp_State(step, err);
+		out[0] = step;
+		out[1] = err;
+		Smp2p_In(KSmemHostAdsp, "slave-kernel", out[2]);
+		out[3] = Tel_Open(1) | Tel_Open(2) << 1;
+		kumemput32(a1, out, sizeof(out));
+		return KErrNone;
+		}
+	case EChanSend:
+	case EChanRecv:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		if (io.iA < 1 || io.iA >= (TUint32)KTelRings)
+			return KErrArgument;
+		return ChanIo(aFunction == EChanSend, io.iA, (TAny*)io.iBuf, io.iLen);
+		}
+	case EAudio:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		return A64Audio_Control(io.iA, io.iB);
 		}
 		}
 	return KErrNotSupported;

@@ -61,9 +61,16 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x0018a000, 0x00001000, 1 },		// GCC: the modem's AHB/AXI clock branches
 	{ 0x00134000, 0x00001000, 1 },		// GCC: prng AHB branch (status)
 	{ 0x00138000, 0x00001000, 1 },		// GCC: boot ROM AHB branch (status)
-	{ 0x15000000, 0x00080000, 1 },
+	{ 0x15000000, 0x00080000, 1 },		// apps SMMU (MMU-500): IPA's streams 0x720/0x722 (telephony C5b, qcom_smmu.cpp)
 	{ 0x01e04000, 0x0002c000, 1 },		// GSI, IPA's DMA engine (qcom_ipa.cpp; read only once IPA is clocked)
-	{ 0x01e40000, 0x00009000, 1 },		// IPA registers + its shared memory		// apps SMMU (MMU-500): IPA's streams 0x720/0x722 (telephony C5b, qcom_telmon.cpp)
+	{ 0x01e40000, 0x00009000, 1 },		// IPA registers + its shared memory
+	{ 0x00a88000, 0x00004000, 1 },		// GENI serial engine 2 of QUP wrapper 1: I2C10, the call-audio codecs (C6)
+	{ 0x03937000, 0x00002000, 1 },		// TLMM north tile: gpio55, gpio56 (I2C10)
+	{ 0x03941000, 0x00004000, 1 },		// TLMM north tile: gpio65-68 (the mic's TDM, pri_mi2s)
+	{ 0x0394f000, 0x00002000, 1 },		// TLMM north tile: gpio79, gpio80 (amp IRQs)
+	{ 0x0350e000, 0x00001000, 1 },		// TLMM west tile: gpio14 (Top amp reset)
+	{ 0x03510000, 0x00001000, 1 },		// TLMM west tile: gpio16 (Bottom amp reset)
+	{ 0x62b48000, 0x00004000, 1 },		// LPASS LPI TLMM gpio8-11: the amps' TDM (i2s1; touched once the ADSP is up)
 	{ 0x9e3e0000, 0x00020000, 2 },		// the log ring that survives a reset (a64_dbgmon.cpp lastlog): the tail of
 										// the DTB's no-map framebuffer-region, kept by ABL across PSCI and watchdog resets
 	};

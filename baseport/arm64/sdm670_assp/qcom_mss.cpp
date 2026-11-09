@@ -17,7 +17,8 @@
 // and resets from Linux gcc-sdm845.c, reset-qcom-aoss.c and reset-qcom-pdc.c. Telephony stage C3 (docs/telephony.md).
 // Before all that, the Pixel's board record goes into SMEM item 134 (BoardInfo): the modem's RF task reads it to
 // pick the RF card, and faults without it (C4: ":0:[rf]EX:kernel:0:rf:171" 0.5 s after ready).
-// shortcut: the proxy votes and clocks stay on after handover (RPMh votes are never dropped yet, qcom_rpmh.cpp).
+// At handover the proxy votes go, as Linux's qcom_msa_handover: kept at their highest, they pinned the modem's rails
+// and its RPMh code asserted after voice calls ("rpmh_image_os.c:162", C6 2026-11-09).
 #include <kernel/kern_priv.h>
 #include <platform.h>
 #include "board.h"
@@ -81,6 +82,20 @@ static TInt ClocksOn(const SClk* aClk, TInt aCount)
 			Kern::Printf("[mss] clock %s still off (cbcr %08x)", aClk[i].iName, Reg(aClk[i].iHalt));
 		}
 	return KErrNone;
+	}
+
+// Linux qcom_msa_handover: the proxy clock off and the proxy rails back. Our RPMh votes are one per resource, not
+// summed per driver, so CX goes back to the eMMC's own level (qcom_sdhci.cpp, DDR52) rather than 0.
+// shortcut: no per-driver vote aggregation in qcom_rpmh.cpp; add it when a third CX user appears.
+static void ReleaseProxy()
+	{
+	for (TUint i = 0; i < sizeof(KProxyClks) / sizeof(SClk); ++i)
+		Reg(KProxyClks[i].iEnable) &= ~(1u << KProxyClks[i].iBit);
+	TInt r = Arc_Vote("mss.lvl", 0);
+	r |= Arc_Vote("mx.lvl", 0);
+	r |= Arc_Vote("cx.lvl", 128);
+	r |= Rpmh_Set("xo.lvl", 0, 0);
+	Kern::Printf("[mss] handover: proxy votes released (mss/mx 0, cx 128, xo off) -> %d", r);
 	}
 
 // Linux q6v5_xfer_mem_ownership: HLOS (RWX) and/or the modem's MSA (RW)
@@ -449,6 +464,8 @@ static TInt Boot()
 		Smp2p_In(KSmemHostModem, "slave-kernel", v);
 		}
 	Kern::Printf("[mss] after %d ms: slave-kernel %08x%s", i, v, v & KMssHandover ? " (handover)" : "");
+	if (v & KMssHandover)
+		ReleaseProxy();
 	return KErrNone;
 	}
 

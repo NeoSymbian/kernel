@@ -2,7 +2,8 @@
 //
 // qcom_pas.cpp -- TrustZone's peripheral authentication service (PAS): the firmware's metadata to TZ (init_image),
 // the carve-out declared (mem_setup, for relocatable images), the segments copied in, then auth_and_reset. Used for
-// IPA's GSI firmware (telephony C5b, PAS 15); the ADSP (C6) is next.
+// IPA's GSI firmware (telephony C5b, PAS 15, one image in memory) and the ADSP (C6, PAS 1, 17 MB streamed segment
+// by segment from MODEMD: Pas_Begin, Pas_Segment..., Pas_End).
 // Written from the sequence in Linux drivers/soc/qcom/mdt_loader.c (__qcom_mdt_load) and qcom_scm.c (the PIL calls:
 // SCM service 2, init_image 1, mem_setup 2, auth_and_reset 5, is_supported 7).
 #include <kernel/kern_priv.h>
@@ -49,14 +50,27 @@ static TInt Pil(TUint aCmd, TUint32 aArgInfo, const TUint64* aArgs, TInt aCount,
 	return r;
 	}
 
-TInt Pas_Load(TUint32 aPas, const TUint8* aImage, TUint32 aLen, TUint32 aMdtLen, TUint32 aPhys, TUint32 aSize)
+// one load at a time (IPA at MODEMD's start, the ADSP later): the program headers and where the image goes
+static struct
 	{
-	if (aLen < 0x34 || aMdtLen > aLen || memcompare(aImage, 4, (const TUint8*)"\x7f" "ELF", 4) != 0)
+	TBool iBusy;
+	TUint32 iPas, iBase, iPhys, iSize, iPhnum;
+	SPhdr iPh[32];
+	} L;
+
+static void Done() { L.iBusy = EFalse; }
+
+TInt Pas_Begin(TUint32 aPas, const TUint8* aMdt, TUint32 aMdtLen, TUint32 aPhys, TUint32 aSize)
+	{
+	if (L.iBusy)
+		return KErrInUse;
+	if (aMdtLen < 0x34 || memcompare(aMdt, 4, (const TUint8*)"\x7f" "ELF", 4) != 0)
 		return KErrCorrupt;
-	TUint32 phoff = *(const TUint32*)(aImage + 28), phnum = *(const TUint16*)(aImage + 44);
-	if (phoff + phnum * sizeof(SPhdr) > aMdtLen)
+	TUint32 phoff = *(const TUint32*)(aMdt + 28), phnum = *(const TUint16*)(aMdt + 44);
+	if (phoff + phnum * sizeof(SPhdr) > aMdtLen || phnum > sizeof(L.iPh) / sizeof(L.iPh[0]))
 		return KErrCorrupt;
-	const SPhdr* ph = (const SPhdr*)(aImage + phoff);
+	memcpy(L.iPh, aMdt + phoff, phnum * sizeof(SPhdr));
+	const SPhdr* ph = L.iPh;
 	TUint64 args[3] = { aPas, 0, 0 };
 	TUint64 res[3] = { 0, 0, 0 };
 	// is_supported: logged only. Linux's IPA path never asks, and this TZ answers it with an odd error (0xffcfffc0)
@@ -86,7 +100,7 @@ TInt Pas_Load(TUint32 aPas, const TUint8* aImage, TUint32 aLen, TUint32 aMdtLen,
 	TUint8* p = Map(md, mdSize, c);
 	if (p)
 		{
-		memcpy(p, aImage, aMdtLen);
+		memcpy(p, aMdt, aMdtLen);
 		Unmap(c);
 		args[1] = md;
 		Kern::Printf("[pas] %d: init_image, metadata %d bytes at %08x", aPas, aMdtLen, (TUint32)md);
@@ -101,7 +115,6 @@ TInt Pas_Load(TUint32 aPas, const TUint8* aImage, TUint32 aLen, TUint32 aMdtLen,
 		return r;
 
 	// 2. a relocatable image: tell TZ where it goes
-	TUint32 base = reloc ? minAddr : aPhys;
 	if (reloc)
 		{
 		args[1] = aPhys;
@@ -110,32 +123,84 @@ TInt Pas_Load(TUint32 aPas, const TUint8* aImage, TUint32 aLen, TUint32 aMdtLen,
 		if ((r = Pil(EMemSetup, Args(3), args, 3, "mem_setup")) != KErrNone)
 			return r;
 		}
+	L.iBusy = ETrue;
+	L.iPas = aPas;
+	L.iBase = reloc ? minAddr : aPhys;
+	L.iPhys = aPhys;
+	L.iSize = aSize;
+	L.iPhnum = phnum;
+	return KErrNone;
+	}
 
-	// 3. the segments
-	if ((p = Map(aPhys, aSize, c)) == NULL)
+// a window over [aPhys, aPhys + aLen) in the carve-out, mapped for this one copy
+static TInt Copy(TUint32 aPhys, const TUint8* aData, TUint32 aLen)
+	{
+	TUint32 page = aPhys & ~0xfffu;
+	DPlatChunkHw* c;
+	TUint8* p = Map(page, aPhys - page + aLen, c);
+	if (!p)
 		return KErrNoMemory;
-	for (TUint32 i = 0; i < phnum && r == KErrNone; ++i)
+	if (aData)
+		memcpy(p + (aPhys - page), aData, aLen);
+	else
+		memclr(p + (aPhys - page), aLen);
+	Unmap(c);
+	return KErrNone;
+	}
+
+TInt Pas_Segment(TUint32 aIndex, TUint32 aOffset, const TUint8* aData, TUint32 aLen)
+	{
+	if (!L.iBusy || aIndex >= L.iPhnum || !Loadable(L.iPh[aIndex]))
+		return KErrArgument;
+	const SPhdr& h = L.iPh[aIndex];
+	TUint32 off = h.iPaddr - L.iBase;
+	if (h.iPaddr < L.iBase || off + h.iMemsz > L.iSize || h.iFilesz > h.iMemsz || aOffset > h.iFilesz
+		|| aLen > h.iFilesz - aOffset)
+		return KErrCorrupt;
+	return Copy(L.iPhys + off + aOffset, aData, aLen);
+	}
+
+TInt Pas_End()
+	{
+	if (!L.iBusy)
+		return KErrNotReady;
+	TInt r = KErrNone;
+	for (TUint32 i = 0; i < L.iPhnum && r == KErrNone; ++i)	// each segment's tail past its file data is zeros
 		{
-		const SPhdr& h = ph[i];
+		const SPhdr& h = L.iPh[i];
+		if (Loadable(h) && h.iMemsz > h.iFilesz)
+			for (TUint32 at = h.iFilesz; at < h.iMemsz && r == KErrNone; at += 0x100000)
+				r = Copy(L.iPhys + h.iPaddr - L.iBase + at, NULL, Min(h.iMemsz - at, 0x100000u));
+		}
+	TUint64 args[1] = { L.iPas };
+	if (r == KErrNone)
+		{
+		// TZ checks the segments against the hash and starts the peripheral
+		Kern::Printf("[pas] %d: segments copied; auth_and_reset", L.iPas);
+		r = Pil(EAuthReset, Args(1), args, 1, "auth_and_reset");
+		Kern::Printf("[pas] %d: in %08x -> %d", L.iPas, L.iPhys, r);
+		}
+	Done();
+	return r;
+	}
+
+void Pas_Abort() { Done(); }
+
+TInt Pas_Load(TUint32 aPas, const TUint8* aImage, TUint32 aLen, TUint32 aMdtLen, TUint32 aPhys, TUint32 aSize)
+	{
+	if (aMdtLen > aLen)
+		return KErrCorrupt;
+	TInt r = Pas_Begin(aPas, aImage, aMdtLen, aPhys, aSize);
+	for (TUint32 i = 0; r == KErrNone && i < L.iPhnum; ++i)
+		{
+		const SPhdr& h = L.iPh[i];
 		if (!Loadable(h))
 			continue;
-		TUint32 off = h.iPaddr - base;
-		if (h.iPaddr < base || off + h.iMemsz > aSize || h.iFilesz > h.iMemsz || h.iOffset + h.iFilesz > aLen)
-			r = KErrCorrupt;
-		else
-			{
-			memcpy(p + off, aImage + h.iOffset, h.iFilesz);
-			memclr(p + off + h.iFilesz, h.iMemsz - h.iFilesz);
-			}
+		r = h.iOffset + h.iFilesz > aLen ? KErrCorrupt : Pas_Segment(i, 0, aImage + h.iOffset, h.iFilesz);
 		}
-	Unmap(c);
-	if (r != KErrNone)
-		return r;
-
-	// 4. TZ checks the segments against the hash and starts the peripheral
-	Kern::Printf("[pas] %d: segments copied; auth_and_reset", aPas);
-	r = Pil(EAuthReset, Args(1), args, 1, "auth_and_reset");
-	Kern::Printf("[pas] %d: %d bytes in %08x..%08x%s -> %d", aPas, maxAddr - minAddr, aPhys, aPhys + maxAddr - minAddr,
-		reloc ? " (relocated)" : "", r);
+	if (r == KErrNone)
+		return Pas_End();
+	if (L.iBusy)
+		Pas_Abort();
 	return r;
 	}

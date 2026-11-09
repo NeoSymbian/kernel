@@ -599,7 +599,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	else if (Eq(c, "spmi") && argc >= 5 && Eq(arg[1], "w"))
 		Say("spmi %d:%04x <- %02x -> %d", (TInt)num[2], (TInt)num[3], (TInt)num[4],
 			Spmi_Write((TUint)num[2], (TUint)num[3], (TUint)num[4]));
-	else if (Eq(c, "scm") || Eq(c, "smem") || Eq(c, "fw") || Eq(c, "smp2p") || Eq(c, "qmp") || Eq(c, "mss") || Eq(c, "glink") || Eq(c, "smmu") || Eq(c, "ipa"))	// telephony (qcom_telmon.cpp)
+	else if (Eq(c, "scm") || Eq(c, "smem") || Eq(c, "fw") || Eq(c, "smp2p") || Eq(c, "qmp") || Eq(c, "mss") || Eq(c, "glink") || Eq(c, "smmu") || Eq(c, "ipa") || Eq(c, "adsp") || Eq(c, "audio"))	// telephony (qcom_telmon.cpp)
 		{
 		TInt x;
 		XTRAP(x, XT_DEFAULT, A64Tel_Monitor(argc, arg, num));

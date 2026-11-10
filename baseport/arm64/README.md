@@ -137,7 +137,7 @@ baseport/arm64/
     bus/             qcom_spmi, qcom_geni_i2c, qcom_rpmh
     soc/             qcom_scm, qcom_smem, qcom_llcc, qcom_cpufreq, qcom_gcc, qcom_tlmm
     storage/         qcom_sdhci
-    usb/             qcom_dwc3_acm, qcom_usbpower
+    usb/             qcom_dwc3, qcom_usbpower
     pmic/            qcom_rtc, qcom_pon (later: charger, RRADC, haptics, WLED)
     remoteproc/      qcom_smp2p, qcom_qmp, qcom_glink, qcom_mss, qcom_telhal, qcom_telmon (later: ADSP, IPA)
     display/ gpu/ audio/   (later: DPU/DSI, Adreno + GMU, LPASS/WCD)

@@ -325,7 +325,7 @@ __attribute__((weak)) void A64StartKeys() {}
 __attribute__((weak)) void A64StartTouch() {}
 // a64_reboot.cpp on the Pixel: the AUTOFASTBOOT timer of debug builds
 __attribute__((weak)) void A64StartReboot() {}
-// qcom_dwc3_acm.cpp on the Pixel: the USB debug console (tools/phone.py)
+// qcom_dwc3.cpp + a64_usb_acm_monitor.cpp on the Pixel: the USB debug console (tools/phone.py)
 __attribute__((weak)) void A64StartUsbConsole() {}
 // qcom_cpufreq.cpp on the Pixel: CPU and L3 clocks with touch boost (smooth-ui S3c)
 __attribute__((weak)) void A64StartCpufreq() {}

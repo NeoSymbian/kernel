@@ -319,6 +319,8 @@ void A64StartMedia();									// a64_media.cpp
 void A64StartDisplay();									// a64_display.cpp
 // a64_serialkbd.cpp on QEMU virt; boards without a serial keyboard keep this
 __attribute__((weak)) void A64StartSerialKeyboard() {}
+// a64_ecomm.cpp: the serial LDD + the board's debug serial PDD (QEMU virt's second PL011)
+__attribute__((weak)) void A64StartDebugSerial() {}
 // a64_keys.cpp on the Pixel: power and volume keys
 __attribute__((weak)) void A64StartKeys() {}
 // a64_touch.cpp on the Pixel: the touchscreen
@@ -340,6 +342,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	A64StartCpufreq();									// before the input drivers: their events boost the clocks
 	A64StartDisplay();									// the screen's HAL, for the window server
 	A64StartSerialKeyboard();
+	A64StartDebugSerial();
 	A64StartKeys();
 	A64StartTouch();
 	A64StartReboot();

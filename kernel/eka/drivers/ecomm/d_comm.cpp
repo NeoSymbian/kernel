@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): an integer comparison of a control argument (AArch64 build).
 // Description:
 // e32\drivers\ecomm\d_comm.cpp
 // 
@@ -1942,7 +1942,7 @@ TInt DChannelComm::DoControl(TInt aFunction, TAny* a1, TAny* a2)
 
 		case RBusDevComm::EControlSetMinTurnaroundTime:
 				{
-				if (a1<0)
+				if ((TInt)a1<0)
 					a1=(TAny*)0;
 				iTurnaroundMicroSeconds = (TUint)a1;			// save this
 				TUint newTurnaroundMilliSeconds = (TUint)a1/1000;	// convert to ms

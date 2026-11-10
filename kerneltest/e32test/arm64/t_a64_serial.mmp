@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// NEOCOM.EXE: the debug serial port test (t_a64_serial.cpp); NeoSymbian/build emitter/components.py builds it
+TARGET neocom.exe
+TARGETTYPE exe
+UID 0 0xe0002024
+CAPABILITY CommDD
+SOURCEPATH .
+SOURCE t_a64_serial.cpp
+SYSTEMINCLUDE /epoc32/include
+LIBRARY euser.lib

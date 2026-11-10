@@ -5,6 +5,8 @@
 # Env: SMP (default 4), OUT, MON (a monitor socket path),
 #      INPUT=<text> (printf escapes, e.g. "dir\r"; each "~" waits 5 s): typed into the serial console after INPUT_DELAY
 #      seconds (default 15); Ctrl-T ("\024") makes the full kernel dump its threads,
+#      SERIAL1=<chardev>: the second PL011 (the debug serial port, RBusDevComm unit 1), default null; e.g.
+#      unix:/tmp/uart1.sock,server=on,wait=off (tools/test-serial-qemu.py). The first stays the console on stdio.
 #      DISK=<file>: a virtio-blk disk (the persistent C:, board/virtio_blk.cpp), created 256 MB if missing,
 #      FBDUMP=<file.png>: a moment before the timeout, save the full kernel's RAM framebuffer (the address its display
 #      driver prints: "[display] WxH 32 bpp, framebuffer phys P") through the monitor and convert it to a PNG.
@@ -15,13 +17,15 @@ SECS=${1:-10}; EXPECT=${2:-}
 FBDUMP=${FBDUMP:-}
 [ -n "$FBDUMP" ] && MON=${MON:-$OUT/qemu-mon.sock}
 [ -n "${MON:-}" ] && rm -f "$MON"
+MONITOR=none; [ -n "${MON:-}" ] && MONITOR="unix:$MON,server,nowait"
 DISKARGS=""
 if [ -n "${DISK:-}" ]; then
 	[ -f "$DISK" ] || truncate -s 256M "$DISK"
 	DISKARGS="-global virtio-mmio.force-legacy=true -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
 fi
 qemu() { timeout "$SECS" qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a55 -smp "${SMP:-4}" -m 512 \
-	-nographic -no-reboot -nic none $DISKARGS ${MON:+-monitor unix:$MON,server,nowait} -kernel "$OUT/Image" > "$OUT/serial.log" 2>&1; }
+	-display none -serial stdio -serial "${SERIAL1:-null}" -monitor "$MONITOR" \
+	-no-reboot -nic none $DISKARGS -kernel "$OUT/Image" > "$OUT/serial.log" 2>&1; }
 if [ -n "${INPUT:-}" ]; then
 	{ sleep "${INPUT_DELAY:-15}"
 	  rest=$INPUT
@@ -55,5 +59,7 @@ print("FBDUMP: %s (%dx%d from phys %08x)" % (png, w, h, phys))
 PY
 fi
 wait $QPID
+QSTATUS=$?
 tr -d '\r' < "$OUT/serial.log"
+case $QSTATUS in 0|124) ;; *) echo "run-qemu: QEMU failed ($QSTATUS)" >&2; exit "$QSTATUS" ;; esac	# 124: the timeout
 [ -z "$EXPECT" ] || grep -q "$EXPECT" "$OUT/serial.log"

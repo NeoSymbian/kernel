@@ -11,11 +11,13 @@
 // completes; a SET_CONFIGURATION waits for its stops before its status stage; an active control transfer at a bus
 // reset, or a failed start or stop, restarts the controller (halt, core reset, bring-up), the one thing that frees
 // a quarantined endpoint. After startup only the poll DFC (UsbQ) touches the controller and the DMA area.
+// The link's suspend and resume (a host asleep) are logged and counted.
 // shortcut: polled every 1 ms on its own DFC queue, no interrupt; HS only; one function.
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_usb_function.h"
 #include "a64_usb_dma.h"
+#include "a64_usb_link.h"
 #include "qcom_rpmh.h"
 
 const TUint32 KDwc3 = 0x0a600000;
@@ -70,6 +72,8 @@ static TInt DeferredStatusEp = -1;							// its status stage, once the host aske
 static TUint32 RscIdx[KPhysEps], StopTick[KPhysEps];
 static TUsbDmaOwnership Dma;
 static TInt Events, Resets, Setups, Restarts;
+static TUsbResumeTracker Link;
+static TInt Suspends, Resumes;
 static TUint32 SetupLog[6];
 
 // ---- endpoint commands
@@ -188,6 +192,8 @@ void A64Usb_Stats(SA64UsbStats& aStats)
 	aStats.iDmaOwned = Dma.iOwned;
 	aStats.iDmaPending = Dma.iPending;
 	aStats.iDmaQuarantined = Dma.iQuarantined;
+	aStats.iSuspends = Suspends;
+	aStats.iResumes = Resumes;
 	}
 
 void A64Usb_Trb(TInt aPhysEp, TUint32& aSize, TUint32& aCtrl, TUint32& aRscIdx)
@@ -543,6 +549,7 @@ static TInt Bringup()
 	memclr((TAny*)Area, KAreaSize);
 	memclr(RscIdx, sizeof(RscIdx));
 	Ep0RearmNeeded = EFalse;
+	Link.Reset();
 	EndSession();											// nothing is owned now: it only resets the function
 	R(EGusb2PhyCfg) = phy & ~((1u << 6) | (1u << 8));		// DTB: dis_u2_susphy_quirk, dis_enblslpm_quirk
 	R(EGctl) = (R(EGctl) & ~(3u << 12)) | (2u << 12);		// device mode
@@ -609,6 +616,16 @@ static void PollDfcFn(TAny*)
 		RestartController();
 	if (Running)
 		{
+		TUint32 dsts = R(EDsts);
+		TUsbResumeTracker::TAction link = Link.Observe((dsts >> 18) & 0xf);
+		if (link != TUsbResumeTracker::ENone)
+			{
+			if (link == TUsbResumeTracker::ESuspend)
+				++Suspends;
+			else
+				++Resumes;
+			Kern::Printf("[usb] link %s (dsts %08x)", link == TUsbResumeTracker::ESuspend ? "suspend" : "resume", dsts);
+			}
 		A64Usb_ProcessEvents();
 		if (Restart)
 			RestartController();

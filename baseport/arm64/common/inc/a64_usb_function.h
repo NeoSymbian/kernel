@@ -48,7 +48,7 @@ TBool A64Usb_Ep0Idle();										// no control transfer in progress
 TBool A64Usb_Configured();
 struct SA64UsbStats
 	{
-	TInt iEvents, iResets, iSetups, iEp0, iRestarts;
+	TInt iEvents, iResets, iSetups, iEp0, iRestarts, iSuspends, iResumes;
 	TBool iConfigured;
 	TUint32 iDsts, iSetupLog[6], iDmaOwned, iDmaPending, iDmaQuarantined;
 	};

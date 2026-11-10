@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// test_usb_core.cpp -- host test of the USB core's endpoint ownership and EP0 recovery (common/inc/a64_usb_dma.h):
+// test_usb_core.cpp -- host test of the USB core's state machines (common/inc/a64_usb_dma.h, a64_usb_link.h):
 //   c++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined test_usb_core.cpp -o test_usb_core && ./test_usb_core
 #include <cassert>
 #include <cstdio>
 #include "../common/inc/a64_usb_dma.h"
+#include "../common/inc/a64_usb_link.h"
 
 int main()
 	{
@@ -56,6 +57,28 @@ int main()
 	assert(UsbStopProgress(blocked.iPending, blocked.iQuarantined, 1u << 2) == EUsbStopReady);
 	blocked.ControllerReset();
 	assert(UsbStopProgress(blocked.iPending, blocked.iQuarantined, bulk) == EUsbStopReady && blocked.CanStart(3));
+
+	// the link: one suspend and one resume per sleep, nothing from steady states or resume signalling
+	TUsbResumeTracker link = {};
+	for (unsigned i = 0; i < 1000; ++i)
+		assert(link.Observe(0) == TUsbResumeTracker::ENone);
+	assert(link.Observe(3) == TUsbResumeTracker::ESuspend);
+	for (unsigned i = 0; i < 1000; ++i)
+		assert(link.Observe(3) == TUsbResumeTracker::ENone);
+	assert(link.Observe(15) == TUsbResumeTracker::ENone);	// resume signalling before On
+	assert(link.Observe(0) == TUsbResumeTracker::EResume);
+	assert(link.Observe(0) == TUsbResumeTracker::ENone);
+	for (unsigned state = 1; state < 16; ++state)
+		if (state != 3)
+			assert(link.Observe(state) == TUsbResumeTracker::ENone);
+	assert(link.Observe(3) == TUsbResumeTracker::ESuspend);
+	link.Reset();											// a controller restart forgets the suspend
+	assert(link.Observe(0) == TUsbResumeTracker::ENone);
+	for (unsigned cycle = 0; cycle < 100; ++cycle)
+		{
+		assert(link.Observe(3) == TUsbResumeTracker::ESuspend && link.Observe(3) == TUsbResumeTracker::ENone);
+		assert(link.Observe(2) == TUsbResumeTracker::ENone && link.Observe(0) == TUsbResumeTracker::EResume);
+		}
 	puts("test_usb_core: ok");
 	return 0;
 	}

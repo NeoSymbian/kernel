@@ -12,6 +12,9 @@
 
 enum { EPhysBulkOut = 2, EPhysBulkIn = 3, EPhysIntrIn = 5 };
 const TInt KBulkMax = 512, KInMax = 4096;
+// a 4 KB HS transfer takes ~70 us on the wire: the writer polls for its completion up to 200 us (fast counter)
+// before it sleeps a tick (a tick per 4 KB held "shot" at ~1 MB/s)
+const TInt KSpinPerSecond = 5000;
 
 // ---- descriptors
 static const TUint8 KDevice[] = {
@@ -147,6 +150,9 @@ static void UsbWrite(const TUint8* aData, TInt aLen)
 		for (TInt i = 0; (InBusy || !A64Usb_CanStart(EPhysBulkIn)) && i < 2000 && generation == Generation; ++i)
 			{
 			A64Usb_ProcessEvents();
+			const TUint32 t0 = NKern::FastCounter(), spin = NKern::FastCounterFrequency() / KSpinPerSecond;
+			while ((InBusy || !A64Usb_CanStart(EPhysBulkIn)) && generation == Generation && NKern::FastCounter() - t0 < spin)
+				A64Usb_ProcessEvents();
 			if (InBusy || !A64Usb_CanStart(EPhysBulkIn))
 				NKern::Sleep(1);
 			}
@@ -254,9 +260,9 @@ void A64UsbStatus(TDes8& aBuf)							// the monitor's "usb" command
 	TUint32 size, ctrl, rsc;
 	A64Usb_Trb(EPhysBulkIn, size, ctrl, rsc);
 	Append(aBuf, "ev %d rst %d setups %d ep0 %d cfg %d dtr %d in %d/%d/%d busy %d abort %d lines %d logpos %d "
-		"trb3 %08x %08x rsc3 %d dma %x/%x/%x restarts %d", s.iEvents, s.iResets, s.iSetups, s.iEp0, s.iConfigured, Dtr,
+		"trb3 %08x %08x rsc3 %d dma %x/%x/%x restarts %d link %d/%d", s.iEvents, s.iResets, s.iSetups, s.iEp0, s.iConfigured, Dtr,
 		InStarts, InDone, InFail, InBusy, AbortIn, OutLines, LogPos, size, ctrl, rsc, s.iDmaOwned, s.iDmaPending,
-		s.iDmaQuarantined, s.iRestarts);
+		s.iDmaQuarantined, s.iRestarts, s.iSuspends, s.iResumes);
 	}
 
 void A64UsbDump()

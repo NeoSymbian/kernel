@@ -150,3 +150,39 @@ baseport/arm64/
 **Order of the code pass:**
 1. Registries and `ekc` names. Behaviour stays the same; check `drivers` and an `nm` diff on QEMU and bonito.
 2. Moves, as one commit at a quiet point in the telephony work.
+
+## Read-only SoC temperatures (bonito)
+
+`thermal` in the debug monitor lists both SDM670 TSENS v2 controllers (13 and 8
+controller-local sensor IDs) in milli-Celsius. `drivers`/the device-list HAL report
+valid sample count and maximum temperature. The registry deliberately reports
+`partial`: telemetry provides no throttling, trip interrupts or thermal policy.
+The driver never enables, resets or calibrates a controller; disabled/invalid
+samples return unavailable. Sensor IDs are not physical CPU labels.
+
+Host regression check: `python3 baseport/arm64/tools/test-tsens-host.py`.
+The new `thermal` tag is mapped to neoui's existing Thermal device row; showing it
+there requires rebuilding the UI as well as the kernel.
+
+## Read-only battery observations (bonito)
+
+`battery` reads PM660 fuel-gauge/charger observations through SPMI. It prints a
+validity mask before raw fields: an unset bit means unknown, never an actual zero.
+`drivers` reports the available percentage/voltage as `partial`, because this is
+telemetry without charging policy. No PMIC writes, profile/SRAM access, ADC
+triggers or charger-watchdog service are performed. Hardware readiness/shadow
+agreement cannot establish profile correctness or sample age; the percentage is
+the retained PMIC estimate, not Android's smoothed/calibrated UI value.
+
+HAL `EHalGroupVariant` function `0x4e1a` takes an output descriptor in a1 and
+requires `ReadDeviceData`. Exactly 32 little-endian bytes contain eight u32 words:
+version (1), validity mask, presence, reported percentage, microvolts, USB presence,
+USB online, normalized charge state. Validity bits 0..5 correspond to the six data
+words; charge states are 0 unknown, 1 discharging, 2 charging, 3 not charging,
+4 full. Partial data returns success; no data returns `KErrNotReady`; unsupported
+PMIC/boards return `KErrNotSupported`. A short output descriptor returns overflow
+through the standard descriptor write path. Older user interfaces remain unchanged.
+
+`python3 baseport/arm64/tools/test-battery-host.py` checks actual driver code with
+fake SPMI input. Source facts are from the AOSP PM660 Gen3 FG and Linux v6.16
+PMI8998/PM660 charger references cited in `qcom_battery.cpp`.

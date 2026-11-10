@@ -7,7 +7,7 @@
 //   help | log | lastlog | drivers (the device registry, a64_device.h) | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel) | scm | smem | fw ls|sha | smp2p | qmp | mss | glink (telephony, Pixel: qcom_telmon.cpp)
 //   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> (vendor_a/_b, EMMC_C=2) | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
-//   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | rtc | date <unix UTC s> [UTC offset s]
+//   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | thermal | rtc | date <unix UTC s> [UTC offset s]
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; "blk dump" sends "DUMP <n>\n", n*512 raw bytes,
 // then a text line with their SHA-256; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
@@ -205,6 +205,8 @@ void A64Mon_Say(const char* aFmt, ...)						// Say for board files' commands (a6
 __attribute__((weak)) void A64TouchDump() {}
 __attribute__((weak)) void A64BlkDump() {}
 __attribute__((weak)) void A64KeysDump() {}
+__attribute__((weak)) void A64BatteryDump() { Say("battery: not on this board"); }
+__attribute__((weak)) void A64ThermalDump() { Say("thermal: not on this board"); }
 __attribute__((weak)) void A64_RebootToFastboot() { Say("fastboot: not on this board"); }
 // QEMU virt: PSCI resets or stops the guest (a64_reboot.cpp on the Pixel, with the PMIC's reboot reason)
 __attribute__((weak)) void A64_RebootNormal() { A64_Psci(0x84000009, 0, 0, 0); }
@@ -545,7 +547,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console drivers peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt rtc date");
+		Say("help log lastlog console drivers peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt thermal battery rtc date");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -637,6 +639,10 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		}
 	else if (Eq(c, "touch"))
 		A64TouchDump();
+	else if (Eq(c, "battery"))
+		A64BatteryDump();
+	else if (Eq(c, "thermal"))
+		A64ThermalDump();
 	else if (Eq(c, "keys"))
 		A64KeysDump();
 	else if (Eq(c, "threads"))

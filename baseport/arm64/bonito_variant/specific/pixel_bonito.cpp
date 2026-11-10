@@ -22,6 +22,10 @@ const unsigned int A64_TimerPpi = 19;	// Qualcomm wires the virtual timer to PPI
 const unsigned int A64_UserCpuAffinity = 0xffffffff;
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu << 8; }		// Aff1 = core
 const SA64IoRegion A64_IoRegions[] = {
+	{ 0x0c263000, 0x00001000, 1 }, // TSENS0 temperature monitor
+	{ 0x0c265000, 0x00001000, 1 }, // TSENS1 temperature monitor
+	{ 0x0c222000, 0x00001000, 1 }, // TSENS0 configuration (read only)
+	{ 0x0c223000, 0x00001000, 1 }, // TSENS1 configuration (read only)
 	{ 0x17a00000, 0x00200000, 1 },		// GICv3 distributor + redistributors
 	{ 0x9c000000, 0x00900000, 2 },		// the framebuffer's 4320 x 2160 bytes (in RAM: the bank must stop below it)
 	{ 0x0c440000, 0x00002000, 1 },		// SPMI PMIC arbiter core: version + the apid map (qcom_spmi.cpp)

@@ -21,6 +21,7 @@ enum { EStDone = 1, EStFailure = 2, EStDenied = 4, EStDropped = 8 };
 
 static TInt16 ApidOf[0x1000];									// ppid -> apid, -1 = none
 static TBool Ready;
+static NFastMutex ReadLock; // serialize each observer command through its completion
 static TInt Version = KErrNotReady;
 
 static volatile TUint32* Reg(TUint32 aBase, TUint32 aOff) { return (volatile TUint32*)(A64_Io(aBase) + aOff); }
@@ -89,8 +90,11 @@ int Spmi_Read(unsigned aSid, unsigned aAddr)
 	if (apid < 0)
 		return KErrNotFound;
 	TUint32 ch = 0x80 * apid;										// ee 0's observer channels
+	NKern::FMWait(&ReadLock);
 	*Reg(KArbObsrvr, ch + ECmd) = (EOpExtReadL << 27) | ((aAddr & 0xff) << 4) | 0;	// byte count - 1 = 0
-	return Wait(Reg(KArbObsrvr, ch), ETrue);
+	TInt r = Wait(Reg(KArbObsrvr, ch), ETrue);
+	NKern::FMSignal(&ReadLock);
+	return r;
 	}
 
 static struct { TInt iApid; DPlatChunkHw* iChunk; } WriteChannels[4];

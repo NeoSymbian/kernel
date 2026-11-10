@@ -64,7 +64,7 @@ public:
 //   ENeoHalBuildInfo   a1 = TDes8* -> this kernel's build: "kernel <commit>[+dirty] <UTC time> <board>" (no capability)
 enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalUsbDebugSet,
 	ENeoHalUsbDebugGet, ENeoHalBootOk = 0x4e06,
-	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c, ENeoHalDeviceList = 0x4e19 };
+	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c, ENeoHalDeviceList = 0x4e19, ENeoHalBatteryRead = 0x4e1a };
 //   ENeoHalPower       a1 = 0 restart, 1 restart to fastboot, 2 power off (PowerMgmt). Returns only on a failure; the
 //                      caller finalises the drives first (neoui's Power menu)
 //   ENeoHalRtcRead     a1 = TUint32* -> the PMIC RTC's raw seconds; KErrNotSupported without one (QEMU)
@@ -73,6 +73,7 @@ enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalCo
 //                      KErrNotSupported elsewhere
 //   ENeoHalDeviceList  a1 = TUint32* cursor (in/out; 0 = the first), a2 = TDes8* (1024 bytes) -> the device registry
 //                      as lines "tag\tstate\tname\tdriver\tdetail\n", none past the end (a64_devices.cpp; ReadDeviceData)
+__attribute__((weak)) TInt A64Battery_Hal(TAny*) { return KErrNotSupported; }
 void A64_RebootNormal();									// a64_reboot.cpp (weak QEMU defaults: a64_dbgmon.cpp)
 void A64_RebootToFastboot();
 TInt A64_PowerOff();
@@ -175,6 +176,10 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 	case 0x4e0d: case 0x4e0e: case 0x4e0f: case 0x4e10: case 0x4e11: case 0x4e12: case 0x4e13:
 	case 0x4e14: case 0x4e15: case 0x4e16: case 0x4e17: case 0x4e18:
 		return A64Tel_Hal(aFunction, a1, a2);
+	case ENeoHalBatteryRead:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityReadDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian battery")))
+			return KErrPermissionDenied;
+		return A64Battery_Hal(a1);
 	case ENeoHalDeviceList:
 		return A64Device_Hal(a1, a2);
 	case ENeoHalConsoleGet:

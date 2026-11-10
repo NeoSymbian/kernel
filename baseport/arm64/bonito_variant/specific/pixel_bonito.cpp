@@ -43,7 +43,7 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x0397d000, 0x00001000, 1 },		// TLMM north tile: gpio125 (touch attention)
 	{ 0x03587000, 0x00001000, 1 },		// TLMM west tile: gpio135 (ts-switch)
 	{ 0x007c4000, 0x00002000, 1 },		// eMMC host (sdhci-msm v5): SDHCI registers + CQHCI (qcom_sdhci.cpp)
-	{ 0x0a600000, 0x0000d000, 1 },		// USB DWC3 core (qcom_dwc3_acm.cpp: the debug console)
+	{ 0x0a600000, 0x0000d000, 1 },		// USB DWC3 core (qcom_dwc3.cpp: the debug console)
 	{ 0x0a6f8000, 0x00001000, 1 },		// USB Qualcomm wrapper (QSCRATCH at +0x800)
 	{ 0x088e2000, 0x00001000, 1 },		// QUSB2 HS PHY
 	{ 0x179e0000, 0x00010000, 1 },		// apps RSC DRV2: RPMh bus votes (qcom_rpmh.cpp)

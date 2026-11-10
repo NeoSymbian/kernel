@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""phone.py -- drive the Pixel running the AArch64 Symbian kernel over its USB debug console (board/qcom_dwc3_acm.cpp),
+"""phone.py -- drive the Pixel running the AArch64 Symbian kernel over its USB debug console (common/specific/a64_usb_acm_monitor.cpp),
 with nothing but the Python standard library and the fastboot tool.
 
   phone.py run IMG [--cmd C]... [--log F] [--secs N] [--stay] [--no-date]

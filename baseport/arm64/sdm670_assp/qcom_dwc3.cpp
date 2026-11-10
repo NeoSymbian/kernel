@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// qcom_dwc3_acm.cpp -- the Pixel's debug console: the SDM670 USB controller (DTB usb@a600000, Synopsys DWC3, device
-// mode, high speed) as a USB CDC-ACM serial port, the Mac's /dev/cu.usbmodem*. Its bytes in are lines for the debug
-// monitor (a64_dbgmon.cpp); its bytes out are the kernel log ring and the monitor's answers. tools/phone.py drives it.
+// qcom_dwc3.cpp -- the SDM670 USB device controller (DTB usb@a600000, Synopsys DWC3, device mode, high speed) and the
+// core of our gadget: bring-up, the event ring, EP0 with the standard requests, and each endpoint's transfers and DMA
+// buffer. A function (a64_usb_function.h) supplies descriptors, class requests and endpoint callbacks; today that is
+// the debug monitor's ACM serial port (common/specific/a64_usb_acm_monitor.cpp), the Mac's /dev/cu.usbmodem*.
 // ABL's fastboot used this controller to receive our image, so its clocks, the QUSB2 PHY and the Qualcomm wrapper
 // are set up: only the device controller is reset and programmed, after Linux drivers/usb/dwc3 (core.c, gadget.c,
 // ep0.c). Every transfer is one TRB (LST) started by its own StartTransfer, so there are no TRB rings.
-// IDs 0x1209:0x0001 (pid.codes test ID, private development use).
-// shortcut: polled every 1 ms on its own DFC queue, no interrupt; HS only; one ACM port.
+// shortcut: polled every 1 ms on its own DFC queue, no interrupt; HS only; one function.
 #include <kernel/kern_priv.h>
 #include "board.h"
-#include "a64_dbgmon.h"
+#include "a64_usb_function.h"
 #include "qcom_rpmh.h"
 
 const TUint32 KDwc3 = 0x0a600000;
@@ -30,16 +30,19 @@ enum { ETrbHwo = 1, ETrbLst = 2, ETrbIsp = 1 << 10, ETrbIoc = 1 << 11 };
 enum { ETrbNormal = 1 << 4, ETrbSetup = 2 << 4, ETrbStatus2 = 3 << 4, ETrbStatus3 = 4 << 4, ETrbData = 5 << 4 };
 enum { EEvXferComplete = 1, EEvXferNotReady = 3 };
 enum { EDevDisconnect = 0, EDevReset = 1, EDevConnectDone = 2 };
-enum { EPhysEp0Out = 0, EPhysEp0In = 1, EPhysBulkOut = 2, EPhysBulkIn = 3, EPhysIntrIn = 5 };
-const TInt KEp0Max = 64, KBulkMax = 512;
+enum { EPhysEp0Out = 0, EPhysEp0In = 1 };
+const TInt KEp0Max = 64, KPhysEps = 8;
 
-// DMA area, physically contiguous and mapped non-cached: event buffer, TRBs, setup packet, EP0 data, bulk buffers
+// DMA area, physically contiguous and mapped non-cached: event buffer, TRBs, setup packet, EP0 data, then the
+// function's endpoint buffers (from EOffEpBufs, in its endpoint order)
 const TInt KAreaSize = 0x4000, KEvSize = 4096;
-enum { EOffEv = 0x0000, EOffTrb = 0x1000, EOffSetup = 0x1100, EOffEp0Buf = 0x1200, EOffOut = 0x2000, EOffIn = 0x3000 };
-const TInt KInMax = 4096;
+enum { EOffEv = 0x0000, EOffTrb = 0x1000, EOffSetup = 0x1100, EOffEp0Buf = 0x1200, EOffEpBufs = 0x2000 };
 static TPhysAddr AreaPhys;
 static TLinAddr Area;
 static TUint32 EvPos;
+
+static const SA64UsbFunction& Fn = KA64UsbFunction;
+static TInt BufOff[KPhysEps], Armed[KPhysEps];				// each endpoint's buffer; the length its transfer was armed with
 
 struct STrb { TUint32 iBpl, iBph, iSize, iCtrl; };
 static volatile STrb* Trb(TInt aPhysEp) { return (volatile STrb*)(Area + EOffTrb + 16 * aPhysEp); }
@@ -51,22 +54,9 @@ static volatile TUint32& P(TUint32 aOff) { return *(volatile TUint32*)(A64_Io(KQ
 enum TEp0State { ESetup, EDataIn, EDataOut, EWaitStatus2, EWaitStatus3In, EWaitStatus3Out, EStatus };
 static TEp0State Ep0;
 static TUint8 Setup[8];
-static TBool Configured, Dtr, InBusy, OutBusy, AbortIn;
-static TUint32 RscIdx[8];
-static TUint8 LineCoding[7] = { 0x00, 0xc2, 0x01, 0x00, 0, 0, 8 };	// 115200 8N1, as the host likes to see
-static TUint32 LogPos;
-static TBuf8<160> Line;
-static TBool LineReady;
-// "blk put" raw input (A64Usb_RawIn below): the stage, how much of it is filled, what is still to come
-// A transfer never splits: the stage has a transfer's worth of slack past 64 KB, and what isn't a whole sector stays
-// for the next stage. Raw transfers are 4 KB (the OUT area), lines take one packet at a time.
-const TInt KRawStage = 64 * 1024, KRawXfer = 0x1000, KSector = 512;
-static TUint8* RawStage;									// KRawStage + KRawXfer
-static TInt RawFill, RawLeft;
-static TBool RawFull;
-static TInt OutArmed = 512;								// the bytes the OUT TRB was armed with
-static TInt ArmOut();
-static TInt Events, Resets, Setups, InStarts, InDone, InFail, OutLines;
+static TBool Configured;
+static TUint32 RscIdx[KPhysEps];
+static TInt Events, Resets, Setups;
 static TUint32 SetupLog[6];
 
 // ---- endpoint commands
@@ -82,7 +72,7 @@ static TInt DepCmd(TInt aPhysEp, TUint32 aCmd, TUint32 aP0 = 0, TUint32 aP1 = 0,
 		TUint32 c = R(base + EDepCmd);
 		if (!(c & KCmdAct))
 			{
-			if (aPhysEp < 8 && (aCmd & 0xf) == ECmdStartXfer)
+			if (aPhysEp < KPhysEps && (aCmd & 0xf) == ECmdStartXfer)
 				RscIdx[aPhysEp] = (c >> 16) & 0x7f;
 			return (c >> 12) & 0xf ? KErrGeneral : KErrNone;
 			}
@@ -112,12 +102,13 @@ static TInt Start(TInt aPhysEp, TUint32 aType, TUint32 aBufOff, TInt aLen)
 	t->iSize = aLen;
 	t->iCtrl = aType | ETrbLst | ETrbIoc | ((aPhysEp & 1) ? 0 : ETrbIsp) | ETrbHwo;
 	__e32_memory_barrier();
+	Armed[aPhysEp] = aLen;
 	return DepCmd(aPhysEp, ECmdStartXfer, 0, AreaPhys + EOffTrb + 16 * aPhysEp);
 	}
 
 static void EndXfer(TInt aPhysEp)
 	{
-	if (aPhysEp < 8 && (Trb(aPhysEp)->iCtrl & ETrbHwo))
+	if (aPhysEp < KPhysEps && (Trb(aPhysEp)->iCtrl & ETrbHwo))
 		DepCmd(aPhysEp, ECmdEndXfer | KForceRm | (RscIdx[aPhysEp] << 16));
 	}
 
@@ -127,24 +118,33 @@ static void StartSetup()
 	Start(EPhysEp0Out, ETrbSetup, EOffSetup, 8);
 	}
 
-// ---- descriptors
-static const TUint8 KDevice[] = {
-	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, KEp0Max, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1 };
-static const TUint8 KQualifier[] = { 10, 6, 0x00, 0x02, 0x02, 0x00, 0x00, KEp0Max, 1, 0 };
-static const TUint8 KConfig[] = {
-	9, 2, 67, 0, 2, 1, 0, 0x80, 50,							// configuration: 2 interfaces, bus powered 100 mA
-	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,						// interface 0: CDC communication, ACM, AT commands
-	5, 0x24, 0x00, 0x10, 0x01,								// header 1.10
-	5, 0x24, 0x01, 0x00, 0x01,								// call management: data on interface 1
-	4, 0x24, 0x02, 0x02,									// ACM: line coding + control line state
-	5, 0x24, 0x06, 0x00, 0x01,								// union: 0 controls 1
-	7, 5, 0x82, 0x03, 16, 0, 9,								// EP2 IN interrupt, 16 bytes
-	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,						// interface 1: CDC data
-	7, 5, 0x01, 0x02, 0x00, 0x02, 0,						// EP1 OUT bulk 512
-	7, 5, 0x81, 0x02, 0x00, 0x02, 0,						// EP1 IN bulk 512
-	};
-static const char* const KStrings[] = { NULL, "NeoSymbian", "Symbian Pixel debug", "0001" };
+// ---- the function's side
+TUint8* A64Usb_Buf(TInt aPhysEp) { return (TUint8*)(Area + BufOff[aPhysEp]); }
+TInt A64Usb_Start(TInt aPhysEp, TInt aLen) { return Start(aPhysEp, ETrbNormal, BufOff[aPhysEp], aLen); }
+void A64Usb_EndXfer(TInt aPhysEp) { EndXfer(aPhysEp); }
+TBool A64Usb_Ep0Idle() { return Ep0 == ESetup; }
+TBool A64Usb_Configured() { return Configured; }
 
+void A64Usb_Stats(SA64UsbStats& aStats)
+	{
+	aStats.iEvents = Events;
+	aStats.iResets = Resets;
+	aStats.iSetups = Setups;
+	aStats.iEp0 = Ep0;
+	aStats.iConfigured = Configured;
+	aStats.iDsts = R(EDsts);
+	memcpy(aStats.iSetupLog, SetupLog, sizeof(SetupLog));
+	}
+
+void A64Usb_Trb(TInt aPhysEp, TUint32& aSize, TUint32& aCtrl, TUint32& aRscIdx)
+	{
+	volatile STrb* t = Trb(aPhysEp);
+	aSize = t->iSize;
+	aCtrl = t->iCtrl;
+	aRscIdx = RscIdx[aPhysEp];
+	}
+
+// ---- descriptors
 static TInt StringDesc(TInt aIndex, TUint8* aBuf)
 	{
 	if (aIndex == 0)
@@ -152,10 +152,10 @@ static TInt StringDesc(TInt aIndex, TUint8* aBuf)
 		aBuf[0] = 4; aBuf[1] = 3; aBuf[2] = 0x09; aBuf[3] = 0x04;
 		return 4;
 		}
-	if (aIndex >= (TInt)(sizeof(KStrings) / sizeof(KStrings[0])))
+	if (aIndex >= Fn.iStringCount)
 		return -1;
 	TInt n = 0;
-	for (const char* s = KStrings[aIndex]; *s; ++s, ++n)
+	for (const char* s = Fn.iStrings[aIndex]; *s; ++s, ++n)
 		{
 		aBuf[2 + 2 * n] = (TUint8)*s;
 		aBuf[3 + 2 * n] = 0;
@@ -168,17 +168,15 @@ static TInt StringDesc(TInt aIndex, TUint8* aBuf)
 static void Configure()
 	{
 	DepCmd(EPhysEp0Out, ECmdStartCfg | (2 << 16));		// transfer resources for the other endpoints
-	const struct { TInt iEp; TUint32 iType; TInt iMax; TUint32 iInterval; } eps[] = {
-		{ EPhysBulkOut, 2, KBulkMax, 0 }, { EPhysBulkIn, 2, KBulkMax, 0 }, { EPhysIntrIn, 3, 16, 9 } };
-	for (TUint i = 0; i < sizeof(eps) / sizeof(eps[0]); ++i)
+	for (TInt i = 0; i < Fn.iEndpointCount; ++i)
 		{
-		EpConfig(eps[i].iEp, eps[i].iType, eps[i].iMax, 0, eps[i].iInterval);
-		DepCmd(eps[i].iEp, ECmdSetXferRes, 1);
-		R(EDalepena) |= 1u << eps[i].iEp;
+		const SA64UsbEndpoint& e = Fn.iEndpoints[i];
+		EpConfig(e.iPhysEp, e.iType, e.iMaxPacket, 0, e.iInterval);
+		DepCmd(e.iPhysEp, ECmdSetXferRes, 1);
+		R(EDalepena) |= 1u << e.iPhysEp;
 		}
 	Configured = ETrue;
-	InBusy = EFalse;
-	OutBusy = ArmOut() == KErrNone;
+	Fn.iConfigured();
 	}
 
 // a SETUP packet arrived: answer it (data stage started here), or stall
@@ -197,10 +195,10 @@ static void HandleSetup()
 		case 6:												// GET_DESCRIPTOR
 			switch (value >> 8)
 				{
-			case 1: memcpy(buf, KDevice, sizeof(KDevice)); in = sizeof(KDevice); break;
-			case 2: memcpy(buf, KConfig, sizeof(KConfig)); in = sizeof(KConfig); break;
+			case 1: memcpy(buf, Fn.iDevice, Fn.iDeviceLen); in = Fn.iDeviceLen; break;
+			case 2: memcpy(buf, Fn.iConfig, Fn.iConfigLen); in = Fn.iConfigLen; break;
 			case 3: in = StringDesc(value & 0xff, buf); ok = in >= 0; break;
-			case 6: memcpy(buf, KQualifier, sizeof(KQualifier)); in = sizeof(KQualifier); break;
+			case 6: memcpy(buf, Fn.iQualifier, Fn.iQualifierLen); in = Fn.iQualifierLen; break;
 			default: ok = EFalse; break;
 				}
 			break;
@@ -211,8 +209,13 @@ static void HandleSetup()
 			if (value == 1 && !Configured)
 				Configure();
 			else if (value == 1)							// again: the host restarts every data toggle at DATA0
-				for (TInt ep = EPhysBulkOut; ep <= EPhysIntrIn; ++ep)
+				{
+				TInt last = 0;
+				for (TInt i = 0; i < Fn.iEndpointCount; ++i)
+					last = Max(last, Fn.iEndpoints[i].iPhysEp);
+				for (TInt ep = 2; ep <= last; ++ep)
 					DepCmd(ep, ECmdClearStall);
+				}
 			break;
 		case 8: buf[0] = Configured ? 1 : 0; in = 1; break;	// GET_CONFIGURATION
 		case 0: buf[0] = buf[1] = 0; in = 2; break;			// GET_STATUS
@@ -220,27 +223,21 @@ static void HandleSetup()
 			if ((type & 0x1f) == 2 && value == 0)			// -- resets its data toggle: so must the controller,
 				{											// or both sides drop each other's packets as repeats
 				TInt ep = Setup[4] & 0x0f, phys = 2 * ep + ((Setup[4] & 0x80) ? 1 : 0);
-				if (phys >= 2 && phys < 8)
+				if (phys >= 2 && phys < KPhysEps)
 					DepCmd(phys, ECmdClearStall);
 				}
 			break;
 		case 3: case 11: break;								// SET_FEATURE, SET_INTERFACE: accept
 		default: ok = EFalse; break;
 			}
-	else if ((type & 0x60) == 0x20)						// class (CDC ACM)
-		switch (req)
-			{
-		case 0x20: out = ETrue; break;						// SET_LINE_CODING: 7 bytes follow
-		case 0x21: memcpy(buf, LineCoding, 7); in = 7; break;	// GET_LINE_CODING
-		case 0x22:											// SET_CONTROL_LINE_STATE: bit 0 = DTR (port open)
-			Dtr = value & 1;
-			AbortIn = InBusy;								// a closed port never collects its last piece: abort it
-															// (later: End Transfer stalls during a control transfer)
-			if (Dtr)
-				LogPos = 0;									// a new session sees the whole log
-			break;
-		default: ok = EFalse; break;
-			}
+	else if ((type & 0x60) == 0x20)						// class: the function's
+		{
+		TInt r = Fn.iClassSetup(Setup, buf);
+		ok = r != KA64UsbStall;
+		out = r == KA64UsbDataOut;
+		if (r >= 0)
+			in = r;
+		}
 	else
 		ok = EFalse;
 	if (!ok)
@@ -276,8 +273,7 @@ static void Ep0Event(TInt aPhysEp, TInt aType, TInt aStatus)
 			Ep0 = EWaitStatus3Out;
 		else if (Ep0 == EDataOut)
 			{
-			if (Setup[1] == 0x20)
-				memcpy(LineCoding, (const TAny*)(Area + EOffEp0Buf), 7);
+			Fn.iClassOutData(Setup, (const TUint8*)(Area + EOffEp0Buf));
 			Ep0 = EWaitStatus3In;
 			}
 		else if (Ep0 == EStatus)
@@ -295,7 +291,7 @@ static void Ep0Event(TInt aPhysEp, TInt aType, TInt aStatus)
 	}
 
 // ---- the event buffer
-static void ProcessEvents()
+void A64Usb_ProcessEvents()
 	{
 	TUint32 count = R(EGevntCount) & 0xffff;
 	while (count >= 4)
@@ -310,33 +306,8 @@ static void ProcessEvents()
 			TInt ep = (e >> 1) & 0x1f, type = (e >> 6) & 0xf, status = (e >> 12) & 0xf;
 			if (ep <= 1)
 				Ep0Event(ep, type, status);
-			else if (type == EEvXferComplete && ep == EPhysBulkIn)
-				{
-				InBusy = EFalse;
-				++InDone;
-				}
-			else if (type == EEvXferComplete && ep == EPhysBulkOut)
-				{
-				TInt got = OutArmed - (Trb(EPhysBulkOut)->iSize & 0xffffff);
-				const TUint8* p = (const TUint8*)(Area + EOffOut);
-				if (RawLeft > 0)								// "blk put": raw bytes into the stage, no lines
-					{
-					TInt n = Min(got, RawLeft);					// fits: the stage keeps KRawXfer of slack
-					memcpy(RawStage + RawFill, p, n);
-					RawFill += n;
-					RawLeft -= n;
-					RawFull = RawFill >= KRawStage || RawLeft == 0;	// the poll writes it, then re-arms the endpoint
-					}
-				else
-					for (TInt i = 0; i < got; ++i)
-						{
-						if (p[i] == '\r' || p[i] == '\n')
-							LineReady = LineReady || Line.Length() > 0;
-						else if (!LineReady && Line.Length() < Line.MaxLength())
-							Line.Append(p[i]);
-						}
-				OutBusy = !RawFull && ArmOut() == KErrNone;
-				}
+			else if (type == EEvXferComplete && ep < KPhysEps)
+				Fn.iXferComplete(ep, Armed[ep] - (TInt)(Trb(ep)->iSize & 0xffffff));
 			}
 		else if (((e >> 1) & 0x7f) == 0)					// a device event
 			{
@@ -344,10 +315,12 @@ static void ProcessEvents()
 			if (type == EDevReset)
 				{
 				++Resets;
-				EndXfer(EPhysBulkOut);
-				EndXfer(EPhysBulkIn);
+				for (TInt i = 0; i < Fn.iEndpointCount; ++i)
+					if (Fn.iEndpoints[i].iBufSize)
+						EndXfer(Fn.iEndpoints[i].iPhysEp);
 				R(EDcfg) &= ~(0x7f << 3);
-				Configured = Dtr = InBusy = OutBusy = EFalse;
+				Configured = EFalse;
+				Fn.iBus(EA64UsbReset);
 				}
 			else if (type == EDevConnectDone)
 				{
@@ -355,67 +328,14 @@ static void ProcessEvents()
 				EpConfig(EPhysEp0In, 0, KEp0Max, 2u << 30);
 				}
 			else if (type == EDevDisconnect)
-				Configured = Dtr = EFalse;
+				{
+				Configured = EFalse;
+				Fn.iBus(EA64UsbDisconnect);
+				}
 			}
 		}
 	}
 
-// the monitor's writer: blocks (polling the controller) until each piece is sent, gives up after ~2 s
-static void UsbWrite(const TUint8* aData, TInt aLen)
-	{
-	while (aLen > 0 && Configured && Dtr)
-		{
-		for (TInt i = 0; InBusy && i < 2000; ++i)
-			{
-			ProcessEvents();
-			if (InBusy)
-				NKern::Sleep(1);
-			}
-		if (InBusy)
-			{
-			EndXfer(EPhysBulkIn);
-			InBusy = EFalse;
-			return;											// the reader went away: drop the rest
-			}
-		TInt n = Min(aLen, KInMax);
-		if (n % KBulkMax == 0)
-			--n;											// end each transfer with a short packet
-		memcpy((TAny*)(Area + EOffIn), aData, n);
-		InBusy = Start(EPhysBulkIn, ETrbNormal, EOffIn, n) == KErrNone;
-		++InStarts;
-		InFail += !InBusy;
-		aData += n;
-		aLen -= n;
-		}
-	}
-
-// "blk put" (a64_dbgmon.cpp, telephony C5b): the host's next aBytes are raw data, not command lines. They gather in a
-// 64 KB stage; while it is full the OUT endpoint stays unarmed, so USB holds the host back (no loss) until the
-// monitor has written the stage (A64Mon_PutChunk, called from the poll below).
-
-TInt A64Usb_RawIn(TInt aBytes)
-	{
-	if (!RawStage)
-		{
-		NKern::ThreadEnterCS();
-		RawStage = (TUint8*)Kern::Alloc(KRawStage + KRawXfer);
-		NKern::ThreadLeaveCS();
-		if (!RawStage)
-			return KErrNoMemory;
-		}
-	RawFill = 0;
-	RawFull = EFalse;
-	RawLeft = aBytes;
-	return KErrNone;
-	}
-
-static TInt ArmOut()
-	{
-	OutArmed = RawLeft > 0 ? KRawXfer : KBulkMax;
-	return Start(EPhysBulkOut, ETrbNormal, EOffOut, OutArmed);
-	}
-
-void A64UsbDump();
 static void PollDfcFn(TAny*);
 static TDfc PollDfc(PollDfcFn, NULL, 1);
 static void PollTimerFn(TAny*) { PollDfc.Add(); }
@@ -423,44 +343,8 @@ static NTimer PollTimer(PollTimerFn, NULL);
 
 static void PollDfcFn(TAny*)
 	{
-	ProcessEvents();
-	if (AbortIn && Ep0 == ESetup)
-		{
-		EndXfer(EPhysBulkIn);
-		InBusy = AbortIn = EFalse;
-		}
-	if (RawFull)
-		{
-		TBool last = RawLeft == 0;
-		TInt n = last ? RawFill : RawFill / KSector * KSector;	// whole sectors; the total is too
-		A64Mon_PutChunk(RawStage, n, last, UsbWrite);
-		memmove(RawStage, RawStage + n, RawFill - n);
-		RawFill -= n;
-		RawFull = EFalse;
-		OutBusy = ArmOut() == KErrNone;
-		}
-	else if (LineReady)
-		{
-		TBuf8<160> line(Line);
-		Line.Zero();
-		LineReady = EFalse;
-		++OutLines;
-		A64Mon_Line(line, UsbWrite);
-		}
-	else if (Configured && Dtr && !InBusy)					// stream new log text
-		{
-		TUint8* p = (TUint8*)(Area + EOffIn);
-		TInt n = A64Log_Read(LogPos, p, KInMax - 1);
-		if (n > 0)
-			{
-			InBusy = Start(EPhysBulkIn, ETrbNormal, EOffIn, n) == KErrNone;
-			++InStarts;
-			InFail += !InBusy;
-			}
-		}
-	static TInt ticks;
-	if (++ticks % 3000 == 0 && !Dtr)						// until a host opens the port: status on the screen
-		A64UsbDump();
+	A64Usb_ProcessEvents();
+	Fn.iPoll();
 	PollTimer.OneShot(1);								// not Again(): it refuses (KErrArgument) once a slow poll put its next expiry in the past
 	}
 
@@ -470,22 +354,6 @@ static void Append(TDes8& aBuf, const char* aFmt, ...)
 	VA_START(list, aFmt);
 	Kern::AppendFormat(aBuf, aFmt, list);
 	VA_END(list);
-	}
-
-void A64UsbStatus(TDes8& aBuf)							// the monitor's "usb" command
-	{
-	volatile STrb* t = Trb(EPhysBulkIn);
-	Append(aBuf, "ev %d rst %d setups %d ep0 %d cfg %d dtr %d in %d/%d/%d busy %d abort %d lines %d logpos %d "
-		"trb3 %08x %08x rsc3 %d", Events, Resets, Setups, Ep0, Configured, Dtr, InStarts, InDone, InFail, InBusy,
-		AbortIn, OutLines, LogPos, t->iSize, t->iCtrl, RscIdx[EPhysBulkIn]);
-	}
-
-void A64UsbDump()
-	{
-	Kern::Printf("[usb] ev %d rst %d setups %d ep0 %d cfg %d dtr %d in %d/%d/%d busy %d abort %d lines %d dsts %08x",
-		Events, Resets, Setups, Ep0, Configured, Dtr, InStarts, InDone, InFail, InBusy, AbortIn, OutLines, R(EDsts));
-	Kern::Printf("[usb] setups %08x %08x %08x %08x %08x %08x (type req value index; newest = #%d)", SetupLog[0],
-		SetupLog[1], SetupLog[2], SetupLog[3], SetupLog[4], SetupLog[5], (Setups + 5) % 6);
 	}
 
 static TDynamicDfcQue* UsbQ;
@@ -553,10 +421,11 @@ void A64UsbCold(TDes8& aOut, TInt aMask)
 	if (r != KErrNone)
 		return;
 	Ep0 = ESetup;
-	Configured = Dtr = InBusy = OutBusy = AbortIn = EFalse;
+	Configured = EFalse;
+	Fn.iBus(EA64UsbRestart);
 	memclr((TAny*)Area, KAreaSize);
 	Bringup();
-	A64UsbDump();
+	Fn.iDump();
 	}
 
 void A64StartUsbConsole()
@@ -586,6 +455,18 @@ void A64StartUsbConsole()
 		R(EDcfg), R(EGctl));
 	if ((id >> 16) != 0x5533)
 		return;
+	TInt off = EOffEpBufs;									// the function's endpoint buffers
+	for (TInt i = 0; i < Fn.iEndpointCount; ++i)
+		{
+		const SA64UsbEndpoint& e = Fn.iEndpoints[i];
+		if (e.iPhysEp < 2 || e.iPhysEp >= KPhysEps || off + e.iBufSize > KAreaSize)
+			{
+			Kern::Printf("[usb] function endpoint %d (phys %d, buffer %d) doesn't fit", i, e.iPhysEp, e.iBufSize);
+			return;
+			}
+		BufOff[e.iPhysEp] = off;
+		off += e.iBufSize;
+		}
 	NKern::ThreadEnterCS();
 	TInt r = Epoc::AllocPhysicalRam(KAreaSize, AreaPhys, 12);
 	DPlatChunkHw* chunk = NULL;
@@ -604,7 +485,7 @@ void A64StartUsbConsole()
 	memclr((TAny*)Area, KAreaSize);
 
 	Bringup();
-	A64UsbDump();
+	Fn.iDump();
 
 	PollDfc.SetDfcQ(UsbQ);
 	PollTimer.OneShot(1);

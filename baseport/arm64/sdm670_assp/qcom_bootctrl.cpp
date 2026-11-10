@@ -17,6 +17,7 @@
 // sectors only), each copy read back and its CRCs checked before the next is touched.
 #include <kernel/kern_priv.h>
 #include "a64_blk.h"
+#include "a64_device.h"
 
 const TInt KHdrLba = 1, KMaxEntryBytes = 128 * 128;
 const TUint8 KActive = 1 << 2, KOk = 1 << 6, KUnbootable = 1 << 7;
@@ -301,3 +302,12 @@ TInt A64Slot_MarkOk(TBool aDryRun, TDes8& aOut)
 	PrintLong(aOut);
 	return r;
 	}
+
+static TA64DevState SlotStatus(TDes8& aDetail)
+	{
+	TBuf8<400> b;
+	A64Slot_Show(b);
+	aDetail.Append(b.Left(aDetail.MaxLength() - aDetail.Length()));
+	return Current ? EA64DevOk : EA64DevError;
+	}
+A64_DEVICE("slot", "A/B boot slots", "qcom_bootctrl", SlotStatus);

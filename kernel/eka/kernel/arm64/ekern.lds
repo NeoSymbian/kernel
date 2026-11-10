@@ -69,6 +69,10 @@ SECTIONS
 		KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
 		KEEP(*(.init_array))
 		__init_array_end = .;
+		. = ALIGN(8);
+		__a64dev_start = .;			/* NeoSymbian: the device status registry (baseport a64_device.h) */
+		KEEP(*(.a64dev))
+		__a64dev_end = .;
 		. = ALIGN(0x1000);
 		} >ROMV
 	__code_end = .;

@@ -17,6 +17,7 @@
 #include "a64_blk.h"
 #include "qcom_rpmh.h"
 #include <kernel/cache.h>
+#include "a64_device.h"
 
 const TUint32 KHc = 0x007c4000, KCqhci = 0x007c5000;
 enum
@@ -93,6 +94,7 @@ public:
 
 static TUint32 Rca;
 static TUint64 Sectors;
+static TInt InitResult = KErrNotReady;						// DoInit's last result (the device registry)
 // data moves by ADMA2 through a bounce buffer. This host has no SDMA (CAPS bit 22 is 0: an SDMA transfer leaves the
 // block in the FIFO and the stuck master resets the SoC) and its PIO data port never drains (both found on the
 // phone); Linux sdhci.c picks ADMA2 here too. The SDHC's SMMU stream (0x140) is set up as pass-through (CB0, M = 0).
@@ -541,13 +543,13 @@ TInt A64BlkDev_Init(TUint64& aSectors)
 	{
 	if (!KBootDrive)
 		return KErrNotSupported;
-	return DoInit(aSectors);
+	return InitResult = DoInit(aSectors);
 	}
 
 TInt A64BlkDev_Probe()
 	{
 	TUint64 sectors = 0, first = 0, count = 0;
-	TInt r = DoInit(sectors);
+	TInt r = InitResult = DoInit(sectors);
 	if (r == KErrNone)
 		r = A64BlkBoard_Window(sectors, first, count);
 	return r;
@@ -890,3 +892,21 @@ TInt A64BlkDev_Discard(TUint64 aLba, TInt aCount)
 		}
 	return KErrNone;
 	}
+
+static TA64DevState EmmcStatus(TDes8& aDetail)
+	{
+	if (InitResult == KErrNotReady)
+		{
+		A64Device_Format(aDetail, KBootDrive ? "not started yet" : "not used by this build (EMMC_C=1 puts C: and E: on it)");
+		return KBootDrive ? EA64DevStarting : EA64DevOff;
+		}
+	if (InitResult != KErrNone)
+		{
+		A64Device_Format(aDetail, "init failed: %d", InitResult);
+		return EA64DevError;
+		}
+	A64Device_Format(aDetail, "%d MB, %s, polled ADMA2; %d trims, %d trim errors", (TInt)(Sectors >> 11),
+		KModeName[CurMode], Trims, TrimErrors);
+	return CurMode == KMaxMode ? EA64DevOk : EA64DevPartial;
+	}
+A64_DEVICE("emmc", "Storage (eMMC)", "qcom_sdhci", EmmcStatus);

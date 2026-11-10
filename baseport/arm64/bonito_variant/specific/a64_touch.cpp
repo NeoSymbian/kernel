@@ -11,6 +11,7 @@
 #include "board.h"
 #include "qcom_spmi.h"
 #include "qcom_geni_i2c.h"
+#include "a64_device.h"
 
 static volatile TUint32& Reg(TUint32 aPhys) { return *(volatile TUint32*)A64_Io(aPhys); }
 
@@ -292,6 +293,7 @@ static void PollTimerFn(TAny*) { PollDfc.Add(); }
 static NTimer PollTimer(PollTimerFn, NULL);
 static TBool Down;
 static TInt LastX, LastY, Quiet, Errors, AttnSeen;
+static TBool Polling, BringUpDone;						// the device registry: running, or stopped where CurStep says
 
 static void Post(TRawEvent::TType aType, TInt aX, TInt aY)
 	{
@@ -364,6 +366,7 @@ static void PollDfcFn(TAny*)
 
 static void BringUpDfcFn(TAny*)
 	{
+	struct SDone { ~SDone() { BringUpDone = ETrue; } } done;	// every return below
 	NKern::ThreadEnterCS();
 	Step("pins");
 	Io(KNorth, 99) = 0;									// hold the controller in reset while its supply comes up
@@ -438,6 +441,7 @@ static void BringUpDfcFn(TAny*)
 		}
 	PollDfc.SetDfcQ(TouchQ);
 	PollTimer.OneShot(NKern::TimerTicks(KPollMs));
+	Polling = ETrue;
 	Step("polling");
 	NKern::ThreadLeaveCS();
 	}
@@ -456,3 +460,16 @@ void A64StartTouch()
 	BringUpDfc.SetDfcQ(TouchQ);
 	BringUpDfc.Enque();
 	}
+
+static TA64DevState TouchStatus(TDes8& aDetail)
+	{
+	if (Polling)
+		{
+		A64Device_Format(aDetail, "%dx%d, one finger, polled %d ms; %d presses+releases, %d errors, %d dropped", MaxX, MaxY,
+			KPollMs, Logged, Errors, Dropped);
+		return EA64DevOk;
+		}
+	A64Device_Format(aDetail, BringUpDone ? "stopped at: %s" : "step: %s", CurStep);
+	return BringUpDone || !TouchQ ? EA64DevError : EA64DevStarting;
+	}
+A64_DEVICE("touch", "Touchscreen (Synaptics RMI4)", "a64_touch", TouchStatus);

@@ -8,6 +8,7 @@
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_blk.h"
+#include "a64_device.h"
 
 const TUint32 KMmioBase = 0x0a000000, KMmioStride = 0x200, KMmioSlots = 32;
 enum
@@ -35,6 +36,7 @@ static TPhysAddr AreaPhys;
 static TLinAddr Area;
 static volatile TUint32* Dev;
 static TUint16 LastUsed;
+static TUint64 Capacity;								// sectors, once set up (the device registry)
 
 static volatile TUint32& R(TUint32 aOff) { return Dev[aOff / 4]; }
 static SDesc* Descs() { return (SDesc*)Area; }
@@ -79,7 +81,7 @@ TInt A64BlkDev_Init(TUint64& aSectors)
 	R(EQueueAlign) = 4096;
 	R(EQueuePfn) = AreaPhys >> 12;
 	R(EStatus) = EStAck | EStDriver | EStDriverOk;
-	aSectors = (TUint64)R(EConfig) | ((TUint64)R(EConfig + 4) << 32);	// capacity in 512-byte sectors
+	aSectors = Capacity = (TUint64)R(EConfig) | ((TUint64)R(EConfig + 4) << 32);	// capacity in 512-byte sectors
 	return KErrNone;
 	}
 
@@ -140,3 +142,14 @@ TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
 		}
 	return KErrNone;
 	}
+
+static TA64DevState VirtioBlkStatus(TDes8& aDetail)
+	{
+	if (!Dev)
+		return EA64DevAbsent;
+	if (!Capacity)
+		return EA64DevError;
+	A64Device_Format(aDetail, "virtio-mmio, %d MB", (TInt)(Capacity >> 11));
+	return EA64DevOk;
+	}
+A64_DEVICE("blk", "Storage (virtio-blk)", "virtio_blk", VirtioBlkStatus);

@@ -13,6 +13,7 @@
 // comes with H3.
 #include <kernel/kern_priv.h>
 #include "board.h"
+#include "a64_device.h"
 
 enum { EEnable = 0x0, ELut = 0x110, ERow = 32, EPerfState = 0x920, EMaxRows = 40 };
 const TInt KBoostMs = 3000;
@@ -127,3 +128,24 @@ void A64StartCpufreq()
 		}
 	Ready = ETrue;
 	}
+
+static TA64DevState CpufreqStatus(TDes8& aDetail)
+	{
+	if (!Ready)
+		return EA64DevStarting;
+	TInt on = 0;
+	for (TInt i = 0; i < KDomains; ++i)
+		{
+		const SDomain& d = Domains[i];
+		if (d.iTop < 0)
+			continue;
+		++on;
+		TInt now = (TInt)Reg(d.iBase + EPerfState);
+		A64Device_Format(aDetail, "%s%s %d/%d MHz", on > 1 ? ", " : "", d.iName, StepMHz(d, now), d.iTopMHz);
+		}
+	if (Boosted)
+		A64Device_Format(aDetail, ", boosted");
+	A64Device_Format(aDetail, "; touch boost, no governor");
+	return on ? EA64DevPartial : EA64DevOff;
+	}
+A64_DEVICE("cpufreq", "CPU clocks (OSM)", "qcom_cpufreq", CpufreqStatus);

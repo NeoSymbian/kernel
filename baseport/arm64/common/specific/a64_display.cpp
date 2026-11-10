@@ -15,6 +15,7 @@
 #include <videodriver.h>
 #include <mmboot.h>
 #include "board.h"
+#include "a64_device.h"
 
 static DPlatChunkHw* TheFbChunk;
 static TPhysAddr TheFbPhys;
@@ -134,3 +135,14 @@ void A64StartDisplay()
 		A64_FbWidth, A64_FbHeight, TheFbPhys, size, TheFbChunk->LinearAddress(), r);
 	A64_ConsoleReserveTop(A64_FbHeight);
 	}
+
+static TA64DevState DisplayStatus(TDes8& aDetail)
+	{
+	if (!TheFbChunk)
+		return EA64DevError;
+	A64Device_Format(aDetail, "%dx%d 32 bpp, %s framebuffer", A64_FbWidth, A64_FbHeight, A64_FbPhys ? "the bootloader's" : "a RAM");
+	if (!TheDisplayState)
+		A64Device_Format(aDetail, ", off");
+	return TheDisplayState ? EA64DevOk : EA64DevOff;
+	}
+A64_DEVICE("display", "Display", "a64_display", DisplayStatus);

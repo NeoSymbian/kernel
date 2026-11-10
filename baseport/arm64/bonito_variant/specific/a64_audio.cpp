@@ -19,6 +19,7 @@
 #include "qcom_rpmh.h"
 #include "qcom_geni_i2c.h"
 #include "qcom_telhal.h"
+#include "a64_device.h"
 
 static volatile TUint32& Reg(TUint32 aPhys) { return *(volatile TUint32*)A64_Io(aPhys); }
 
@@ -458,3 +459,21 @@ void A64Audio_Report(void (*aSay)(const char*, ...))
 	aSay("audio: top PWR_CTRL2 %08x PWR_CTRL3 %08x INT1 %08x; mic DOWNFILTER0 %08x", v[0], v[1], v[2], v[3]);
 	aSay("audio: bottom PWR_CTRL2 %08x INT1 %08x RX slot %x", b[0], b[1], b[2]);
 	}
+
+static TA64DevState AudioStatus(TDes8& aDetail)
+	{
+	if (!Probed)
+		{
+		A64Device_Format(aDetail, "not probed yet (the first call or audio test does)");
+		return EA64DevOff;
+		}
+	if (ProbeErr != KErrNone)
+		{
+		A64Device_Format(aDetail, "probe failed: %d; I2C faults %d", ProbeErr, Faults);
+		return EA64DevError;
+		}
+	A64Device_Format(aDetail, "2x CS35L36 amps, RT5514 mic; %s, %s, volume %d%s; I2C faults %d", Running ? "on" : "off",
+		Route == ESpeaker ? "loudspeaker" : "earpiece", Volume, MicMuted ? ", mic muted" : "", Faults);
+	return Faults ? EA64DevPartial : EA64DevOk;
+	}
+A64_DEVICE("audio", "Audio amps and mic", "a64_audio", AudioStatus);

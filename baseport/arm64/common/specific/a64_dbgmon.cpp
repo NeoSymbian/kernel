@@ -4,7 +4,7 @@
 // 64 KB ring (A64Log_Putc, from DebugOutputChar), so a transport that connects late can still replay the whole boot
 // log. Commands come as text lines from a transport -- the PL011 on QEMU (Ctrl-B, then a line), USB CDC-ACM on the
 // Pixel -- and answer through that transport's blocking writer:
-//   help | log | lastlog | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
+//   help | log | lastlog | drivers (the device registry, a64_device.h) | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel) | scm | smem | fw ls|sha | smp2p | qmp | mss | glink (telephony, Pixel: qcom_telmon.cpp)
 //   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> (vendor_a/_b, EMMC_C=2) | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
 //   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | rtc | date <unix UTC s> [UTC offset s]
@@ -18,6 +18,7 @@
 #include "board.h"
 #include "a64_blk.h"
 #include "a64_dbgmon.h"
+#include "a64_device.h"
 #include "a64_platform.h"
 
 // ---- the log ring
@@ -543,7 +544,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt rtc date");
+		Say("help log lastlog console drivers peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt rtc date");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -625,6 +626,13 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 			A64Slot_Show(b);
 		b.Append('\n');
 		Write(b.Ptr(), b.Length());
+		}
+	else if (Eq(c, "drivers"))							// the device registry (a64_devices.cpp), as HAL 0x4e19 lists it
+		{
+		TBuf8<200> b;
+		for (TInt i = 0; A64Device_Line(i, b) == KErrNone; ++i)
+			Say("%S", &b);
+		Say("%d devices", A64Device_Count());
 		}
 	else if (Eq(c, "touch"))
 		A64TouchDump();

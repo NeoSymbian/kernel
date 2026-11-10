@@ -67,6 +67,7 @@ $AS -march=armv8.2-a+sha2 "$BSP/common/specific/a64_sha256.S" -o "$I/a64_sha256.
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_blk.cpp" -o "$I/a64_blk.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$BSP/common/specific/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_display.cpp" -o "$I/a64_display.o"
+$EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_devices.cpp" -o "$I/a64_devices.o"	# HAL 0x4e19
 $EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
 	-c "$BSP/common/specific/a64_dbgmon.cpp" -o "$I/a64_dbgmon.o"	# the debug monitor; its thread dump reads scheduler internals
 # the board's own kernel extensions and drivers (its variant.conf: variant_drivers)

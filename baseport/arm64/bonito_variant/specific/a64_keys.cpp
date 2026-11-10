@@ -10,6 +10,7 @@
 #include <e32keys.h>
 #include "board.h"
 #include "qcom_spmi.h"
+#include "a64_device.h"
 
 struct SKey { const char* iName; TInt iScanCode; TUint8 iSid; TUint16 iAddr; TUint8 iBit; TBool iActiveLow; };
 static const SKey Keys[] = {
@@ -21,6 +22,7 @@ const TInt KKeys = sizeof(Keys) / sizeof(Keys[0]);
 const TInt KPollMs = 20;
 
 static TBool Down[KKeys];
+static TInt SpmiVersion = KErrNotReady;					// < 0: the SPMI bus did not come up
 static void PollDfcFn(TAny*);
 static TDfc PollDfc(PollDfcFn, NULL, 1);
 static void PollTimerFn(TAny*) { PollDfc.Add(); }
@@ -66,6 +68,7 @@ static void PollDfcFn(TAny*)
 void A64StartKeys()
 	{
 	TInt ver = Spmi_Init();
+	SpmiVersion = ver;
 	Kern::Printf("[spmi] arbiter version %08x; apid PON %d, PM660L GPIO7 %d, PM660 GPIO12 %d", ver,
 		Spmi_Apid(0, 0x08), Spmi_Apid(2, 0xc6), Spmi_Apid(0, 0xcb));
 	if (ver < 0)
@@ -77,3 +80,21 @@ void A64StartKeys()
 	PollDfc.SetDfcQ(Kern::DfcQue0());					// a static TDfc was constructed before the queue existed
 	PollTimer.OneShot(NKern::TimerTicks(KPollMs));
 	}
+
+static TA64DevState KeysStatus(TDes8& aDetail)
+	{
+	if (SpmiVersion < 0)
+		{
+		A64Device_Format(aDetail, "SPMI bus: %d", SpmiVersion);
+		return EA64DevError;
+		}
+	A64Device_Format(aDetail, "Power, VolDown, VolUp, polled %d ms; held:", KPollMs);
+	TBool any = EFalse;
+	for (TInt i = 0; i < KKeys; ++i)
+		if (Down[i])
+			A64Device_Format(aDetail, " %s", Keys[i].iName), any = ETrue;
+	if (!any)
+		A64Device_Format(aDetail, " none");
+	return EA64DevOk;
+	}
+A64_DEVICE("keys", "Buttons (PM660 PON, GPIO)", "a64_keys", KeysStatus);

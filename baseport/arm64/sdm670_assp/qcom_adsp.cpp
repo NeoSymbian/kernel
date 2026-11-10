@@ -18,6 +18,7 @@
 #include "qcom_glink.h"
 #include "qcom_telhal.h"
 #include "qcom_adsp.h"
+#include "a64_device.h"
 
 const TUint32 KAdspPhys = 0x95800000, KAdspSize = 0x02200000;
 const TUint32 KCrashReason = 423;							// SMEM_SSR_REASON_LPASS0
@@ -134,3 +135,17 @@ void Adsp_Report(void (*aSay)(const char*, ...))
 		Smp2p_In(KSmemHostAdsp, "slave-kernel", v);
 	aSay("adsp: step %d error %d slave-kernel %08x", Step, Error, v);
 	}
+
+static TA64DevState AdspStatus(TDes8& aDetail)
+	{
+	static const char* const KSteps[] = { "not started (MODEMD loads it)", "loading", "authenticated", "ready, GLINK up",
+		"running" };
+	A64Device_Format(aDetail, "%s", KSteps[Step >= 0 && Step <= 4 ? Step : 0]);
+	if (Error)
+		{
+		A64Device_Format(aDetail, "; failed: %d", Error);
+		return EA64DevError;
+		}
+	return Step == 0 ? EA64DevOff : Step == 4 ? EA64DevOk : EA64DevStarting;
+	}
+A64_DEVICE("adsp", "Audio DSP (ADSP)", "qcom_adsp", AdspStatus);

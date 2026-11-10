@@ -101,6 +101,10 @@ A second board on an existing SoC (the Pixel 3a "sargo" on SDM670) copies the So
    NeoSymbian `EHalGroupVariant` function (or an LDD once it needs asynchronous notification). User-side logic goes in
    Rust (NeoSymbian/e32-rs, neoui, telephony).
 7. **For debugging,** add a monitor command in `a64_dbgmon.cpp` with a weak stub.
+8. **For status,** describe the part with one `A64_DEVICE(tag, name, driver, statusFn)` at the end of the driver file
+   (`common/inc/a64_device.h`): the status function returns the state (absent, off, starting, ok, partial, error) and
+   appends one detail line. HAL `ENeoHalDeviceList` (0x4e19) and the monitor's `drivers` command list every entry, and
+   neoui's Dev tools shows them on its Devices page. A driver that is not linked has no entry.
 
 ## Known debts and planned layout
 
@@ -111,7 +115,7 @@ them; this list is **not done yet**.
 | Debt | Where | Fix |
 |---|---|---|
 | Every boot-time driver edits `common/`: one weak `A64Start*` per driver and a fixed call list | `a64_variant.cpp` (`A64ExtensionEntry`) | Registry: `A64_DRIVER(name, startFn, order)` in a `.a64drv` linker section (`ekern.lds`, `__start_`/`__stop_`), run in `order` |
-| The monitor knows every driver: about 20 weak stubs and an `if` chain; `a64_dbgmon.h` declares the Qualcomm `A64Tel_Monitor` | `a64_dbgmon.cpp`, `common/inc/a64_dbgmon.h` | Registry: `A64_MONCMD("name", fn, "help")` in `.a64mon`; `help` and a new `drivers` command list them |
+| The monitor knows every driver: about 20 weak stubs and an `if` chain; `a64_dbgmon.h` declares the Qualcomm `A64Tel_Monitor` | `a64_dbgmon.cpp`, `common/inc/a64_dbgmon.h` | Registry: `A64_MONCMD("name", fn, "help")` in `.a64mon`; `help` lists them. (The `drivers` command and the status half of the driver registry exist: `A64_DEVICE` in `.a64dev`, `a64_devices.cpp`.) |
 | A dropped `ekc` line fails silently into the weak default | `variant.conf`, weak stubs | The two registries, plus a `drivers` check in the gates |
 | Start order is implicit: the keys driver starts SPMI, and RTC, reboot and touch depend on it | `a64_keys.cpp` (`A64StartKeys` → `Spmi_Init`) | Explicit orders: buses 10, cpufreq 20, display 30, input 40, reboot/USB 50, media 60 |
 | The SoC's driver list sits in the board's `variant.conf` | `bonito_variant/variant.conf` | `<soc>_assp/assp.conf` with `assp_drivers()`, called before `variant_drivers()` |

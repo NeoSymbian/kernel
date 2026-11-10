@@ -13,6 +13,7 @@
 #include "board.h"
 #include "a64_dbgmon.h"
 #include "a64_blk.h"
+#include "a64_device.h"
 #include "a64_platform.h"
 
 const TInt KTickUs = 1000;			// system tick period: 1 ms, as every EKA2 port
@@ -58,12 +59,15 @@ public:
 //   ENeoHalSlotInfo    a1 = TDes8* -> one line: the booted A/B slot and both slots' state (ReadDeviceData)
 //   ENeoHalBuildInfo   a1 = TDes8* -> this kernel's build: "kernel <commit>[+dirty] <UTC time> <board>" (no capability)
 enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalBootOk = 0x4e06,
-	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c };
+	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c, ENeoHalDeviceList = 0x4e19 };
 //   ENeoHalPower       a1 = 0 restart, 1 restart to fastboot, 2 power off (PowerMgmt). Returns only on a failure; the
 //                      caller finalises the drives first (neoui's Power menu)
 //   ENeoHalRtcRead     a1 = TUint32* -> the PMIC RTC's raw seconds; KErrNotSupported without one (QEMU)
-//   0x4e0d..0x4e12     the modem (telephony C4): boot, state, QRTR send/receive, EFS partition reads, the rmtfs
-//                      carve-out; CommDD. qcom_telhal.cpp on the Pixel, KErrNotSupported elsewhere
+//   0x4e0d..0x4e18     the modem and the ADSP (telephony C4-C6): boot, state, QRTR send/receive, EFS partition reads,
+//                      the rmtfs carve-out, IPA, ADSP channels, audio; CommDD. qcom_telhal.cpp on the Pixel,
+//                      KErrNotSupported elsewhere
+//   ENeoHalDeviceList  a1 = TUint32* cursor (in/out; 0 = the first), a2 = TDes8* (1024 bytes) -> the device registry
+//                      as lines "tag\tstate\tname\tdriver\tdetail\n", none past the end (a64_devices.cpp; ReadDeviceData)
 void A64_RebootNormal();									// a64_reboot.cpp (weak QEMU defaults: a64_dbgmon.cpp)
 void A64_RebootToFastboot();
 TInt A64_PowerOff();
@@ -153,6 +157,8 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 	case 0x4e0d: case 0x4e0e: case 0x4e0f: case 0x4e10: case 0x4e11: case 0x4e12: case 0x4e13:
 	case 0x4e14: case 0x4e15: case 0x4e16: case 0x4e17: case 0x4e18:
 		return A64Tel_Hal(aFunction, a1, a2);
+	case ENeoHalDeviceList:
+		return A64Device_Hal(a1, a2);
 	case ENeoHalConsoleGet:
 		{
 		TInt on = A64_ConsoleShown();

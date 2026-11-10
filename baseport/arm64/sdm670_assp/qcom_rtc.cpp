@@ -6,6 +6,7 @@
 // side keeps "real time - RTC" (neoui's clock.dat) and reads the raw count through HAL ENeoHalRtcRead.
 #include <kernel/kern_priv.h>
 #include "qcom_spmi.h"
+#include "a64_device.h"
 
 const TUint32 KRtcCtrl = 0x6046, KRtcRead = 0x6048, KRtcEnabled = 0x80;
 
@@ -38,3 +39,22 @@ TInt A64_RtcSeconds(TUint32& aSecs)
 		}
 	return KErrTimedOut;
 	}
+
+static TA64DevState RtcStatus(TDes8& aDetail)
+	{
+	TUint32 secs = 0;
+	TInt r = A64_RtcSeconds(secs);
+	if (r == KErrNotReady)
+		{
+		A64Device_Format(aDetail, "not enabled");
+		return EA64DevOff;
+		}
+	if (r != KErrNone)
+		{
+		A64Device_Format(aDetail, "read failed: %d", r);
+		return EA64DevError;
+		}
+	A64Device_Format(aDetail, "read only, %u s", secs);
+	return EA64DevOk;
+	}
+A64_DEVICE("rtc", "Real-time clock (PM660)", "qcom_rtc", RtcStatus);

@@ -12,6 +12,7 @@
 #include "board.h"
 #include "a64_platform.h"
 #include "a64_dbgmon.h"
+#include "a64_device.h"
 
 const TUint32 KUartPhys = 0x09000000;					// PL011 (qemu_virt.cpp's console)
 const TUint32 KUartIntId = 33;							// SPI 1
@@ -38,6 +39,7 @@ static void UartIsr(TAny*)
 	}
 
 static TBool MonMode;
+static TInt BindResult = KErrNotReady;
 static TBuf8<128> MonLine;
 static void SerialWrite(const TUint8* aData, TInt aLen)
 	{
@@ -82,6 +84,20 @@ void A64StartSerialKeyboard()
 	{
 	RxDfc.SetDfcQ(Kern::DfcQue0());						// a static TDfc was constructed before the queue existed
 	*Uart(EUartIMSC) |= KIntRx | KIntRxTimeout;
-	TInt r = A64_BindSpi(KUartIntId, UartIsr, NULL);
+	TInt r = BindResult = A64_BindSpi(KUartIntId, UartIsr, NULL);
 	Kern::Printf("[kbd] serial keyboard on the PL011 (INTID %d) -> %d", KUartIntId, r);
 	}
+
+static TA64DevState SerialKbdStatus(TDes8& aDetail)
+	{
+	if (BindResult == KErrNotReady)
+		return EA64DevStarting;
+	if (BindResult < 0)
+		{
+		A64Device_Format(aDetail, "interrupt: %d", BindResult);
+		return EA64DevError;
+		}
+	A64Device_Format(aDetail, "keys typed on the PL011 serial line; Ctrl-B for the monitor");
+	return EA64DevOk;
+	}
+A64_DEVICE("kbd", "Keyboard (serial line)", "a64_serialkbd", SerialKbdStatus);

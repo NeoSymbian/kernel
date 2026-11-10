@@ -22,6 +22,7 @@
 #include "qcom_smmu.h"
 #include "qcom_smp2p.h"
 #include "qcom_ipa.h"
+#include "a64_device.h"
 
 const TUint32 KIpa = 0x01e40000, KShared = 0x01e47000, KGsi = 0x01e04000;
 const TUint32 KIpaFwPhys = 0x97a00000, KIpaFwSize = 0x10000;	// DTB ipa-fw carve-out
@@ -562,3 +563,20 @@ void Ipa_Report(void (*aSay)(const char*, ...))
 	if (Smmu_Fault(fsr, far, fsynr) == KErrNone)
 		aSay("ipa: smmu fsr %08x far %08x fsynr %08x", fsr, (TUint32)far, fsynr);
 	}
+
+static TA64DevState IpaStatus(TDes8& aDetail)
+	{
+	if (Ready)
+		{
+		A64Device_Format(aDetail, "running, no data endpoints yet; LAN_RX events %d, clock queries %d", LanEvents, Queries);
+		return EA64DevPartial;
+		}
+	if (!Step)
+		{
+		A64Device_Format(aDetail, "not started (MODEMD starts it)");
+		return EA64DevOff;
+		}
+	A64Device_Format(aDetail, "stopped at step %d of 12", Step);	// Ipa_Start runs inside one HAL call
+	return EA64DevError;
+	}
+A64_DEVICE("ipa", "Packet engine (IPA)", "qcom_ipa", IpaStatus);

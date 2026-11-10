@@ -9,6 +9,7 @@
 #      build-userrom.sh) | 0 (kernel only: boot/a32test.S is the secondary),
 #      DTB = the board's device tree blob where its boot image needs one (bonito: the phone's own, also taken
 #      from BONITO_DTB; never commit it). The board's own options are in its variant.conf.
+#      TEL_DIAGNOSTICS=1 enables synthetic detection commands in the existing modem monitor (default off).
 set -eu
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/tools/paths.sh"
@@ -30,6 +31,7 @@ CFLAGS="$ARCH -ffreestanding -fno-pic -fno-stack-protector -nostdinc -mgeneral-r
 EKXX="${X}g++-14 $CFLAGS -std=gnu++03 -fno-lifetime-dse -fno-strict-aliasing -fno-delete-null-pointer-checks -fpermissive -w"
 DEFS="-D__GCC32__ -D__EPOC32__ -D__SYMBIAN32__ -D__KERNEL_MODE__ -D__IN_KERNEL__ -D_UNICODE -D__SMP__ \
       -D__MEMMODEL_FLEXIBLE__ -DMM_FLEXIBLE -D__CPU_ARMV7"
+[ "${TEL_DIAGNOSTICS:-0}" != 1 ] || DEFS="$DEFS -DTEL_DIAGNOSTICS=1"
 C=$OUT/census
 FLX=$EKA/memmodel/epoc/flexible
 INCS="$INC64 \

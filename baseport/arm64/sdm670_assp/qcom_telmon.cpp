@@ -171,6 +171,16 @@ __attribute__((weak)) void A64Audio_Report(void (*aSay)(const char*, ...)) { aSa
 
 void A64Tel_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 	{
+	if (aArgc == 2 && Eq(aArg[1], "fault") && (Eq(aArg[0], "mss") || Eq(aArg[0], "adsp")))
+		{
+#if defined(TEL_DIAGNOSTICS) && TEL_DIAGNOSTICS
+		A64Mon_Say("%S synthetic detection -> %d (real stop/reload remains owned by MODEMD)", &aArg[0],
+			Tel_DiagnosticFault(Eq(aArg[0], "mss") ? 1 : 2));
+#else
+		A64Mon_Say("%S fault -> %d (diagnostic detection disabled in this image)", &aArg[0], KErrNotSupported);
+#endif
+		return;
+		}
 	if (Eq(aArg[0], "adsp"))
 		Adsp_Report(A64Mon_Say);
 	else if (Eq(aArg[0], "audio"))

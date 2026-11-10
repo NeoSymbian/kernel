@@ -33,6 +33,8 @@ static TUint8* Fw;
 static TUint32 FwLen, FwMdtLen;
 static TInt Step;											// how far Ipa_Start got (the monitor's "ipa")
 static TUint32 LanEvents, Queries;
+// Written only by the IPA poll DFC; reset increments SMP2P's generation, without restarting healthy IPA.
+static TUint32 ClockReplyGeneration = ~0u;
 
 static volatile TUint32& R(TUint32 aOff) { return *(volatile TUint32*)A64_Io(KIpa + aOff); }
 static volatile TUint32& S(TUint32 aOff) { return *(volatile TUint32*)A64_Io(KShared + aOff); }
@@ -407,15 +409,24 @@ static void PollFn(TAny*)
 		Dsb();
 		G(EChDoorbell + 8 * KLanCh) = RingAddr(LanRing, LanRing.iNext);
 		}
-	TUint32 in = 0;
-	if (Smp2p_In(KSmemHostModem, "ipa", in) == KErrNone && (in & 1) && !Queries++)
+	TUint32 generation = Smp2p_Generation(KSmemHostModem), in = 0;
+	if (generation != ClockReplyGeneration && Smp2p_In(KSmemHostModem, "ipa", in) == KErrNone && (in & 1))
 		{
-		Smp2p_Set(KSmemHostModem, "ipa", 2, 2);					// clock enabled, then valid (Linux's order)
-		Smp2p_Set(KSmemHostModem, "ipa", 1, 1);
-		Kern::Printf("[ipa] the modem asked for the IPA clock: answered on");
+		// Enabled before valid, as Linux. Every write checks generation under SMP2P's state lock.
+		// A reset between either write and this DFC's acknowledgement leaves the new generation pending.
+		TInt r = Smp2p_Set(KSmemHostModem, "ipa", 2, 2, generation);
+		if (r == KErrNone)
+			r = Smp2p_Set(KSmemHostModem, "ipa", 1, 1, generation);
+		if (r == KErrNone)
+			{
+			ClockReplyGeneration = generation;
+			++Queries;
+			Kern::Printf("[ipa] the modem asked for the IPA clock: answered on (generation %d)", generation);
+			}
 		}
 	PollTimer.OneShot(NKern::TimerTicks(1));
 	}
+
 
 TInt Ipa_Start()
 	{

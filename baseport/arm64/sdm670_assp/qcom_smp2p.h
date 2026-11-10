@@ -11,7 +11,9 @@ const TUint32 KMssStop = 1u << 0;							// our outbound "master-kernel" bit 0
 TInt Smp2p_Start(TInt aRemote);								// our outbound item + entries; idempotent
 // an inbound entry's value; KErrNotReady until the remote created it
 TInt Smp2p_In(TInt aRemote, const char* aEntry, TUint32& aValue);
-TInt Smp2p_Set(TInt aRemote, const char* aEntry, TUint32 aMask, TUint32 aValue);	// outbound bits, then a kick
+TUint32 Smp2p_Generation(TInt aRemote); // increments when the outbound item is reset
+TInt Smp2p_Set(TInt aRemote, const char* aEntry, TUint32 aMask, TUint32 aValue, TUint32 aGeneration = ~0u);	// outbound bits, then a kick
+TInt Smp2p_Reset(TInt aRemote); // stopped remote only
 void Smp2p_Poll(TInt aRemote);								// version negotiation and the restart ack
 void Smp2p_Dump(TInt aRemote, void (*aSay)(const char*, ...));
 #endif

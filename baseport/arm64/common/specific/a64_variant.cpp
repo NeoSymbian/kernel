@@ -155,7 +155,7 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 		return r;
 		}
 	case 0x4e0d: case 0x4e0e: case 0x4e0f: case 0x4e10: case 0x4e11: case 0x4e12: case 0x4e13:
-	case 0x4e14: case 0x4e15: case 0x4e16: case 0x4e17: case 0x4e18:
+	case 0x4e14: case 0x4e15: case 0x4e16: case 0x4e17: case 0x4e18: case 0x4e1a: case 0x4e1b: case 0x4e1c: case 0x4e1d:
 		return A64Tel_Hal(aFunction, a1, a2);
 	case ENeoHalDeviceList:
 		return A64Device_Hal(a1, a2);

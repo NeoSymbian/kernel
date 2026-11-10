@@ -20,11 +20,17 @@
 //   0x4e16 ChanSend    a1 = SIo { channel 1 = the ADSP's IPCRTR, 2 = APR (apr_audio_svc); 0; len; buf }
 //   0x4e17 ChanRecv    a1 = SIo { channel; 0; size; buf } -> the next queued message's length, KErrNotReady if none
 //   0x4e18 Audio       a1 = SIo { op; arg; 0; 0 }: the board's codecs and amps (A64Audio_Control, a64_audio.cpp)
+// C7: 0x4e1a Stop SIo{mask1=MSS,2=ADSP}; asynchronous, poll 0x4e1b [phase,error,mss_gen,adsp_gen].
+// phase: 0 idle,1 stopping,2 stopped,3 failed. Never reload after phase3 until a later stop succeeds.
+// 0x4e1c AudioMem SIo: 0 info ->{b=phys,len=64KiB,buf=adsp_gen}; 1 copy{b=offset,len,buf};
+// 2 publish ->{b=ticket,len=64KiB,buf=adsp_gen}; 3 complete{b=ticket,buf=adsp_gen} after DSP completion.
+// 0x4e1d Haptic SIo{a=duration_ms 0..2000,b=amplitude0..127}; zero stops, timer bounds each pulse.
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
 #include <platform.h>
 #include "board.h"
+#include "a64_mutex.h"
 #include "a64_blk.h"
 #include "qcom_scm.h"
 #include "qcom_smp2p.h"
@@ -38,10 +44,11 @@
 
 TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
 // the board's codecs (bonito a64_audio.cpp); a board without call audio has none
+__attribute__((weak)) TInt A64Haptic_Control(TInt, TInt) { return KErrNotSupported; }
 __attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupported; }
 
 enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
-	EChanRecv, EAudio };
+	EChanRecv, EAudio, ERprocStop = 0x4e1a, ERprocState, EAudioMem, EHaptic };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -58,6 +65,11 @@ struct SRing
 	};
 static SRing Rings[KTelRings];
 static TBool RingsInit;
+static TBool FatalSaid;
+static TUint32 Generations[2];
+static volatile TInt StopPhase, StopError;
+static TUint32 StopMask;
+static NFastMutex StopLock;
 
 TAny* Tel_Ring(TInt aRing)
 	{
@@ -114,10 +126,9 @@ void Tel_Dump(void (*aSay)(const char*, ...))
 // the modem's own reason, once, when it raises FATAL while running (the boot path prints it for boot failures)
 static void FatalReason(TUint32 aSlaveKernel)
 	{
-	static TBool said;
-	if (!(aSlaveKernel & KMssFatal) || said)
+	if (!(aSlaveKernel & KMssFatal) || FatalSaid)
 		return;
-	said = ETrue;
+	FatalSaid = ETrue;
 	TUint32 len = 0;
 	const char* why = (const char*)Smem_Get(KSmemHostGlobal, 421, &len);	// SMEM_SSR_REASON_MSS0
 	char buf[160];											// a short copy: monitor output over 256 bytes faults
@@ -257,12 +268,218 @@ static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 	return KErrNone;
 	}
 
+// One bounded physical region retained for this boot. The daemon owns ASM map/write acknowledgements;
+// a published region cannot be overwritten until its exact ticket is completed or PAS shutdown succeeds.
+const TUint32 KAudioBytes = 0x10000;
+static TPhysAddr AudioPhys;
+static DPlatChunkHw* AudioChunk;
+static TUint32 AudioTicket, AudioGeneration;
+static TBool AudioBusy;
+static DMutex* AudioLock;
+static NFastMutex AudioInit;
+static TInt AudioMem(SIo& aIo)
+	{
+	TInt r = A64Mutex_Init(AudioLock, AudioInit, _L("AudioMem"), KMutexOrdGeneral0);
+	if (r != KErrNone)
+		return r;
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*AudioLock);
+	if (!AudioChunk && aIo.iA == 0)
+		{
+		r = Epoc::AllocPhysicalRam(KAudioBytes, AudioPhys);
+		if (r == KErrNone)
+			{
+			r = DPlatChunkHw::New(AudioChunk, AudioPhys, KAudioBytes, EMapAttrSupRw | EMapAttrBufferedNC);
+			if (r != KErrNone)
+				Epoc::FreePhysicalRam(AudioPhys, KAudioBytes);
+			else
+				memclr((TAny*)AudioChunk->LinearAddress(), KAudioBytes);
+			}
+		}
+	if (r == KErrNone && !AudioChunk)
+		r = KErrNotReady;
+	if (r == KErrNone)
+		switch (aIo.iA)
+			{
+		case 0:
+			aIo.iB = AudioPhys;
+			aIo.iLen = KAudioBytes;
+			aIo.iBuf = Generations[1];
+			break;
+		case 1:
+			if (AudioBusy)
+				r = KErrInUse;
+			else if (aIo.iB > KAudioBytes || aIo.iLen > KAudioBytes - aIo.iB)
+				r = KErrArgument;
+			else
+				kumemget((TUint8*)AudioChunk->LinearAddress() + aIo.iB, (const TAny*)aIo.iBuf, aIo.iLen);
+			break;
+		case 2:
+			if (AudioBusy)
+				r = KErrInUse;
+			else
+				{
+				__e32_memory_barrier(); // PCM reaches noncached DRAM before the daemon sends ASM WRITE
+				AudioBusy = ETrue;
+				AudioGeneration = Generations[1];
+				if (!++AudioTicket)
+					++AudioTicket;
+				aIo.iB = AudioTicket;
+				aIo.iLen = KAudioBytes;
+				aIo.iBuf = AudioGeneration;
+				}
+			break;
+		case 3:
+			if (!AudioBusy || aIo.iB != AudioTicket || aIo.iBuf != AudioGeneration || aIo.iBuf != Generations[1])
+				r = KErrNotReady;
+			else
+				AudioBusy = EFalse;
+			break;
+		default:
+			r = KErrArgument;
+			}
+	Kern::MutexSignal(*AudioLock);
+	NKern::ThreadLeaveCS();
+	return r;
+	}
+
+static void ResetRings(TInt aFirst, TInt aEnd)
+	{
+	for (TInt i = aFirst; i < aEnd; ++i)
+		{
+		SRing& ring = *(SRing*)Tel_Ring(i);
+		NKern::FMWait(&ring.iLock);
+		ring.iChannel = -1;
+		ring.iHead = ring.iTail = 0;
+		NKern::FMSignal(&ring.iLock);
+		}
+	}
+
+static TDynamicDfcQue* StopQueue;
+static void StopDfcFn(TAny*)
+	{
+	TInt r = KErrNone;
+	// MODEMD has stopped sending before requesting this. Both operations wait for their existing boot DFC
+	// to finish; an unresponsive processor never authorizes memory reuse or another firmware load.
+	for (TInt i = 0; i < 30000; ++i)
+		{
+		r = StopMask & 1 ? Mss_Stop() : KErrNone;
+		if (r != KErrInUse)
+			break;
+		NKern::Sleep(NKern::TimerTicks(1));
+		}
+	if (r == KErrNone && (StopMask & 1))
+		{
+		ResetRings(0, 1);
+		++Generations[0];
+		FatalSaid = EFalse;
+		}
+	if (r == KErrNone && (StopMask & 2))
+		{
+		A64Audio_Control(2, 0);
+		A64Haptic_Control(0, 0);
+		for (TInt i = 0; i < 30000; ++i)
+			{
+			r = Adsp_Stop();
+			if (r != KErrInUse)
+				break;
+			NKern::Sleep(NKern::TimerTicks(1));
+			}
+		if (r == KErrNone)
+			{
+			ResetRings(1, 3);
+			if (AudioLock)
+				{
+				NKern::ThreadEnterCS();
+				Kern::MutexWait(*AudioLock);
+				++Generations[1];
+				AudioBusy = EFalse; // successful PAS shutdown is the DSP ownership boundary
+				Kern::MutexSignal(*AudioLock);
+				NKern::ThreadLeaveCS();
+				}
+			else
+				++Generations[1];
+			}
+		}
+	StopError = r == KErrInUse ? KErrTimedOut : r;
+	__e32_memory_barrier();
+	NKern::FMWait(&StopLock);
+	StopPhase = StopError == KErrNone ? 2 : 3;
+	NKern::FMSignal(&StopLock);
+	Kern::Printf("[tel] stop mask %d -> %d, generations %d/%d", StopMask, StopError, Generations[0], Generations[1]);
+	}
+static TDfc StopDfc(StopDfcFn, NULL, 1);
+
+static TInt QueueStop(TUint32 aMask)
+	{
+	if (!aMask || aMask > 3)
+		return KErrArgument;
+	NKern::FMWait(&StopLock);
+	if (StopPhase == 1)
+		{
+		NKern::FMSignal(&StopLock);
+		return KErrInUse;
+		}
+	StopPhase = 1; // reserve the request before queue creation can sleep
+	StopMask = aMask;
+	StopError = 0;
+	NKern::FMSignal(&StopLock);
+	TInt r = StopQueue ? KErrNone : Kern::DynamicDfcQCreate(StopQueue, 24, _L8("TelStop"));
+	if (r == KErrNone)
+		{
+		StopDfc.SetDfcQ(StopQueue);
+		StopDfc.Enque();
+		}
+	else
+		{
+		NKern::FMWait(&StopLock);
+		StopError = r;
+		StopPhase = 3;
+		NKern::FMSignal(&StopLock);
+		}
+	return r;
+	}
+
 TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 	{
 	if (!Kern::CurrentThreadHasCapability(ECapabilityCommDD, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian modem")))
 		return KErrPermissionDenied;
+	if ((StopPhase == 1 || StopPhase == 3) && aFunction != ERprocState && aFunction != ERprocStop &&
+		aFunction != EState && aFunction != EAdspState && aFunction != EHaptic)
+		return KErrNotReady;
 	switch (aFunction)
 		{
+	case ERprocStop:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		return QueueStop(io.iA);
+		}
+	case ERprocState:
+		{
+		NKern::FMWait(&StopLock);
+		TUint32 out[4] = { (TUint32)StopPhase, (TUint32)StopError, Generations[0], Generations[1] };
+		NKern::FMSignal(&StopLock);
+		kumemput32(a1, out, sizeof(out));
+		return KErrNone;
+		}
+	case EAudioMem:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		TInt r = AudioMem(io);
+		if (r == KErrNone)
+			kumemput32(a1, &io, sizeof(io));
+		return r;
+		}
+	case EHaptic:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		if (io.iA > 2000 || io.iB > 127)
+			return KErrArgument;
+		return A64Haptic_Control(io.iA, io.iB);
+		}
 	case EBoot:
 		return Mss_StartBoot();
 	case EState:

@@ -31,7 +31,9 @@ struct SEdge
 	const char* iOutNames[2];
 	SItem* iOut;
 	TBool iNegotiated, iSsrAck, iAckState;
+	TUint32 iGeneration;
 	};
+static NFastMutex StateLock; // outbound publication, generation, negotiation and reset (no sleeping calls)
 static SEdge Edges[] = {
 	{ KSmemHostModem, 435, 428, KIpcModemSmp2p, { "master-kernel", "ipa" }, NULL, EFalse, EFalse, EFalse },
 	{ KSmemHostAdsp, 443, 429, KIpcAdspSmp2p, { "master-kernel", "sleepstate" }, NULL, EFalse, EFalse, EFalse },
@@ -77,7 +79,11 @@ TInt Smp2p_Start(TInt aRemote)
 	SEdge* e = Edge(aRemote);
 	if (!e)
 		return KErrArgument;
-	if (e->iOut)
+	NKern::FMWait(&StateLock);
+	TBool up = e->iOut != NULL;
+	TUint32 generation = e->iGeneration;
+	NKern::FMSignal(&StateLock);
+	if (up)
 		return KErrNone;
 	TInt r = Smem_Alloc(aRemote, e->iOutItem, sizeof(SItem));
 	if (r != KErrNone && r != KErrAlreadyExists)
@@ -85,6 +91,19 @@ TInt Smp2p_Start(TInt aRemote)
 	SItem* out = (SItem*)Smem_Get(aRemote, e->iOutItem);
 	if (!out)
 		return KErrNotFound;
+	SItem* in = In(*e);
+	TUint32 inVersion = in ? in->iVersionFeatures & 0xff : 0;
+	NKern::FMWait(&StateLock);
+	if (generation != e->iGeneration)
+		{
+		NKern::FMSignal(&StateLock);
+		return KErrDied; // reset won while SMEM was being allocated
+		}
+	if (e->iOut) // a concurrent initializer may have published while SMEM was allocated
+		{
+		NKern::FMSignal(&StateLock);
+		return KErrNone;
+		}
 	memclr(out, sizeof(SItem));
 	out->iMagic = KMagic;
 	out->iLocalPid = 0;
@@ -92,12 +111,11 @@ TInt Smp2p_Start(TInt aRemote)
 	out->iTotal = KEntries;
 	for (TInt i = 0; i < 2; ++i)							// the entries the DTB names, all bits 0
 		SetName(out->iEntry[out->iValid++].iName, e->iOutNames[i]);
-	SItem* in = In(*e);
-	TUint32 inVersion = in ? in->iVersionFeatures & 0xff : 0;
 	__e32_memory_barrier();									// the header before the version that validates it
 	out->iVersionFeatures = (KFeatureSsrAck << 8) | (inVersion && inVersion <= 2 ? inVersion : 2);
 	e->iOut = out;
 	Ipc_Kick(e->iBit);
+	NKern::FMSignal(&StateLock);
 	return KErrNone;
 	}
 
@@ -116,30 +134,54 @@ TInt Smp2p_In(TInt aRemote, const char* aEntry, TUint32& aValue)
 	return KErrNotReady;
 	}
 
-TInt Smp2p_Set(TInt aRemote, const char* aEntry, TUint32 aMask, TUint32 aValue)
+TUint32 Smp2p_Generation(TInt aRemote)
 	{
 	SEdge* e = Edge(aRemote);
-	if (!e || !e->iOut)
-		return KErrNotReady;
-	for (TInt i = 0; i < e->iOut->iValid; ++i)
-		if (NameIs(e->iOut->iEntry[i].iName, aEntry))
-			{
-			volatile TUint32& v = e->iOut->iEntry[i].iValue;
-			TUint32 old = v, now = (old & ~aMask) | (aValue & aMask);
-			v = now;
-			if (now != old)
-				Ipc_Kick(e->iBit);
-			return KErrNone;
-			}
-	return KErrNotFound;
+	NKern::FMWait(&StateLock);
+	TUint32 generation = e ? e->iGeneration : ~0u;
+	NKern::FMSignal(&StateLock);
+	return generation;
+	}
+
+TInt Smp2p_Set(TInt aRemote, const char* aEntry, TUint32 aMask, TUint32 aValue, TUint32 aGeneration)
+	{
+	SEdge* e = Edge(aRemote);
+	if (!e)
+		return KErrArgument;
+	NKern::FMWait(&StateLock);
+	SItem* out = e->iOut;
+	TInt r = KErrNotReady;
+	if (out && (aGeneration == ~0u || aGeneration == e->iGeneration))
+		{
+		r = KErrNotFound;
+		for (TInt i = 0; i < out->iValid && i < KEntries; ++i)
+			if (NameIs(out->iEntry[i].iName, aEntry))
+				{
+				volatile TUint32& v = out->iEntry[i].iValue;
+				TUint32 old = v, now = (old & ~aMask) | (aValue & aMask);
+				v = now;
+				if (now != old)
+					Ipc_Kick(e->iBit);
+				r = KErrNone;
+				break;
+				}
+		}
+	NKern::FMSignal(&StateLock);
+	return r;
 	}
 
 void Smp2p_Poll(TInt aRemote)
 	{
 	SEdge* e = Edge(aRemote);
 	SItem* in = e ? In(*e) : NULL;
-	if (!in || !e->iOut)
+	if (!in)
 		return;
+	NKern::FMWait(&StateLock);
+	if (!e->iOut)
+		{
+		NKern::FMSignal(&StateLock);
+		return;
+		}
 	TUint32 inV = in->iVersionFeatures & 0xff, outV = e->iOut->iVersionFeatures & 0xff;
 	if (!e->iNegotiated)
 		{
@@ -162,6 +204,7 @@ void Smp2p_Poll(TInt aRemote)
 		e->iOut->iFlags = (e->iOut->iFlags & ~KFlagRestartAck) | (e->iAckState ? KFlagRestartAck : 0);
 		Ipc_Kick(e->iBit);
 		}
+	NKern::FMSignal(&StateLock);
 	}
 
 void Smp2p_Dump(TInt aRemote, void (*aSay)(const char*, ...))
@@ -169,7 +212,14 @@ void Smp2p_Dump(TInt aRemote, void (*aSay)(const char*, ...))
 	SEdge* e = Edge(aRemote);
 	if (!e)
 		return;
-	const SItem* items[2] = { e->iOut, In(*e) };
+	SItem snapshot;
+	NKern::FMWait(&StateLock);
+	TBool haveOut = e->iOut != NULL;
+	if (haveOut)
+		memcpy(&snapshot, e->iOut, sizeof(snapshot));
+	TBool negotiated = e->iNegotiated;
+	NKern::FMSignal(&StateLock);
+	const SItem* items[2] = { haveOut ? &snapshot : NULL, In(*e) };
 	for (TInt k = 0; k < 2; ++k)
 		{
 		const SItem* it = items[k];
@@ -180,7 +230,7 @@ void Smp2p_Dump(TInt aRemote, void (*aSay)(const char*, ...))
 			}
 		aSay("smp2p %d %s: version %d features %x pids %d->%d entries %d flags %x%s", aRemote, k ? "in" : "out",
 			it->iVersionFeatures & 0xff, it->iVersionFeatures >> 8, it->iLocalPid, it->iRemotePid, it->iValid,
-			it->iFlags, !k && e->iNegotiated ? " negotiated" : "");
+			it->iFlags, !k && negotiated ? " negotiated" : "");
 		for (TInt i = 0; i < it->iValid && i < KEntries; ++i)
 			{
 			TBuf8<KName + 1> n;
@@ -189,4 +239,27 @@ void Smp2p_Dump(TInt aRemote, void (*aSay)(const char*, ...))
 			aSay("  %S = %08x", &n, it->iEntry[i].iValue);
 			}
 		}
+	}
+
+// Remote must be stopped first. Only clear our entries; the remote owns its inbound item.
+TInt Smp2p_Reset(TInt aRemote)
+	{
+	SEdge* e = Edge(aRemote);
+	if (!e)
+		return KErrArgument;
+	NKern::FMWait(&StateLock);
+	if (e->iOut)
+		{
+		for (TInt i = 0; i < e->iOut->iValid && i < KEntries; ++i)
+			e->iOut->iEntry[i].iValue = 0;
+		__e32_memory_barrier();
+		Ipc_Kick(e->iBit);
+		}
+	e->iNegotiated = EFalse;
+	e->iSsrAck = EFalse;
+	e->iAckState = EFalse;
+	e->iOut = NULL;
+	++e->iGeneration;
+	NKern::FMSignal(&StateLock);
+	return KErrNone;
 	}

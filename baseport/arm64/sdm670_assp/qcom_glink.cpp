@@ -17,6 +17,7 @@
 // never loses it, and nothing counts as sent before it is (2026-11-09 review F03).
 #include <kernel/kern_priv.h>
 #include "board.h"
+#include "a64_mutex.h"
 #include "qcom_ipc.h"
 #include "qcom_smem.h"
 #include "qcom_glink.h"
@@ -67,6 +68,9 @@ struct SEdge
 	SChannel iCh[KChannels];
 	TInt iNCh;
 	};
+static NFastMutex LifeInit;
+static DMutex* LifeLock; // serializes reset with polling, callbacks and public channel operations
+static TUint32 Generations[2];
 static SEdge Edges[] = { { KSmemHostModem, KIpcModemGlink }, { KSmemHostAdsp, KIpcAdspGlink } };
 const TInt KEdges = sizeof(Edges) / sizeof(Edges[0]);
 static SEdge* EdgeOf(TInt aRemote)
@@ -477,6 +481,8 @@ static void PollTimerFn(TAny*) { PollDfc.Add(); }
 static NTimer PollTimer(PollTimerFn, NULL);
 static void PollDfcFn(TAny*)
 	{
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*LifeLock);
 	for (TInt e = 0; e < KEdges; ++e)
 		{
 		if (Edges[e].iUp)
@@ -484,10 +490,12 @@ static void PollDfcFn(TAny*)
 		for (TInt n = 0; Edges[e].iUp && n < 64 && RxOne(Edges[e]); ++n)
 			;
 		}
+	Kern::MutexSignal(*LifeLock);
+	NKern::ThreadLeaveCS();
 	PollTimer.OneShot(1);
 	}
 
-TInt Glink_Start(TInt aRemote)
+static TInt StartLocked(TInt aRemote)
 	{
 	SEdge* e = EdgeOf(aRemote);
 	if (!e)
@@ -528,7 +536,7 @@ TInt Glink_Start(TInt aRemote)
 	return KErrNone;
 	}
 
-TInt Glink_Open(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr)
+static TInt OpenLocked(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr)
 	{
 	SEdge* e = EdgeOf(aRemote);
 	if (!e || !e->iUp)
@@ -549,18 +557,18 @@ TInt Glink_Open(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr)
 	return Id(E, *c);
 	}
 
-TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
+static TInt SendLocked(TInt aChannel, const TAny* aData, TInt aLen)
 	{
-	if ((aChannel >> 8) >= KEdges)
+	if (aChannel <= 0 || (aChannel >> 8) >= KEdges)
 		return KErrNotReady;
 	SEdge& E = Edges[aChannel >> 8];
 	SChannel* c = ByLcid(E, aChannel & 0xff);
-	if (!c || !c->iRcid || !c->iOpenAcked)
+	if (!E.iUp || !c || !c->iRcid || !c->iOpenAcked)
 		return KErrNotReady;
 	TUint32 id = 0;
 	TInt k = 0;
 	TBool found = EFalse;
-	for (TInt tries = 0; !found && tries < 200; ++tries)		// none free: ask for one, the GLINK thread files it
+	for (TInt tries = 0; !found && tries < 1; ++tries)		// none free: ask for one, the GLINK thread files it
 		{
 		NKern::FMWait(&TxLock);
 		for (k = 0; k < KRemoteIntents; ++k)
@@ -579,7 +587,6 @@ TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
 			SMsg req = { EIntentReq, c->iLcid, (TUint32)aLen };
 			Tx(E, &req, sizeof(req));
 			}
-		NKern::Sleep(NKern::TimerTicks(1));
 		}
 	if (!found)
 		return KErrNotReady;
@@ -598,8 +605,90 @@ TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
 	return KErrNone;
 	}
 
+TInt Glink_Start(TInt aRemote)
+	{
+	TInt r = A64Mutex_Init(LifeLock, LifeInit, _L("GlinkLife"), KMutexOrdGeneral0);
+	if (r != KErrNone)
+		return r;
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*LifeLock);
+	r = StartLocked(aRemote);
+	Kern::MutexSignal(*LifeLock);
+	NKern::ThreadLeaveCS();
+	return r;
+	}
+
+TInt Glink_Open(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr)
+	{
+	if (!LifeLock)
+		return KErrNotReady;
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*LifeLock);
+	TInt r = OpenLocked(aRemote, aName, aRx, aPtr);
+	Kern::MutexSignal(*LifeLock);
+	NKern::ThreadLeaveCS();
+	return r;
+	}
+
+TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
+	{
+	if (!LifeLock || aChannel <= 0 || (aChannel >> 8) >= KEdges || aLen <= 0 || aLen > 0x2000)
+		return KErrNotReady;
+	TUint32 generation;
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*LifeLock);
+	generation = Generations[aChannel >> 8];
+	Kern::MutexSignal(*LifeLock);
+	NKern::ThreadLeaveCS();
+	for (TInt i = 0; i < 200; ++i)
+		{
+		NKern::ThreadEnterCS();
+		Kern::MutexWait(*LifeLock);
+		TBool stale = generation != Generations[aChannel >> 8];
+		TInt r = stale ? KErrDied : SendLocked(aChannel, aData, aLen);
+		Kern::MutexSignal(*LifeLock);
+		NKern::ThreadLeaveCS();
+		if (r != KErrNotReady)
+			return r;
+		NKern::Sleep(NKern::TimerTicks(1)); // let polling publish an intent; no lifecycle lock held
+		}
+	return KErrNotReady;
+	}
+
+TInt Glink_Stop(TInt aRemote)
+	{
+	SEdge* e = EdgeOf(aRemote);
+	if (!e)
+		return KErrArgument;
+	if (!LifeLock)
+		return KErrNone;
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*LifeLock); // waits for any current receive callback and send to finish
+	e->iUp = EFalse;
+	++Generations[e - Edges];
+	NKern::ThreadEnterCS();
+	for (TInt i = 0; i < e->iNCh; ++i)
+		for (TInt k = 0; k < KSlots; ++k)
+			Kern::Free(e->iCh[i].iIn[k].iBuf); // GLINK copies FIFO data; these are never remote DMA buffers
+	TInt remote = e->iRemote, bit = e->iIpcBit;
+	memclr(e, sizeof(*e));
+	e->iRemote = remote;
+	e->iIpcBit = bit;
+	NKern::ThreadLeaveCS();
+	Kern::MutexSignal(*LifeLock);
+	NKern::ThreadLeaveCS();
+	return KErrNone;
+	}
+
 void Glink_Dump(void (*aSay)(const char*, ...))
 	{
+	if (!LifeLock)
+		{
+		aSay("glink: not started");
+		return;
+		}
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*LifeLock);
 	static const char* const KNames[] = { "modem", "lpass" };
 	for (TInt e = 0; e < KEdges; ++e)
 		{
@@ -629,4 +718,6 @@ void Glink_Dump(void (*aSay)(const char*, ...))
 				inUse, ours, KSlots, c.iRefused);
 			}
 		}
+	Kern::MutexSignal(*LifeLock);
+	NKern::ThreadLeaveCS();
 	}

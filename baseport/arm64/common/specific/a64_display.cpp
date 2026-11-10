@@ -19,6 +19,7 @@
 
 static DPlatChunkHw* TheFbChunk;
 static TPhysAddr TheFbPhys;
+__attribute__((weak)) TInt A64Panel_SetState(TBool) { return KErrNotSupported; }
 static TInt TheDisplayState = 1;					// on
 
 static TInt ModeInfo(TInt aMode, TVideoInfoV01& a)
@@ -83,8 +84,13 @@ static TInt DisplayHal(TAny*, TInt aFunction, TAny* a1, TAny* a2)
 		kumemput32(a1, &TheDisplayState, sizeof(TheDisplayState));
 		return KErrNone;
 	case EDisplayHalSetState:
-		TheDisplayState = a1 ? 1 : 0;
-		return KErrNone;
+		{
+		TInt state = a1 ? 1 : 0;
+		TInt r = state == TheDisplayState ? KErrNone : A64Panel_SetState(state != 0);
+		if (r == KErrNone)
+			TheDisplayState = state;
+		return r;
+		}
 	case EDisplayHalCurrentModeInfo:
 	case EDisplayHalSpecifiedModeInfo:
 		{

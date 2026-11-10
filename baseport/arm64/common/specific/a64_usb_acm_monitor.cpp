@@ -50,6 +50,7 @@ static TUint8* RawStage;									// KRawStage + KRawXfer
 static TInt RawFill, RawLeft;
 static TBool RawFull;
 static TInt InStarts, InDone, InFail, OutLines;
+static TUint32 Generation;								// a new host session: a writer still sending drops the rest
 
 static TInt ArmOut()
 	{
@@ -57,13 +58,24 @@ static TInt ArmOut()
 	}
 
 // ---- the core's callbacks
-static TInt ClassSetup(const TUint8* aSetup, TUint8* aBuf)	// CDC ACM
+static TInt ClassSetup(const TUint8* aSetup, TUint8* aBuf)	// CDC ACM, to interface 0
 	{
+	const TUint8 type = aSetup[0];
+	const TUint16 index = aSetup[4] | (aSetup[5] << 8), length = aSetup[6] | (aSetup[7] << 8);
+	if (index != 0)
+		return KA64UsbStall;
 	switch (aSetup[1])
 		{
-	case 0x20: return KA64UsbDataOut;						// SET_LINE_CODING: 7 bytes follow
-	case 0x21: memcpy(aBuf, LineCoding, 7); return 7;		// GET_LINE_CODING
+	case 0x20:												// SET_LINE_CODING: 7 bytes follow
+		return type == 0x21 && length == 7 ? KA64UsbDataOut : KA64UsbStall;
+	case 0x21:												// GET_LINE_CODING
+		if (type != 0xa1 || length != 7)
+			return KA64UsbStall;
+		memcpy(aBuf, LineCoding, 7);
+		return 7;
 	case 0x22:												// SET_CONTROL_LINE_STATE: bit 0 = DTR (port open)
+		if (type != 0x21 || length != 0)
+			return KA64UsbStall;
 		Dtr = aSetup[2] & 1;
 		AbortIn = InBusy;									// a closed port never collects its last piece: abort it
 															// (later: End Transfer stalls during a control transfer)
@@ -80,19 +92,20 @@ static void ClassOutData(const TUint8* aSetup, const TUint8* aData)
 		memcpy(LineCoding, aData, 7);
 	}
 
-static void Ready()
+static TInt Ready()
 	{
 	InBusy = EFalse;
 	OutBusy = ArmOut() == KErrNone;
+	return OutBusy ? KErrNone : KErrGeneral;
 	}
 
-static void Bus(TA64UsbBus aEvent)
+static void Reset()											// the session ended: forget its state
 	{
-	Dtr = EFalse;
-	if (aEvent != EA64UsbDisconnect)
-		InBusy = OutBusy = EFalse;
-	if (aEvent == EA64UsbRestart)
-		AbortIn = EFalse;
+	++Generation;
+	Dtr = InBusy = OutBusy = AbortIn = EFalse;
+	RawLeft = RawFill = 0;
+	RawFull = LineReady = EFalse;
+	Line.Zero();
 	}
 
 static void XferComplete(TInt aPhysEp, TInt aBytes)
@@ -128,20 +141,25 @@ static void XferComplete(TInt aPhysEp, TInt aBytes)
 // the monitor's writer: blocks (polling the controller) until each piece is sent, gives up after ~2 s
 static void UsbWrite(const TUint8* aData, TInt aLen)
 	{
-	while (aLen > 0 && A64Usb_Configured() && Dtr)
+	const TUint32 generation = Generation;
+	while (aLen > 0 && A64Usb_Configured() && Dtr && generation == Generation)
 		{
-		for (TInt i = 0; InBusy && i < 2000; ++i)
+		for (TInt i = 0; (InBusy || !A64Usb_CanStart(EPhysBulkIn)) && i < 2000 && generation == Generation; ++i)
 			{
 			A64Usb_ProcessEvents();
-			if (InBusy)
+			if (InBusy || !A64Usb_CanStart(EPhysBulkIn))
 				NKern::Sleep(1);
 			}
+		if (generation != Generation)
+			return;											// a new session: its host never asked for this
 		if (InBusy)
 			{
 			A64Usb_EndXfer(EPhysBulkIn);
 			InBusy = EFalse;
 			return;											// the reader went away: drop the rest
 			}
+		if (!A64Usb_CanStart(EPhysBulkIn))					// the controller still owns the buffer (a stop)
+			return;
 		TInt n = Min(aLen, KInMax);
 		if (n % KBulkMax == 0)
 			--n;											// end each transfer with a short packet
@@ -187,11 +205,15 @@ static void Poll()
 		{
 		TBool last = RawLeft == 0;
 		TInt n = last ? RawFill : RawFill / KSector * KSector;	// whole sectors; the total is too
+		const TUint32 generation = Generation;
 		A64Mon_PutChunk(RawStage, n, last, UsbWrite);
-		memmove(RawStage, RawStage + n, RawFill - n);
-		RawFill -= n;
-		RawFull = EFalse;
-		OutBusy = ArmOut() == KErrNone;
+		if (generation == Generation)						// else Reset() emptied the stage
+			{
+			memmove(RawStage, RawStage + n, RawFill - n);
+			RawFill -= n;
+			RawFull = EFalse;
+			OutBusy = ArmOut() == KErrNone;
+			}
 		}
 	else if (LineReady)
 		{
@@ -201,7 +223,7 @@ static void Poll()
 		++OutLines;
 		A64Mon_Line(line, UsbWrite);
 		}
-	else if (A64Usb_Configured() && Dtr && !InBusy)				// stream new log text
+	else if (A64Usb_Configured() && Dtr && !InBusy && A64Usb_CanStart(EPhysBulkIn))	// stream new log text
 		{
 		TUint8* p = A64Usb_Buf(EPhysBulkIn);
 		TInt n = A64Log_Read(LogPos, p, KInMax - 1);
@@ -232,8 +254,9 @@ void A64UsbStatus(TDes8& aBuf)							// the monitor's "usb" command
 	TUint32 size, ctrl, rsc;
 	A64Usb_Trb(EPhysBulkIn, size, ctrl, rsc);
 	Append(aBuf, "ev %d rst %d setups %d ep0 %d cfg %d dtr %d in %d/%d/%d busy %d abort %d lines %d logpos %d "
-		"trb3 %08x %08x rsc3 %d", s.iEvents, s.iResets, s.iSetups, s.iEp0, s.iConfigured, Dtr, InStarts, InDone, InFail,
-		InBusy, AbortIn, OutLines, LogPos, size, ctrl, rsc);
+		"trb3 %08x %08x rsc3 %d dma %x/%x/%x restarts %d", s.iEvents, s.iResets, s.iSetups, s.iEp0, s.iConfigured, Dtr,
+		InStarts, InDone, InFail, InBusy, AbortIn, OutLines, LogPos, size, ctrl, rsc, s.iDmaOwned, s.iDmaPending,
+		s.iDmaQuarantined, s.iRestarts);
 	}
 
 void A64UsbDump()
@@ -250,5 +273,5 @@ void A64UsbDump()
 const SA64UsbFunction KA64UsbFunction = {
 	KDevice, sizeof(KDevice), KQualifier, sizeof(KQualifier), KConfig, sizeof(KConfig),
 	KStrings, sizeof(KStrings) / sizeof(KStrings[0]), KEndpoints, sizeof(KEndpoints) / sizeof(KEndpoints[0]),
-	ClassSetup, ClassOutData, Ready, Bus, XferComplete, Poll, A64UsbDump,
+	ClassSetup, ClassOutData, Ready, Reset, XferComplete, Poll, A64UsbDump,
 	};

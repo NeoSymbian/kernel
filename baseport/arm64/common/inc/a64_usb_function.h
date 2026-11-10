@@ -8,7 +8,6 @@
 #define A64_USB_FUNCTION_H
 
 enum TA64UsbEpType { EA64UsbControl = 0, EA64UsbBulk = 2, EA64UsbInterrupt = 3 };
-enum TA64UsbBus { EA64UsbDisconnect, EA64UsbReset, EA64UsbRestart };	// Restart: the monitor's "usb cold"
 const TInt KA64UsbStall = -1, KA64UsbNoData = -2, KA64UsbDataOut = -3;	// ClassSetup's answers besides a length
 
 struct SA64UsbEndpoint
@@ -30,8 +29,9 @@ struct SA64UsbFunction
 	// a class request: the IN data's length (in aBuf), KA64UsbNoData, KA64UsbDataOut (data follows) or KA64UsbStall
 	TInt (*iClassSetup)(const TUint8* aSetup, TUint8* aBuf);
 	void (*iClassOutData)(const TUint8* aSetup, const TUint8* aData);	// the data stage of a KA64UsbDataOut request
-	void (*iConfigured)();									// SET_CONFIGURATION: the endpoints are ready
-	void (*iBus)(TA64UsbBus aEvent);
+	TInt (*iConfigured)();									// SET_CONFIGURATION: the endpoints are ready; an error stalls
+	void (*iReset)();										// the host's session ended: bus reset, disconnect, a new
+															// SET_CONFIGURATION, a controller restart; no transfer is armed
 	void (*iXferComplete)(TInt aPhysEp, TInt aBytes);		// aBytes: what an OUT transfer received
 	void (*iPoll)();										// every poll (1 ms), after the events
 	void (*iDump)();										// status lines in the log
@@ -40,12 +40,18 @@ extern const SA64UsbFunction KA64UsbFunction;
 
 // the core, for the function (thread context, the poll's DFC queue)
 TUint8* A64Usb_Buf(TInt aPhysEp);							// the endpoint's DMA buffer
-TInt A64Usb_Start(TInt aPhysEp, TInt aLen);					// one transfer from/into its buffer
-void A64Usb_EndXfer(TInt aPhysEp);
+TBool A64Usb_CanStart(TInt aPhysEp);						// the controller no longer owns its TRB and buffer
+TInt A64Usb_Start(TInt aPhysEp, TInt aLen);					// one transfer from/into its buffer (KErrNotReady: owned)
+void A64Usb_EndXfer(TInt aPhysEp);							// asks for a stop; CanStart turns true once it completed
 void A64Usb_ProcessEvents();								// for a writer that waits on its IN transfer
 TBool A64Usb_Ep0Idle();										// no control transfer in progress
 TBool A64Usb_Configured();
-struct SA64UsbStats { TInt iEvents, iResets, iSetups, iEp0; TBool iConfigured; TUint32 iDsts, iSetupLog[6]; };
+struct SA64UsbStats
+	{
+	TInt iEvents, iResets, iSetups, iEp0, iRestarts;
+	TBool iConfigured;
+	TUint32 iDsts, iSetupLog[6], iDmaOwned, iDmaPending, iDmaQuarantined;
+	};
 void A64Usb_Stats(SA64UsbStats& aStats);
 void A64Usb_Trb(TInt aPhysEp, TUint32& aSize, TUint32& aCtrl, TUint32& aRscIdx);
 #endif

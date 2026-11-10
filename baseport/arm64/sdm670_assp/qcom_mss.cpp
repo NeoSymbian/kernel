@@ -181,7 +181,10 @@ static TInt Stop()											// halt the ports, reset, and take the memory back
 	TInt r = HaltAxi(KHaltQ6);
 	TInt modem = HaltAxi(KHaltModem), nc = HaltAxi(KHaltNc);
 	if (r != KErrNone || modem != KErrNone || nc != KErrNone)
-		return r != KErrNone ? r : modem != KErrNone ? modem : nc;
+		Kern::Printf("[mss] AXI halt incomplete (%d/%d/%d); forcing MSS reset", r, modem, nc);
+	// A crashed modem may never drain its AXI port. Linux's q6v5proc_halt_axi_port warns and
+	// q6v5_mba_reclaim still resets MSS; an AXI warning must not prevent the hard-stop fallback.
+	// https://github.com/torvalds/linux/blob/v6.12/drivers/remoteproc/qcom_q6v5_mss.c
 	// q6v5_reset_assert(has_alt_reset): pulse MSS restart while PDC sync reset is asserted.
 	// Unlike boot's AltReset, do not set RMB_MBA_ALT_RESET (that starts the MBA reset path).
 	// https://github.com/torvalds/linux/blob/master/drivers/remoteproc/qcom_q6v5_mss.c
@@ -192,10 +195,12 @@ static TInt Stop()											// halt the ports, reset, and take the memory back
 	Reg(KAossMssRestart) = 0;
 	Kern::NanoWait(300000);
 	Reg(KPdcSyncReset) &= ~KPdcModemBit;
-	__e32_memory_barrier();
-	r = Xfer(MpssPerm, ETrue, EFalse, KMpssPhys, KMpssSize);
-	if (r == KErrNone)
-		r = Xfer(MbaPerm, ETrue, EFalse, KMbaPhys, KMbaSize);
+	__asm__ __volatile__("dsb sy" ::: "memory"); // reset writes complete before asking TZ to reclaim memory
+	// Secure SSR permits reclaiming MPSS only after the MBA has been loaded again. Leave it reserved
+	// with its current ownership here; the next boot checks MPSS reclaim before mapping any segment.
+	// Linux v6.12 q6v5_mba_reclaim and q6v5_mpss_load (the secure subsystem-restart comment).
+	r = Xfer(MbaPerm, ETrue, EFalse, KMbaPhys, KMbaSize);
+	Kern::Printf("[mss] reset complete; MBA reclaim -> %d (MPSS deferred until MBA boot)", r);
 	return r;
 	}
 
@@ -303,6 +308,8 @@ static TInt Boot()
 		minAddr, reloc ? " (relocatable)" : "");
 
 	Step = 2;												// MBA into its carve-out (before the modem owns it)
+	if (MbaPerm != (1ull << KScmVmidHlos))
+		return Fail(Step, KErrNotReady, "MBA ownership not reclaimed");
 	DPlatChunkHw* c;
 	TUint8* p = Map(KMbaPhys, KMbaSize, c);
 	if (!p)
@@ -408,7 +415,11 @@ static TInt Boot()
 	Kern::Printf("[mss] headers authenticated");
 
 	Step = 6;												// the segments, shared with the modem while loading
-	Xfer(MpssPerm, ETrue, EFalse, KMpssPhys, KMpssSize);
+	if ((r = Xfer(MpssPerm, ETrue, EFalse, KMpssPhys, KMpssSize)) != KErrNone)
+		{
+		Stop();
+		return Fail(Step, r, "reclaim mpss after MBA boot");
+		}
 	if ((r = Xfer(MpssPerm, ETrue, ETrue, KMpssPhys, KMpssSize)) != KErrNone)
 		{
 		Stop();

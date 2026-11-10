@@ -689,7 +689,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		}
 	else if (Eq(c, "usb"))
 		{
-		TBuf8<200> b;
+		TBuf8<240> b;										// a line stays under the monitor's 256 bytes
 		if (argc >= 2 && Eq(arg[1], "cold"))				// Pixel: power USB off and back up ourselves (debug)
 			A64UsbCold(b, argc >= 3 ? (TInt)num[2] : 7);	// rails voted: 1 ldob1, 2 ldoa10, 4 ldob7
 		else

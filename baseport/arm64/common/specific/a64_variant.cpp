@@ -335,6 +335,8 @@ static TInt ProbeThread(TAny*)
 
 void A64StartMedia();									// a64_media.cpp
 void A64StartDisplay();									// a64_display.cpp
+// Board/ASSP buses, before any peripheral starts using them (SDM670: SPMI).
+__attribute__((weak)) void A64StartBuses() {}
 // a64_serialkbd.cpp on QEMU virt; boards without a serial keyboard keep this
 __attribute__((weak)) void A64StartSerialKeyboard() {}
 // a64_ecomm.cpp: the serial LDD + the board's debug serial PDD (QEMU virt's second PL011)
@@ -357,6 +359,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 		return KErrNone;
 	A64Log_Report();									// the first point where Kern::Printf reaches the log ring
 	Kern::Printf("[neo] %s", NEO_BUILD_KERNEL);			// which kernel this is (HAL ENeoHalBuildInfo too)
+	A64StartBuses();
 	A64StartCpufreq();									// before the input drivers: their events boost the clocks
 	A64StartDisplay();									// the screen's HAL, for the window server
 	A64StartSerialKeyboard();

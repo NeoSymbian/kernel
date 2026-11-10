@@ -67,10 +67,8 @@ static void PollDfcFn(TAny*)
 
 void A64StartKeys()
 	{
-	TInt ver = Spmi_Init();
+	TInt ver = Spmi_Version();
 	SpmiVersion = ver;
-	Kern::Printf("[spmi] arbiter version %08x; apid PON %d, PM660L GPIO7 %d, PM660 GPIO12 %d", ver,
-		Spmi_Apid(0, 0x08), Spmi_Apid(2, 0xc6), Spmi_Apid(0, 0xcb));
 	if (ver < 0)
 		return;
 	// what ABL left: the volume-up pin's type/subtype, mode, status, and the PON real-time status

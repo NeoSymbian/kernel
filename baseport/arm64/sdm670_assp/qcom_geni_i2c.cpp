@@ -30,6 +30,8 @@ const TInt KSpin = 2000000;								// ~a few ms at most; a byte at 100 kHz is ~9
 
 struct SEngine { TLinAddr iSe; TUint32 iTxDepth; };
 static SEngine Engines[2];
+// The two serial-engine apertures mapped by the SDM670 board, not arbitrary mapped MMIO.
+static const TUint32 EngineBase[2] = { 0x00a84000, 0x00a88000 };
 static NFastMutex Lock;										// touch's thread and the audio thread take turns
 static TLinAddr Se;											// the engine of the call in progress (under Lock)
 static TUint32 TxDepth;
@@ -84,7 +86,8 @@ static int Open(TInt aEngine, unsigned long aSe, TInt aKhz)
 
 int I2c_Open(TInt aEngine, unsigned long aSe, TInt aKhz)
 	{
-	if (aEngine < 0 || aEngine > 1)
+	if (aEngine < 0 || aEngine > 1 || aSe != EngineBase[aEngine] ||
+		(aKhz != 100 && aKhz != 400) || !A64_Io(aSe))
 		return KErrArgument;
 	NKern::FMWait(&Lock);
 	int r = Open(aEngine, aSe, aKhz);
@@ -154,7 +157,8 @@ static int Xfer(TInt aEngine, unsigned aAddr, const unsigned char* aW, int aWn, 
 
 int I2c_Xfer(TInt aEngine, unsigned aAddr, const unsigned char* aW, int aWn, unsigned char* aR, int aRn)
 	{
-	if (aEngine < 0 || aEngine > 1)
+	if (aEngine < 0 || aEngine > 1 || aAddr > 0x7f || aWn < 0 || aRn < 0 ||
+		(!aWn && !aRn) || (aWn && !aW) || (aRn && !aR))
 		return KErrArgument;
 	NKern::FMWait(&Lock);
 	int r = Xfer(aEngine, aAddr, aW, aWn, aR, aRn);

@@ -44,7 +44,7 @@ A driver joins the running kernel in one of four ways:
 | Way | How | Examples |
 |---|---|---|
 | **Board interface** | Implements `kernel/eka/include/kernel/arm64/board.h` in the board's `BOARD_SRC` file | `pixel_bonito.cpp`, `qemu_virt.cpp`: GIC, timer, console, I/O map (`A64_IoRegions`), framebuffer |
-| **Start hook** | A strong `A64Start*()` overrides a weak empty default in `a64_variant.cpp`. The one kernel extension, `A64ExtensionEntry`, calls the hooks **in a fixed order** | `A64StartCpufreq`, `A64StartKeys`, `A64StartTouch`, `A64StartUsbConsole`, `A64StartSerialKeyboard`, `A64StartReboot` |
+| **Start hook** | A strong `A64Start*()` overrides a weak empty default in `a64_variant.cpp`. The one kernel extension, `A64ExtensionEntry`, calls the hooks **in a fixed order** | `A64StartBuses`, `A64StartCpufreq`, `A64StartKeys`, `A64StartTouch`, `A64StartUsbConsole`, `A64StartSerialKeyboard`, `A64StartReboot` |
 | **Weak override** | A strong definition replaces a weak default that generic code calls | `A64BlkDev_*` (sdhci, virtio_blk), `A64_RtcSeconds` (rtc), `A64CpuBoost` (cpufreq, called from `kernel/eventq.cpp`), `A64_Restart`/`A64_CrashReset` (reboot), `A64Tel_Hal` (telhal) |
 | **Library** | Plain functions that other drivers call | `Spmi_*`, `I2c_*`, `Bcm/Arc/Vrm_Vote` (rpmh), `Smem_*`, `Scm_*`, GLINK, SMP2P |
 
@@ -95,7 +95,7 @@ A second board on an existing SoC (the Pixel 3a "sargo" on SDM670) copies the So
    - a unique basename, because `ekc` names objects by basename, so `x/foo.cpp` and `y/foo.cpp` overwrite each other.
 3. **Add an `ekc` line** to the board's `variant_drivers()`.
 4. **If it runs at boot**, add an `A64Start<Name>()` hook: a weak default in `a64_variant.cpp` and a call in
-   `A64ExtensionEntry` at the right point. Buses come before their users: SPMI comes up today inside `A64StartKeys`.
+   `A64ExtensionEntry` at the right point. Buses come before their users: `A64StartBuses` initializes SPMI before the peripheral hooks; keys only read its cached readiness.
 5. **Map its registers** in the board's `A64_IoRegions` (`board.h`, `SA64IoRegion`).
 6. **For user access,** use a Symbian HAL group or framework if the 2010 user side already speaks it. Otherwise add a
    NeoSymbian `EHalGroupVariant` function (or an LDD once it needs asynchronous notification). User-side logic goes in
@@ -117,7 +117,7 @@ them; this list is **not done yet**.
 | Every boot-time driver edits `common/`: one weak `A64Start*` per driver and a fixed call list | `a64_variant.cpp` (`A64ExtensionEntry`) | Registry: `A64_DRIVER(name, startFn, order)` in a `.a64drv` linker section (`ekern.lds`, `__start_`/`__stop_`), run in `order` |
 | The monitor knows every driver: about 20 weak stubs and an `if` chain; `a64_dbgmon.h` declares the Qualcomm `A64Tel_Monitor` | `a64_dbgmon.cpp`, `common/inc/a64_dbgmon.h` | Registry: `A64_MONCMD("name", fn, "help")` in `.a64mon`; `help` lists them. (The `drivers` command and the status half of the driver registry exist: `A64_DEVICE` in `.a64dev`, `a64_devices.cpp`.) |
 | A dropped `ekc` line fails silently into the weak default | `variant.conf`, weak stubs | The two registries, plus a `drivers` check in the gates |
-| Start order is implicit: the keys driver starts SPMI, and RTC, reboot and touch depend on it | `a64_keys.cpp` (`A64StartKeys` → `Spmi_Init`) | Explicit orders: buses 10, cpufreq 20, display 30, input 40, reboot/USB 50, media 60 |
+| Per-driver start order is still a fixed call list | `a64_variant.cpp` (`A64StartBuses` now starts SPMI independently of keys) | Keep bus-before-peripheral ordering when adding registry-based startup |
 | The SoC's driver list sits in the board's `variant.conf` | `bonito_variant/variant.conf` | `<soc>_assp/assp.conf` with `assp_drivers()`, called before `variant_drivers()` |
 | `ekc` object names collide on equal basenames | `tools/build-ekern.sh` (`ekc`) | Name objects after the path under `baseport/arm64` |
 | Generic code with a `qcom_` name: a GPT + FAT16 reader | `sdm670_assp/qcom_fat16.cpp` | `common/specific/a64_gpt.cpp` + `a64_fat16.cpp` |

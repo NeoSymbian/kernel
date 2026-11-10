@@ -12,13 +12,14 @@ with nothing but the Python standard library and the fastboot tool.
   phone.py put vendor_a|vendor_b FILE   FILE onto the partition (kernel "blk put", EMMC_C=2 builds), verified
   phone.py dump PART OUT     a GPT partition by name (or FIRST:COUNT sectors), read-only, checked against the
                              kernel's SHA-256; prints the hash (docs telephony.md C0: radio partition backups)
-  phone.py console           interactive (Ctrl-D ends)
-  phone.py selftest          checks the PNG writer
+  phone.py console [--log F] interactive (Ctrl-D ends), optionally capture continuously
+  phone.py selftest          checks PNG output and console failure handling
 
 Monitor answers end with "\\n.\\n"; "shot" answers "SHOT w h\\n" and w*h*4 bytes of BGRX; "blk dump" answers "DUMP n\\n",
 n*512 raw bytes and "dump sha256 HEX err E". Everything else on the line is the kernel log, streamed live.
 """
 
+import errno
 import glob
 import hashlib
 import os
@@ -63,62 +64,94 @@ def find_port(secs=0):
 
 
 class Console:
-    def __init__(self, port):
+    def __init__(self, port, log_path=None):
         self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        a = termios.tcgetattr(self.fd)
-        a[0] = a[1] = a[3] = 0  # raw: no input/output/local processing
-        a[2] |= termios.CLOCAL | termios.CREAD
-        termios.tcsetattr(self.fd, termios.TCSANOW, a)
+        try:
+            a = termios.tcgetattr(self.fd)
+            a[0] = a[1] = a[3] = 0
+            a[2] |= termios.CLOCAL | termios.CREAD
+            termios.tcsetattr(self.fd, termios.TCSANOW, a)
+            self.sink = open(log_path, "ab", buffering=0) if log_path else None
+        except BaseException:
+            os.close(self.fd)
+            raise
         self.log = bytearray()
 
+    def capture(self, data):
+        self.log += data
+        if len(self.log) > 128 * 1024:
+            del self.log[:-128 * 1024]
+        if self.sink:
+            self.sink.write(data)
+        return data
+
+    def chunk(self, timeout, size=1 << 16):
+        try:
+            ready, _, _ = select.select([self.fd], [], [], max(0, timeout))
+            if not ready:
+                return b""
+            data = os.read(self.fd, size)
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                return b""
+            raise ConnectionError(f"console disconnected: {e}") from e
+        if not data:
+            raise ConnectionError("console disconnected (EOF)")
+        return self.capture(data)
+
     def read(self, secs):
-        out, t0 = bytearray(), time.time()
-        while time.time() - t0 < secs:
-            r, _, _ = select.select([self.fd], [], [], 0.2)
-            if r:
-                try:
-                    out += os.read(self.fd, 1 << 16)
-                except (BlockingIOError, OSError):
-                    pass
+        out, deadline = bytearray(), time.monotonic() + secs
+        while time.monotonic() < deadline:
+            out += self.chunk(min(0.2, deadline - time.monotonic()))
         return bytes(out)
 
     def read_until(self, marker, secs):
-        out, t0 = bytearray(), time.time()
-        while marker not in out and time.time() - t0 < secs:
-            r, _, _ = select.select([self.fd], [], [], 0.2)
-            if r:
-                try:
-                    out += os.read(self.fd, 1 << 16)
-                except (BlockingIOError, OSError):
-                    pass
+        out, deadline = bytearray(), time.monotonic() + secs
+        while marker not in out:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"console incomplete reply: {len(out)} bytes, missing {marker!r}")
+            out += self.chunk(min(0.2, deadline - time.monotonic()))
         return bytes(out)
 
     def read_exact(self, n, secs):
-        out, t0 = bytearray(), time.time()
-        while len(out) < n and time.time() - t0 < secs:
-            r, _, _ = select.select([self.fd], [], [], 0.2)
-            if r:
-                try:
-                    out += os.read(self.fd, n - len(out))
-                except (BlockingIOError, OSError):
-                    pass
+        out, deadline = bytearray(), time.monotonic() + secs
+        while len(out) < n:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"console incomplete transfer: {len(out)} of {n} bytes")
+            out += self.chunk(min(0.2, deadline - time.monotonic()), n - len(out))
         return bytes(out)
 
     def send(self, line):
-        os.write(self.fd, line.encode() + b"\r")
+        data, deadline = memoryview(line.encode() + b"\r"), time.monotonic() + 20
+        while data:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("console write timed out")
+            try:
+                _, ready, _ = select.select([], [self.fd], [], 0.2)
+                if ready:
+                    n = os.write(self.fd, data)
+                    if not n:
+                        raise ConnectionError("console write returned zero")
+                    data = data[n:]
+            except OSError as e:
+                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                    raise ConnectionError(f"console write disconnected: {e}") from e
 
     def cmd(self, line, secs=20):
-        self.log += self.read(0.3)  # log text that arrived before the command
+        self.read(0.3)
+        # Log only the verb: command arguments may contain private user input.
+        verb = line.split()[0] if line.split() else "empty"
+        self.capture(f"\n# host {time.time():.3f} command {verb}\n".encode())
         self.send(line)
         out = self.read_until(END, secs)
-        return out[: out.rfind(END)] if END in out else out
+        return out[:out.rfind(END)]
 
     def put(self, first, data, secs=600):
         """data (padded to whole sectors) onto the eMMC from sector first: "blk put", which the kernel allows only
         inside vendor_a/vendor_b in an EMMC_C=2 build; returns the SHA-256, checked against the kernel's"""
         data = data + bytes(-len(data) % 512)
         n = len(data) // 512
-        self.log += self.read(0.3)
+        self.read(0.3)
         self.send(f"blk put {first} {n}")
         head = self.read_until(b"\n", 10)
         if f"PUT {n}".encode() not in head:
@@ -149,7 +182,7 @@ class Console:
         return want
 
     def shot(self, png, secs=120):
-        self.log += self.read(0.3)
+        self.read(0.3)
         self.send("shot")
         head = self.read_until(b"\n", 10)
         i = head.find(b"SHOT ")
@@ -170,7 +203,7 @@ class Console:
 
     def dump(self, first, count, path, idle=20):
         """count sectors from first into path; returns the SHA-256 hex, after checking it against the kernel's"""
-        self.log += self.read(0.3)
+        self.read(0.3)
         self.send(f"blk dump {first} {count}")
         head = self.read_until(b"\n", 10)
         i = head.find(b"DUMP ")
@@ -193,13 +226,9 @@ class Console:
                 if time.time() - last > idle:
                     raise SystemExit(f"dump: stalled at {got} of {total} bytes")
                 buf = b""
-                r, _, _ = select.select([self.fd], [], [], 0.5)
-                if r:
-                    try:
-                        buf = os.read(self.fd, 1 << 20)
-                        last = time.time()
-                    except (BlockingIOError, OSError):
-                        pass
+                buf = self.chunk(0.5, 1 << 20)
+                if buf:
+                    last = time.time()
                 if got >> 23 != (got + len(buf)) >> 23:
                     print(f"  {(got + len(buf)) >> 20} of {total >> 20} MB", file=sys.stderr)
         tail += self.read_until(END, 30)
@@ -215,7 +244,11 @@ class Console:
         return h.hexdigest()
 
     def close(self):
-        os.close(self.fd)
+        try:
+            os.close(self.fd)
+        finally:
+            if self.sink:
+                self.sink.close()
 
 
 def write_png(path, w, h, bgrx):
@@ -250,6 +283,11 @@ def write_png(path, w, h, bgrx):
         )
 
 
+def _read_file(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def selftest():
     p = (
         "/tmp/phone-selftest.png"
@@ -262,7 +300,52 @@ def selftest():
     assert d[:8] == b"\x89PNG\r\n\x1a\n"
     idat = d[d.find(b"IDAT") + 4 : d.find(b"IEND") - 8]
     assert zlib.decompress(idat) == b"\0" + bytes([255, 0, 0, 0, 0, 255]), "pixel order"
-    print("selftest ok")
+    # Exercise actual fragmented transport, timeout and EOF, preserving partial bytes.
+    import socket
+    import tempfile
+    import threading
+    with tempfile.TemporaryDirectory() as tmp:
+        def pair():
+            a, b = socket.socketpair()
+            a.setblocking(False)
+            c = Console.__new__(Console)
+            c.fd, c.log = a.detach(), bytearray()
+            c.sink = open(os.path.join(tmp, "partial.log"), "wb", buffering=0)
+            return c, b
+
+        c, peer = pair()
+        def fragmented():
+            peer.sendall(b"reply\n.")
+            time.sleep(0.01)
+            peer.sendall(b"\n")
+        writer = threading.Thread(target=fragmented)
+        writer.start()
+        assert c.read_until(END, 1) == b"reply\n.\n"
+        writer.join()
+        c.close()
+        peer.close()
+
+        c, peer = pair()
+        peer.sendall(b"partial")
+        try:
+            c.read_until(END, 0.03)
+            raise AssertionError("missing marker accepted")
+        except TimeoutError:
+            assert c.log == b"partial"
+            assert _read_file(c.sink.name) == b"partial"
+        c.close()
+        peer.close()
+
+        c, peer = pair()
+        peer.sendall(b"before disconnect")
+        peer.close()
+        try:
+            c.read_until(END, 1)
+            raise AssertionError("disconnect accepted")
+        except ConnectionError:
+            assert c.log == b"before disconnect"
+        c.close()
+    print("selftest ok: PNG, fragmented reply, timeout, disconnect, partial capture")
 
 
 def main(argv):
@@ -307,8 +390,8 @@ def main(argv):
             raise SystemExit(
                 "no debug console appeared (the image's AUTOFASTBOOT, if any, will return the phone)"
             )
-        con = Console(port)
-        con.log += con.read(secs)
+        con = Console(port, log)
+        con.read(secs)
         if date:
             c = f"date {int(time.time())} {time.localtime().tm_gmtoff}"
             print("== " + c)
@@ -321,9 +404,6 @@ def main(argv):
             else:
                 print("== " + c)
                 print(con.cmd(c).decode(errors="replace").strip())
-        if log:
-            with open(log, "wb") as f:
-                f.write(con.log)
         if not stay:
             con.send("fastboot")
             time.sleep(1)
@@ -334,7 +414,12 @@ def main(argv):
     port = find_port(5)
     if not port:
         raise SystemExit("no debug console (/dev/cu.usbmodem*)")
-    con = Console(port)
+    log_path = None
+    if verb == "console" and args:
+        if len(args) != 2 or args[0] != "--log":
+            raise SystemExit("console: expected --log FILE")
+        log_path = args[1]
+    con = Console(port, log_path)
     if verb == "cmd":
         for c in args:
             print("== " + c)
@@ -379,4 +464,8 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (ConnectionError, TimeoutError, OSError) as e:
+        print(f"phone: {e}", file=sys.stderr)
+        sys.exit(1)

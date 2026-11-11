@@ -70,7 +70,7 @@ enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalCo
 //   ENeoHalRtcRead     a1 = TUint32* -> the PMIC RTC's raw seconds; KErrNotSupported without one (QEMU)
 //   0x4e0d..0x4e18     the modem and the ADSP (telephony C4-C6): boot, state, QRTR send/receive, EFS partition reads,
 //                      the rmtfs carve-out, IPA, ADSP channels, audio; CommDD. qcom_telhal.cpp on the Pixel,
-//                      KErrNotSupported elsewhere
+//                      KErrNotSupported elsewhere; 0x4e1b reads a firmware file of modem_a (the modem's TFTP, Wi-Fi W0)
 //   ENeoHalDeviceList  a1 = TUint32* cursor (in/out; 0 = the first), a2 = TDes8* (1024 bytes) -> the device registry
 //                      as lines "tag\tstate\tname\tdriver\tdetail\n", none past the end (a64_devices.cpp; ReadDeviceData)
 __attribute__((weak)) TInt A64Battery_Hal(TAny*) { return KErrNotSupported; }
@@ -174,7 +174,7 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 		return r;
 		}
 	case 0x4e0d: case 0x4e0e: case 0x4e0f: case 0x4e10: case 0x4e11: case 0x4e12: case 0x4e13:
-	case 0x4e14: case 0x4e15: case 0x4e16: case 0x4e17: case 0x4e18:
+	case 0x4e14: case 0x4e15: case 0x4e16: case 0x4e17: case 0x4e18: case 0x4e1b:
 		return A64Tel_Hal(aFunction, a1, a2);
 	case ENeoHalBatteryRead:
 		if (!Kern::CurrentThreadHasCapability(ECapabilityReadDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian battery")))

@@ -20,6 +20,9 @@
 //   0x4e16 ChanSend    a1 = SIo { channel 1 = the ADSP's IPCRTR, 2 = APR (apr_audio_svc); 0; len; buf }
 //   0x4e17 ChanRecv    a1 = SIo { channel; 0; size; buf } -> the next queued message's length, KErrNotReady if none
 //   0x4e18 Audio       a1 = SIo { op; arg; 0; 0 }: the board's codecs and amps (A64Audio_Control, a64_audio.cpp)
+//   0x4e1b FwRead      a1 = SIo { 0; byte offset; len <= 64 KB; buf }, a2 = "IMAGE/NAME.EXT" (8.3, in a 32-byte
+//                      buffer): a file of modem_a's FAT16, read-only, for MODEMD's TFTP reads (the modem's WLAN
+//                      domain loads IMAGE/WLANMDSP.MBN, docs wifi.md W0). len 0 -> its size; else the bytes read
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
@@ -41,7 +44,7 @@ TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
 __attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupported; }
 
 enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
-	EChanRecv, EAudio };
+	EChanRecv, EAudio, EFwRead = 0x4e1b };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -235,6 +238,47 @@ static TInt PartRead(const SIo& aIo)
 	return r;
 	}
 
+// a file of the modem's firmware partition (modem_a, FAT16) by its 8.3 path under IMAGE/
+static TInt FwRead(const SIo& aIo, const TAny* aUserPath)
+	{
+	char path[32];
+	kumemget(path, aUserPath, sizeof(path) - 1);
+	path[sizeof(path) - 1] = 0;
+	TInt n = 0;
+	for (; path[n]; ++n)
+		{
+		char c = path[n];
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+			(c == '.' && n && path[n - 1] != '.') || (c == '/' && n == 5)))
+			return KErrArgument;
+		}
+	if (n < 7 || memcompare((const TUint8*)path, 6, (const TUint8*)"IMAGE/", 6) || aIo.iLen > (TUint32)KChunk)
+		return KErrArgument;
+	TInt r = Fat_Mount("modem_a");						// one volume at a time; the modem's boot is past it
+	SFatFile f;
+	if (r == KErrNone)
+		r = Fat_Find(path, f);
+	if (r != KErrNone)
+		return r;
+	if (!aIo.iLen)
+		return (TInt)f.iSize;
+	if (aIo.iB >= f.iSize)
+		return 0;
+	TUint32 len = Min(aIo.iLen, f.iSize - aIo.iB);
+	NKern::ThreadEnterCS();
+	TUint8* k = (TUint8*)Kern::Alloc(len);
+	NKern::ThreadLeaveCS();
+	if (!k)
+		return KErrNoMemory;
+	r = Fat_Read(f, aIo.iB, k, len);
+	if (r == KErrNone)
+		kumemput((TAny*)aIo.iBuf, k, len);
+	NKern::ThreadEnterCS();
+	Kern::Free(k);
+	NKern::ThreadLeaveCS();
+	return r == KErrNone ? (TInt)len : r;
+	}
+
 static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 	{
 	TInt r = RmtfsMap();
@@ -356,6 +400,12 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		SIo io;
 		kumemget32(&io, a1, sizeof(io));
 		return A64Audio_Control(io.iA, io.iB);
+		}
+	case EFwRead:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		return FwRead(io, a2);
 		}
 		}
 	return KErrNotSupported;

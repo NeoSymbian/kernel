@@ -12,13 +12,18 @@
 // reset, or a failed start or stop, restarts the controller (halt, core reset, bring-up), the one thing that frees
 // a quarantined endpoint. After startup only the poll DFC (UsbQ) touches the controller and the DMA area.
 // The link's suspend and resume (a host asleep) are logged and counted.
-// shortcut: polled every 1 ms on its own DFC queue, no interrupt; HS only; one function.
+// Functions: the monitor's ACM (KA64UsbFunction) and, in USBDEBUG=1 builds, fshell's ACM (A64UsbDebugFunction()): two
+// make the device composite (an IAD before each function, device class EF/02/01). A64Usb_Doorbell() raises SGI 7 (a
+// software interrupt, A64_BindSgi), so a function's iIsr runs in interrupt context, as ECOMM's PDD callbacks must.
+// (DWC3's own SPI 133 was tried: it fires during traffic despite the masked event interrupt, thousands a second.)
+// shortcut: polled every 1 ms on its own DFC queue, no interrupt; HS only; two functions at most.
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_usb_function.h"
 #include "a64_usb_dma.h"
 #include "a64_usb_link.h"
 #include "qcom_rpmh.h"
+#include <nkernsmp/arm64/a64_platform.h>
 
 const TUint32 KDwc3 = 0x0a600000;
 const TUint32 KQscratch = 0x0a6f8800, KQusb2 = 0x088e2000;	// the Qualcomm wrapper; the HS PHY (qusb2-v2)
@@ -39,21 +44,29 @@ enum { ETrbNormal = 1 << 4, ETrbSetup = 2 << 4, ETrbStatus2 = 3 << 4, ETrbStatus
 enum { EEvXferComplete = 1, EEvXferNotReady = 3, EEvCommandComplete = 7 };
 enum { EDevDisconnect = 0, EDevReset = 1, EDevConnectDone = 2 };
 enum { EPhysEp0Out = 0, EPhysEp0In = 1 };
-const TInt KEp0Max = 64, KPhysEps = 8;
+const TInt KEp0Max = 64, KPhysEps = 16;
 const TInt KMaxEvents = 64;									// per pass; the rest stay in the ring for the next
 const TUint32 KStopTimeout = 2000;							// ticks (ms) for an ENDTRANSFER to complete
 
 // DMA area, physically contiguous and mapped non-cached: event buffer, TRBs, setup packet, EP0 data, then the
 // function's endpoint buffers (from EOffEpBufs, in its endpoint order)
-const TInt KAreaSize = 0x4000, KEvSize = 4096;
+const TInt KAreaSize = 0x8000, KEvSize = 4096;
 enum { EOffEv = 0x0000, EOffTrb = 0x1000, EOffSetup = 0x1100, EOffEp0Buf = 0x1200, EOffEpBufs = 0x2000 };
 static TPhysAddr AreaPhys;
 static TLinAddr Area;
 static TUint32 EvPos;
 
-static const SA64UsbFunction& Fn = KA64UsbFunction;
+const TInt KMaxFns = 2;
+const TUint32 KDoorbellSgi = 7;								// a software interrupt (the IPIs use SGI 0-4)
+static const SA64UsbFunction* Fns[KMaxFns];
+static TInt FnCount, Interfaces;
 static TInt BufOff[KPhysEps], Armed[KPhysEps];				// each endpoint's buffer; the length its transfer was armed with
-static TUint32 FnMask;										// the function's endpoints
+static TInt EpOwner[KPhysEps];								// the function an endpoint belongs to
+static TUint32 FnMask;										// the functions' endpoints
+static TUint8 Device[18], Qualifier[10], Config[256];		// the device's descriptors (the core composes them)
+static TInt ConfigLen;
+static TBool DoorbellBound;
+static TInt OutDataFn;										// the function whose class request has a data stage
 
 struct STrb { TUint32 iBpl, iBph, iSize, iCtrl; };
 static volatile STrb* Trb(TInt aPhysEp) { return (volatile STrb*)(Area + EOffTrb + 16 * aPhysEp); }
@@ -212,10 +225,10 @@ static TInt StringDesc(TInt aIndex, TUint8* aBuf)
 		aBuf[0] = 4; aBuf[1] = 3; aBuf[2] = 0x09; aBuf[3] = 0x04;
 		return 4;
 		}
-	if (aIndex >= Fn.iStringCount)
+	if (aIndex >= Fns[0]->iStringCount)
 		return -1;
 	TInt n = 0;
-	for (const char* s = Fn.iStrings[aIndex]; *s; ++s, ++n)
+	for (const char* s = Fns[0]->iStrings[aIndex]; *s; ++s, ++n)
 		{
 		aBuf[2 + 2 * n] = (TUint8)*s;
 		aBuf[3 + 2 * n] = 0;
@@ -228,9 +241,10 @@ static TInt StringDesc(TInt aIndex, TUint8* aBuf)
 static TInt Configure()
 	{
 	TInt r = DepCmd(EPhysEp0Out, ECmdStartCfg | (2 << 16));	// transfer resources for the other endpoints
-	for (TInt i = 0; r == KErrNone && i < Fn.iEndpointCount; ++i)
+	for (TInt f = 0; f < FnCount; ++f)
+	for (TInt i = 0; r == KErrNone && i < Fns[f]->iEndpointCount; ++i)
 		{
-		const SA64UsbEndpoint& e = Fn.iEndpoints[i];
+		const SA64UsbEndpoint& e = Fns[f]->iEndpoints[i];
 		r = EpConfig(e.iPhysEp, e.iType, e.iMaxPacket, 0, e.iInterval);
 		if (r == KErrNone)
 			r = DepCmd(e.iPhysEp, ECmdSetXferRes, 1);
@@ -238,7 +252,8 @@ static TInt Configure()
 			R(EDalepena) |= 1u << e.iPhysEp;
 		}
 	if (r == KErrNone)
-		r = Fn.iConfigured();
+		for (TInt f = 0; r == KErrNone && f < FnCount; ++f)
+			r = Fns[f]->iConfigured();
 	Configured = r == KErrNone;
 	return r;
 	}
@@ -280,7 +295,8 @@ static void EndSession()
 	{
 	PendingConfig = DeferredStatusEp = -1;
 	Configured = EFalse;
-	Fn.iReset();
+	for (TInt f = 0; f < FnCount; ++f)
+		Fns[f]->iReset();
 	StopFunction();
 	}
 
@@ -295,17 +311,17 @@ static void HandleSetup()
 	TUint8* buf = (TUint8*)(Area + EOffEp0Buf);
 	TInt in = -1;											// bytes to send, -1 = none
 	TBool out = EFalse, ok = ETrue;
-	const TUint16 interfaces = Fn.iConfig[4];				// bNumInterfaces
+	const TUint16 interfaces = Interfaces;
 	if ((type & 0x60) == 0x00)								// standard
 		switch (req)
 			{
 		case 6:												// GET_DESCRIPTOR
 			switch (value >> 8)
 				{
-			case 1: memcpy(buf, Fn.iDevice, Fn.iDeviceLen); in = Fn.iDeviceLen; break;
-			case 2: memcpy(buf, Fn.iConfig, Fn.iConfigLen); in = Fn.iConfigLen; break;
+			case 1: memcpy(buf, Device, sizeof(Device)); in = sizeof(Device); break;
+			case 2: memcpy(buf, Config, ConfigLen); in = ConfigLen; break;
 			case 3: in = StringDesc(value & 0xff, buf); ok = in >= 0; break;
-			case 6: memcpy(buf, Fn.iQualifier, Fn.iQualifierLen); in = Fn.iQualifierLen; break;
+			case 6: memcpy(buf, Qualifier, sizeof(Qualifier)); in = sizeof(Qualifier); break;
 			default: ok = EFalse; break;
 				}
 			break;
@@ -348,7 +364,13 @@ static void HandleSetup()
 			}
 	else if ((type & 0x60) == 0x20)						// class: the function's
 		{
-		TInt r = Fn.iClassSetup(Setup, buf);
+		TInt r = KA64UsbStall;								// to the function that owns the interface (wIndex)
+		for (TInt f = 0; f < FnCount; ++f)
+			if (Setup[4] >= Fns[f]->iFirstInterface && Setup[4] < Fns[f]->iFirstInterface + Fns[f]->iInterfaceCount)
+				{
+				r = Fns[f]->iClassSetup(Setup, buf);
+				OutDataFn = f;
+				}
 		ok = r != KA64UsbStall;
 		out = r == KA64UsbDataOut;
 		if (r >= 0)
@@ -389,7 +411,7 @@ static void Ep0Event(TInt aPhysEp, TInt aType, TInt aStatus)
 			Ep0 = EWaitStatus3Out;
 		else if (Ep0 == EDataOut)
 			{
-			Fn.iClassOutData(Setup, (const TUint8*)(Area + EOffEp0Buf));
+			Fns[OutDataFn]->iClassOutData(Setup, (const TUint8*)(Area + EOffEp0Buf));
 			Ep0 = EWaitStatus3In;
 			}
 		else if (Ep0 == EStatus)
@@ -446,7 +468,7 @@ void A64Usb_ProcessEvents()
 			if (ep <= 1)
 				Ep0Event(ep, type, status);
 			else if (type == EEvXferComplete && Dma.Completed(ep))	// else: a stop is pending, or it's an old one
-				Fn.iXferComplete(ep, Armed[ep] - (TInt)(Trb(ep)->iSize & 0xffffff));
+				Fns[EpOwner[ep]]->iXferComplete(ep, Armed[ep] - (TInt)(Trb(ep)->iSize & 0xffffff));
 			}
 		else if (((e >> 1) & 0x7f) == 0)					// a device event
 			{
@@ -630,7 +652,8 @@ static void PollDfcFn(TAny*)
 		if (Restart)
 			RestartController();
 		if (Running && !Restart)
-			Fn.iPoll();
+			for (TInt f = 0; f < FnCount; ++f)
+				Fns[f]->iPoll();
 		if (Restart)										// the function's writer polled events, too
 			RestartController();
 		}
@@ -668,7 +691,59 @@ void A64UsbCold(TDes8& aOut, TInt aMask)
 	r = Bringup();
 	if (r != KErrNone)
 		Kern::Printf("[usb] cold: bring-up failed %d; DMA kept", r);
-	Fn.iDump();
+	for (TInt f = 0; f < FnCount; ++f)
+		Fns[f]->iDump();
+	}
+
+// the device, qualifier and configuration descriptors from the functions': one function = its own bytes; two = composite
+static TInt ComposeDescriptors()
+	{
+	memcpy(Device, Fns[0]->iDevice, sizeof(Device));
+	memcpy(Qualifier, Fns[0]->iQualifier, sizeof(Qualifier));
+	const TBool composite = FnCount > 1;
+	if (composite)											// "Interface Association Descriptor" device class
+		{
+		Device[4] = Qualifier[4] = 0xef;
+		Device[5] = Qualifier[5] = 0x02;
+		Device[6] = Qualifier[6] = 0x01;
+		}
+	TInt len = 9;
+	Interfaces = 0;
+	for (TInt f = 0; f < FnCount; ++f)
+		{
+		const SA64UsbFunction& fn = *Fns[f];
+		if (len + 8 + fn.iFragmentLen > (TInt)sizeof(Config))
+			return KErrOverflow;
+		if (composite)										// IAD: first interface, count, class (the function's first)
+			{
+			const TUint8 iad[8] = { 8, 0x0b, (TUint8)fn.iFirstInterface, (TUint8)fn.iInterfaceCount,
+				fn.iFragment[5], fn.iFragment[6], fn.iFragment[7], 0 };
+			memcpy(Config + len, iad, 8);
+			len += 8;
+			}
+		memcpy(Config + len, fn.iFragment, fn.iFragmentLen);
+		len += fn.iFragmentLen;
+		Interfaces += fn.iInterfaceCount;
+		}
+	const TUint8 header[9] = { 9, 2, (TUint8)len, (TUint8)(len >> 8), (TUint8)Interfaces, 1, 0, 0x80, 50 };	// 100 mA
+	memcpy(Config, header, 9);
+	ConfigLen = len;
+	return KErrNone;
+	}
+
+__attribute__((weak)) const SA64UsbFunction* A64UsbDebugFunction() { return NULL; }	// a64_usb_acm_debug.cpp
+
+void A64Usb_Doorbell()
+	{
+	if (DoorbellBound)
+		A64_RaiseSgi(KDoorbellSgi);
+	}
+
+static void DoorbellIsr(TAny*)
+	{
+	for (TInt f = 0; f < FnCount; ++f)
+		if (Fns[f]->iIsr)
+			Fns[f]->iIsr();
 	}
 
 void A64StartUsbConsole()
@@ -698,18 +773,25 @@ void A64StartUsbConsole()
 		R(EDcfg), R(EGctl));
 	if ((id >> 16) != 0x5533)
 		return;
-	TInt off = EOffEpBufs;									// the function's endpoint buffers
-	for (TInt i = 0; i < Fn.iEndpointCount; ++i)
+	Fns[FnCount++] = &KA64UsbFunction;
+	if (A64UsbDebugFunction())
+		Fns[FnCount++] = A64UsbDebugFunction();
+	if (ComposeDescriptors() != KErrNone)
+		return;
+	TInt off = EOffEpBufs;									// the functions' endpoint buffers
+	for (TInt f = 0; f < FnCount; ++f)
+	for (TInt i = 0; i < Fns[f]->iEndpointCount; ++i)
 		{
-		const SA64UsbEndpoint& e = Fn.iEndpoints[i];
-		if (e.iPhysEp < 2 || e.iPhysEp >= KPhysEps || off + e.iBufSize > KAreaSize)
+		const SA64UsbEndpoint& e = Fns[f]->iEndpoints[i];
+		if (e.iPhysEp < 2 || e.iPhysEp >= KPhysEps || off + e.iBufSize > KAreaSize || (FnMask & (1u << e.iPhysEp)))
 			{
-			Kern::Printf("[usb] function endpoint %d (phys %d, buffer %d) doesn't fit", i, e.iPhysEp, e.iBufSize);
+			Kern::Printf("[usb] function %d endpoint %d (phys %d, buffer %d) doesn't fit", f, i, e.iPhysEp, e.iBufSize);
 			return;
 			}
 		BufOff[e.iPhysEp] = off;
 		off += e.iBufSize;
 		FnMask |= 1u << e.iPhysEp;
+		EpOwner[e.iPhysEp] = f;
 		}
 	NKern::ThreadEnterCS();
 	TInt r = Epoc::AllocPhysicalRam(KAreaSize, AreaPhys, 12);
@@ -734,13 +816,17 @@ void A64StartUsbConsole()
 		return;
 		}
 	Area = chunk->LinearAddress();
+	for (TInt f = 0; f < FnCount; ++f)
+		if (Fns[f]->iIsr && !DoorbellBound)
+			DoorbellBound = A64_BindSgi(KDoorbellSgi, DoorbellIsr, NULL) == KErrNone;
 	r = Bringup();
 	if (r != KErrNone)
 		{
 		Kern::Printf("[usb] controller startup failed %d; DMA area kept", r);
 		return;
 		}
-	Fn.iDump();
+	for (TInt f = 0; f < FnCount; ++f)
+		Fns[f]->iDump();
 
 	PollDfc.SetDfcQ(UsbQ);
 	PollTimer.OneShot(1);

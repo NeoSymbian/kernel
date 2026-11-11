@@ -806,9 +806,22 @@ static TInt ComposeDescriptors()
 __attribute__((weak)) const SA64UsbFunction* A64UsbDebugFunction() { return NULL; }	// a64_usb_acm_debug.cpp
 __attribute__((weak)) TBool A64UsbDebugAtBoot() { return EFalse; }
 
+// a normal boot leaves USB off until USB debugging is switched on (T12); then both ports come up, as adb does
+static TBool Deferred, ForceOn;
+void A64StartUsbConsole();
+
 // USB debugging on or off (HAL 0x4e04, the monitor's "usb dbg"): any thread; the poll DFC applies it
 TInt A64UsbDebugSet(TInt aOn)
 	{
+	if (Deferred)											// a normal boot: power USB up in this (the caller's) thread
+		{
+		if (!aOn)
+			return KErrNone;
+		Deferred = EFalse;
+		ForceOn = ETrue;
+		A64StartUsbConsole();
+		// shortcut: "off" afterwards drops fshell only; the monitor stays until a reboot (add A64UsbPowerOff if wanted)
+		}
 	if (FnCount < 2)
 		return KErrNotSupported;							// no debug function, or USB never started
 	WantFns = aOn ? 2 : 1;
@@ -838,14 +851,16 @@ void A64StartUsbConsole()
 	// ABL powers the USB controller only for fastboot: after a normal boot (the phone installed) its power domain and
 	// clocks are off, and a DWC3 register access would stall the bus -- so look at them first (usb30_prim GDSC 0xf004
 	// PWR_ON bit 31, master clock 0xf00c CLK_OFF bit 31). Off: only in dev mode (the kernel console on at boot,
-	// CONSOLE=1) does the debug console power USB itself (qcom_usbpower.cpp) -- it gives full control of the phone.
+	// CONSOLE=1) does the debug console power USB itself (qcom_usbpower.cpp) -- it gives full control of the phone --
+	// or later, when Settings turns USB debugging on (A64UsbDebugSet).
 	// A fastboot RAM boot keeps it as before: whoever can RAM-boot holds the phone already.
 	const TUint32 gdsc = *(volatile TUint32*)A64_Io(0x0010f004), master = *(volatile TUint32*)A64_Io(0x0010f00c);
 	if (!(gdsc & (1u << 31)) || (master & (1u << 31)))
 		{
-		if (!A64_ConsoleShown())
+		if (!A64_ConsoleShown() && !ForceOn)
 			{
-			Kern::Printf("[usb] controller off (a normal boot) and not in dev mode: no USB debug console");
+			Deferred = ETrue;
+			Kern::Printf("[usb] normal boot: USB off until USB debugging is on");
 			return;
 			}
 		TUint32 pll = 0;
@@ -863,7 +878,7 @@ void A64StartUsbConsole()
 	Fns[FnCount++] = &KA64UsbFunction;
 	if (A64UsbDebugFunction())
 		Fns[FnCount++] = A64UsbDebugFunction();
-	ActiveFns = WantFns = A64UsbDebugAtBoot() ? FnCount : 1;
+	ActiveFns = WantFns = A64UsbDebugAtBoot() || ForceOn ? FnCount : 1;
 	if (ComposeDescriptors() != KErrNone)
 		return;
 	TInt off = EOffEpBufs;									// the functions' endpoint buffers

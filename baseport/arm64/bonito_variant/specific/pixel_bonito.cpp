@@ -77,6 +77,7 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x62b48000, 0x00004000, 1 },		// LPASS LPI TLMM gpio8-11: the amps' TDM (i2s1; touched once the ADSP is up)
 	{ 0x0ae00000, 0x00090000, 1 },		// MDSS + MDP (DPU): ABL's splash pipeline, read for the DSI work (D2 display)
 	{ 0x0ae94000, 0x00001000, 1 },		// DSI0 controller (+0) and its 10-nm PHY (+0x400): the SOFEF00 panel
+	{ 0x9a027000, 0x00001000, 2 },		// ABL's DSI command packet page (RAM outside our bank): qcom_dsi.cpp's packets
 	{ 0x9e3e0000, 0x00020000, 2 },		// the log ring that survives a reset (a64_dbgmon.cpp lastlog): the tail of
 										// the DTB's no-map framebuffer-region, kept by ABL across PSCI and watchdog resets
 	};

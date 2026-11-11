@@ -23,6 +23,9 @@
 //   0x4e1b FwRead      a1 = SIo { 0; byte offset; len <= 64 KB; buf }, a2 = "IMAGE/NAME.EXT" (8.3, in a 32-byte
 //                      buffer): a file of modem_a's FAT16, read-only, for MODEMD's TFTP reads (the modem's WLAN
 //                      domain loads IMAGE/WLANMDSP.MBN, docs wifi.md W0). len 0 -> its size; else the bytes read
+//   0x4e1c WlanMsa     a1 = SIo { op 1 assign, 0 release; phys; size; secure }: a region of the Wi-Fi firmware's MSA
+//                      carve-out (DTB wlan-msa 0x94d00000 + 1 MB) handed from HLOS to MSS_MSA + WLAN (+ WLAN_CE unless
+//                      secure) and back, as Linux ath10k_qmi_map_msa_permission (docs wifi.md W1)
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
@@ -44,7 +47,7 @@ TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
 __attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupported; }
 
 enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
-	EChanRecv, EAudio, EFwRead = 0x4e1b };
+	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -279,6 +282,48 @@ static TInt FwRead(const SIo& aIo, const TAny* aUserPath)
 	return r == KErrNone ? (TInt)len : r;
 	}
 
+// the Wi-Fi firmware's MSA regions (ath10k qmi.c): at most two, inside the carve-out, each with its current owners
+const TUint32 KWlanMsaPhys = 0x94d00000, KWlanMsaSize = 0x100000, KVmidWlan = 0x18, KVmidWlanCe = 0x19;
+static struct { TUint32 iPhys, iSize; TUint64 iOwners; } Msa[2];
+
+static TInt WlanMsa(const SIo& aIo)
+	{
+	TUint32 phys = aIo.iB, size = aIo.iLen;
+	if (aIo.iA > 1 || !size || (phys | size) & 0xfff || phys < KWlanMsaPhys || size > KWlanMsaSize ||
+		phys - KWlanMsaPhys > KWlanMsaSize - size)
+		return KErrArgument;
+	TInt slot = -1;
+	for (TInt i = 0; i < 2; ++i)
+		if (Msa[i].iSize && Msa[i].iPhys == phys && Msa[i].iSize == size)
+			slot = i;
+	if (aIo.iA == 1)											// assign
+		{
+		if (slot >= 0)
+			return KErrNone;									// already the firmware's
+		for (TInt i = 0; i < 2 && slot < 0; ++i)
+			if (!Msa[i].iSize)
+				slot = i;
+		if (slot < 0)
+			return KErrOverflow;
+		SScmVmPerm dst[3] = { { KScmVmidMssMsa, KScmPermRw }, { KVmidWlan, KScmPermRw }, { KVmidWlanCe, KScmPermRw } };
+		TUint64 owners = 1ull << KScmVmidHlos;
+		TInt r = Scm_AssignMem(phys, size, owners, dst, aIo.iBuf ? 2 : 3);	// iBuf = secure: no WLAN_CE
+		if (r != KErrNone)
+			return r;
+		Msa[slot].iPhys = phys;
+		Msa[slot].iSize = size;
+		Msa[slot].iOwners = owners;
+		return KErrNone;
+		}
+	if (slot < 0)
+		return KErrNotFound;
+	SScmVmPerm hlos = { KScmVmidHlos, KScmPermRw };				// release: back to us
+	TInt r = Scm_AssignMem(phys, size, Msa[slot].iOwners, &hlos, 1);
+	if (r == KErrNone)
+		Msa[slot].iSize = 0;
+	return r;
+	}
+
 static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 	{
 	TInt r = RmtfsMap();
@@ -406,6 +451,12 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		SIo io;
 		kumemget32(&io, a1, sizeof(io));
 		return FwRead(io, a2);
+		}
+	case EWlanMsa:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		return WlanMsa(io);
 		}
 		}
 	return KErrNotSupported;

@@ -638,6 +638,17 @@ class Shell:
             text.extend(self.stream.read(4096, deadline))
             del text[:-4096]
 
+    def ready(self, deadline):
+        """Enter until a prompt comes back. A shell that has just started (USB debugging switched on, a restart)
+        drops what was typed before it opened its console (vt100busdevcons ResetBuffers): the command was lost."""
+        while True:
+            self.stream.write(b"\r", deadline)
+            try:
+                return self.prompt(min(deadline, time.monotonic() + 2))
+            except DeadlineExpired:
+                if time.monotonic() >= deadline:
+                    raise
+
     def finish(self, nonce, deadline):
         marker = re.compile(rb"END_" + nonce.encode() + rb" ([-+]?\d{1,10})\n?$")
         output = bytearray()
@@ -879,6 +890,7 @@ def run_cli(verb, args, connection):
     try:
         with SerialConnection(port) as stream:
             shell = Shell(stream, options.timeout, options.idle_timeout)
+            shell.ready(time.monotonic() + options.timeout)
             if verb == "sh":
                 if options.command is None:
                     interactive(stream)

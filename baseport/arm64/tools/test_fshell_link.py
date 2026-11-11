@@ -170,6 +170,9 @@ class FakeNative:
             while not line.endswith(b"\r"):
                 line.extend(exact(fd, 1))
             text = line.decode("ascii").rstrip("\r")
+            if not text:  # Enter at the prompt (Shell.ready): a new prompt
+                os.write(fd, b"\r\nc:\\>")
+                continue
             nonce = re.search(r"echo BEGIN_([0-9a-f]+)", text)[1]
             # The echoed command contains nonce text and $?; it is not a completion record.
             os.write(fd, bytes(line) + b"\n\x1b[2KBEGIN_" + nonce.encode() + b"\r\n")
@@ -700,6 +703,15 @@ class ShellTests(unittest.TestCase):
             self.assertEqual(
                 sum(c.startswith("ymodem send ") for c in peer.commands), 1
             )
+
+    def test_ready_retries_until_a_fresh_shell_reads(self):
+        def peer(fd):
+            assert exact(fd, 1) == b"\r"  # typed before the console opened: dropped
+            assert exact(fd, 1) == b"\r"
+            os.write(fd, b"\x1bc\x1b[2J\r\nc:\\>")
+
+        with pair(peer) as stream:
+            debug.Shell(stream, timeout=10, idle=1).ready(time.monotonic() + 10)
 
     def test_completion_requires_exact_nonce_and_status(self):
         def peer(fd):

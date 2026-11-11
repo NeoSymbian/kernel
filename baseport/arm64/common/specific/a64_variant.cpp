@@ -55,10 +55,15 @@ public:
 //   ENeoHalBootOk      no arguments -> mark the booted A/B slot "successful" for ABL (FS5b; neoui calls it once the
 //                      launcher is drawn). KErrNone if done or already set; KErrNotSupported without A/B slots
 // Reading needs ReadDeviceData, switching the console and ENeoHalBootOk WriteDeviceData. Each read fills at most
-// 1024 bytes. 0x4e04/0x4e05 are kept for the dev-mode switch.
+// 1024 bytes.
+//   ENeoHalUsbDebugSet a1 = 1 on / 0 off -> USB debugging: fshell's ACM port joins (or leaves) the USB device and the
+//                      host re-enumerates (Settings -> Developer, docs debug-access.md; WriteDeviceData).
+//                      KErrNotSupported without it (QEMU: its second serial port is always there)
+//   ENeoHalUsbDebugGet a1 = TInt* out -> 1 on, 0 off
 //   ENeoHalSlotInfo    a1 = TDes8* -> one line: the booted A/B slot and both slots' state (ReadDeviceData)
 //   ENeoHalBuildInfo   a1 = TDes8* -> this kernel's build: "kernel <commit>[+dirty] <UTC time> <board>" (no capability)
-enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalBootOk = 0x4e06,
+enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalUsbDebugSet,
+	ENeoHalUsbDebugGet, ENeoHalBootOk = 0x4e06,
 	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c, ENeoHalDeviceList = 0x4e19 };
 //   ENeoHalPower       a1 = 0 restart, 1 restart to fastboot, 2 power off (PowerMgmt). Returns only on a failure; the
 //                      caller finalises the drives first (neoui's Power menu)
@@ -73,6 +78,8 @@ void A64_RebootToFastboot();
 TInt A64_PowerOff();
 TInt A64_RtcSeconds(TUint32& aSecs);						// qcom_rtc.cpp
 __attribute__((weak)) TInt A64Tel_Hal(TInt, TAny*, TAny*) { return KErrNotSupported; }	// qcom_telhal.cpp
+__attribute__((weak)) TInt A64UsbDebugSet(TInt) { return KErrNotSupported; }		// qcom_dwc3.cpp
+__attribute__((weak)) TInt A64UsbDebugGet() { return 0; }
 #ifndef NEO_BUILD_KERNEL
 #define NEO_BUILD_KERNEL "kernel unknown"				// build-ekern.sh passes the real one
 #endif
@@ -108,6 +115,17 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 			return KErrPermissionDenied;
 		A64_ConsoleShow((TInt)a1);
 		return KErrNone;
+	case ENeoHalUsbDebugSet:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityWriteDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian USB debugging")))
+			return KErrPermissionDenied;
+		Kern::Printf("[usb] USB debugging requested %d", (TInt)a1);
+		return A64UsbDebugSet((TInt)a1);
+	case ENeoHalUsbDebugGet:
+		{
+		TInt on = A64UsbDebugGet();
+		kumemput32(a1, &on, sizeof(on));
+		return KErrNone;
+		}
 	case ENeoHalBootOk:
 		{
 		if (!Kern::CurrentThreadHasCapability(ECapabilityWriteDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian boot OK")))

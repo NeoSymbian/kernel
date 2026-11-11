@@ -166,6 +166,11 @@ static const SA64UsbFunction KFunction = {
 	KEndpoints, sizeof(KEndpoints) / sizeof(KEndpoints[0]),
 	ClassSetup, ClassOutData, Ready, Reset, XferComplete, Poll, Dump, Isr,
 	};
+#ifndef A64_USBDEBUG
+#define A64_USBDEBUG 0
+#endif
+TBool A64UsbDebugAtBoot() { return A64_USBDEBUG; }		// USBDEBUG=1 test images; else Settings turns it on
+
 const SA64UsbFunction* A64UsbDebugFunction() { return &KFunction; }
 
 // ---- the ECOMM PDD (Comm.UsbAcm, unit 1)

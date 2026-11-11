@@ -53,7 +53,7 @@ TBool A64Usb_Configured();
 void A64Usb_Doorbell();										// any context: run the functions' iIsr soon, in an interrupt
 struct SA64UsbStats
 	{
-	TInt iEvents, iResets, iSetups, iEp0, iRestarts, iSuspends, iResumes;
+	TInt iEvents, iResets, iSetups, iEp0, iRestarts, iSuspends, iResumes, iFunctions;
 	TBool iConfigured;
 	TUint32 iDsts, iSetupLog[6], iDmaOwned, iDmaPending, iDmaQuarantined;
 	};

@@ -6,18 +6,29 @@ markers with their real exit status, and binary-safe YMODEM file transfer checke
     Shell(Stream(fd)).execute("ls")          -> Result(status, output)
     Shell(Stream(fd)).push(local, "C:\\x")   / .pull("C:\\x", local)
 
-Users: tools/test-fshell-qemu.py (QEMU's second serial port); phone.py later (roadmap T9).
+On the phone (USBDEBUG builds) the fshell port is found by USB interface (ioreg) and locked per port; phone.py's
+`sh`, `push` and `pull` call run_cli. Users: tools/phone.py, tools/test-fshell-qemu.py (QEMU's second serial port).
 """
 
+import argparse
 import binascii
+import fcntl
 import hashlib
 import io
+import math
 import os
+import plistlib
+import pwd
 import re
 import secrets
 import select
+import struct
+import subprocess
+import sys
 import tempfile
+import termios
 import time
+import tty
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +61,166 @@ class RemoteError(DebugError):
     def __init__(self, status, output=b""):
         super().__init__(f"native command exited {status}")
         self.status, self.output = status, output
+
+
+@dataclass(frozen=True)
+class Port:
+    path: str
+    device: str
+    serial: str
+    location: int
+    interface: int
+    role: str
+
+
+def ports_from_registry(registry):
+    """Walk IOUSBHostDevice subtrees, inheriting device/interface properties."""
+    found = {}
+
+    def visit(node, device=None, interface=None):
+        if not isinstance(node, dict):
+            return
+        # a device node has its descriptor's bDeviceClass; interfaces and the ACM data driver carry idVendor too
+        if "idVendor" in node and "idProduct" in node and "bDeviceClass" in node:
+            vendor, product = node["idVendor"], node["idProduct"]
+            if vendor == USB_VENDOR and product == USB_PRODUCT:
+                serial = str(
+                    node.get("USB Serial Number", node.get("USBSerialNumber", ""))
+                )
+                location = node.get("locationID", 0)
+                if not isinstance(location, int):
+                    location = 0
+                identity = (
+                    f"{vendor:04x}:{product:04x}:{serial or 'noserial'}@{location:08x}"
+                )
+                device = (identity, serial, location)
+            else:
+                device = None
+            interface = None
+        if isinstance(node.get("bInterfaceNumber"), int):
+            interface = node["bInterfaceNumber"]
+        path = node.get("IOCalloutDevice")
+        if device and isinstance(path, str) and interface in (0, 1, 2, 3):
+            role = "monitor" if interface < 2 else "shell"
+            found[path] = Port(path, *device, interface, role)
+        for child in node.get("IORegistryEntryChildren", []):
+            visit(child, device, interface)
+
+    for node in registry if isinstance(registry, list) else [registry]:
+        visit(node)
+    return sorted(found.values(), key=lambda p: (p.device, p.interface, p.path))
+
+
+def discover_ports():
+    if sys.platform != "darwin":
+        raise DebugError(
+            "automatic USB discovery requires macOS; select an explicit serial port"
+        )
+    try:
+        proc = subprocess.run(
+            ["/usr/sbin/ioreg", "-a", "-l", "-r", "-c", "IOUSBHostDevice"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode:
+            raise DebugError(f"IORegistry discovery exited {proc.returncode}")
+        return ports_from_registry(plistlib.loads(proc.stdout))
+    except (
+        OSError,
+        ValueError,
+        plistlib.InvalidFileException,
+        subprocess.TimeoutExpired,
+    ) as error:
+        raise DebugError(f"cannot discover USB serial functions: {error}") from error
+
+
+def select_port(role, *, device=None, override=None, ports=None):
+    if override:
+        return override
+    candidates = [
+        p for p in (discover_ports() if ports is None else ports) if p.role == role
+    ]
+    if device:
+        candidates = [
+            p
+            for p in candidates
+            if device
+            in (
+                p.device,
+                p.serial,
+                f"{p.location:x}",
+                f"0x{p.location:x}",
+            )
+        ]
+    if len(candidates) > 1:
+        identities = ", ".join(f"{p.device} ({p.path})" for p in candidates)
+        raise DebugError(
+            f"ambiguous {role} port: {identities}; use --device or --{role}-port"
+        )
+    return candidates[0].path if candidates else None
+
+
+def connection_options(argv):
+    """Common selectors may precede or follow the verb; -- protects command text."""
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--device")
+    parser.add_argument("--monitor-port")
+    parser.add_argument("--shell-port")
+    return parser.parse_known_args(argv)
+
+
+class PortLock:
+    """Keep the inode after unlocking so waiting clients cannot lock different files."""
+
+    def __init__(self, port, directory=None):
+        identity = os.path.realpath(port)
+        if sys.platform == "darwin" and os.path.dirname(identity) == "/dev":
+            # macOS exposes a callout and dial-in node for one serial endpoint. Their device numbers differ,
+            # so neither realpath nor st_rdev alone makes cu.<name> and tty.<name> share a lock.
+            name = os.path.basename(identity)
+            if name.startswith(("cu.", "tty.")):
+                identity = "/dev/serial." + name.split(".", 1)[1]
+        key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+        self.private_cache = directory is None
+        if directory is None:
+            uid = os.getuid()
+            home = Path(pwd.getpwuid(uid).pw_dir)
+            if not home.is_absolute():
+                raise DebugError(
+                    "the current OS user has no absolute home directory for serial locks"
+                )
+            cache = (
+                home / "Library/Caches/NeoSymbian"
+                if sys.platform == "darwin"
+                else home / ".cache/neosymbian"
+            )
+            directory = cache / f"serial-locks-{uid}"
+        self.path = Path(directory) / f"neosymbian-shell-{key}.lock"
+        self.fd = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.private_cache:
+            self.path.parent.chmod(0o700)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        self.fd = os.open(self.path, flags, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException as error:
+            os.close(self.fd)
+            self.fd = None
+            if isinstance(error, BlockingIOError):
+                raise BusyError(
+                    "shell port is busy with another command or transfer"
+                ) from error
+            raise
+        return self
+
+    def __exit__(self, *unused):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 
 class Stream:
@@ -123,6 +294,51 @@ class Stream:
                 raise DebugError(
                     "terminal line exceeds the client limit; use file transfer for large data"
                 )
+
+
+class SerialConnection(Stream):
+    def __init__(self, port):
+        self.lock, self.old_termios, self.fd = PortLock(port), None, None
+        self.lock.__enter__()
+        try:
+            fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            self.fd = fd
+            self.old_termios = termios.tcgetattr(fd)
+            attrs = termios.tcgetattr(fd)
+            attrs[0] = attrs[1] = attrs[3] = 0
+            attrs[2] = attrs[2] & ~(termios.CSIZE | termios.PARENB | termios.CSTOPB)
+            attrs[2] |= termios.CLOCAL | termios.CREAD | termios.CS8
+            attrs[4] = attrs[5] = termios.B115200
+            attrs[6][termios.VMIN] = attrs[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            fcntl.ioctl(fd, termios.TIOCMBIS, struct.pack("I", termios.TIOCM_DTR))
+            super().__init__(fd)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                fcntl.ioctl(
+                    self.fd, termios.TIOCMBIC, struct.pack("I", termios.TIOCM_DTR)
+                )
+            except OSError:
+                pass
+            if self.old_termios is not None:
+                try:
+                    termios.tcsetattr(self.fd, termios.TCSANOW, self.old_termios)
+                except OSError:
+                    pass
+            os.close(self.fd)
+            self.fd = None
+        self.lock.__exit__()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *unused):
+        self.close()
 
 
 def packet(block, payload, size=None):
@@ -491,9 +707,25 @@ class Shell:
         if overwrite:
             command += " --overwrite"
         nonce = self.begin(command, script=script)
+        return self.transfer(nonce, lambda ymodem: ymodem.send(file, name, size))
+
+    def transfer(self, nonce, move):
+        """One YMODEM transfer inside command nonce; move(Ymodem) -> its value. On a failed transfer, still read the
+        command's END record and prompt: fshell purges input after a cancel, and a command typed before its prompt
+        is lost (seen on the phone). The phone's status, when there is one, is the error reported."""
         self.transfer_ready(nonce)
-        Ymodem(self.stream, self.idle).send(file, name, size)
-        return self.require(self.finish(nonce, time.monotonic() + self.timeout))
+        try:
+            value = move(Ymodem(self.stream, self.idle))
+        except DebugError as error:
+            try:
+                result = self.finish(nonce, time.monotonic() + self.timeout)
+            except DebugError:
+                raise error from None
+            if result.status:
+                raise RemoteError(result.status, result.output) from error
+            raise
+        self.require(self.finish(nonce, time.monotonic() + self.timeout))
+        return value
 
     def prepare(self, command):
         if "\0" in command:
@@ -529,9 +761,8 @@ class Shell:
                 command += " --overwrite"
             script = self.prepare(command)
             nonce = self.begin("", script=script)
-            self.transfer_ready(nonce)
-            Ymodem(self.stream, self.idle).send(file, remote.rsplit("\\", 1)[-1], size)
-            self.require(self.finish(nonce, time.monotonic() + self.timeout))
+            name = remote.rsplit("\\", 1)[-1]
+            self.transfer(nonce, lambda ymodem: ymodem.send(file, name, size))
         return digest
 
     def pull(self, remote, local, overwrite=False):
@@ -553,9 +784,7 @@ class Shell:
         try:
             with os.fdopen(fd, "w+b") as file:
                 nonce = self.begin("", script=script)
-                self.transfer_ready(nonce)
-                _, size = Ymodem(self.stream, self.idle).receive(file)
-                self.require(self.finish(nonce, time.monotonic() + self.timeout))
+                _, size = self.transfer(nonce, lambda ymodem: ymodem.receive(file))
                 if file.tell() != size:
                     raise DebugError("download length differs from YMODEM metadata")
                 file.flush()
@@ -580,3 +809,105 @@ class Shell:
                     os.unlink(temporary)
                 except FileNotFoundError:
                     pass
+
+
+def interactive(connection):
+    stdin, stdout = sys.stdin.fileno(), sys.stdout.fileno()
+    original = termios.tcgetattr(stdin) if os.isatty(stdin) else None
+    try:
+        if original is not None:
+            tty.setraw(stdin)
+        while True:
+            if connection.buffer:
+                data = connection.read(len(connection.buffer), time.monotonic() + 1)
+                _write_fd(stdout, data)
+            ready = select.select([stdin, connection.fd], [], [])[0]
+            if stdin in ready:
+                data = os.read(stdin, 4096)
+                if not data or b"\x04" in data:
+                    return
+                connection.write(data, time.monotonic() + 30)
+            if connection.fd in ready:
+                _write_fd(stdout, connection.read(65536, time.monotonic() + 30))
+    finally:
+        if original is not None:
+            termios.tcsetattr(stdin, termios.TCSADRAIN, original)
+
+
+def _write_fd(fd, data):
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n == 0:
+            raise LinkError("output closed")
+        view = view[n:]
+
+
+def run_cli(verb, args, connection):
+    parser = argparse.ArgumentParser(prog=f"phone.py {verb}", allow_abbrev=False)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="command completion timeout (default: 60 s)",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=30.0,
+        help="transfer no-progress timeout (default: 30 s)",
+    )
+    if verb == "sh":
+        parser.add_argument("command", nargs="?")
+    else:
+        parser.add_argument("--overwrite", action="store_true")
+        parser.add_argument("source")
+        parser.add_argument("destination")
+    options = parser.parse_args(args)
+    if (
+        not math.isfinite(options.timeout)
+        or not math.isfinite(options.idle_timeout)
+        or options.timeout <= 0
+        or options.idle_timeout <= 0
+    ):
+        parser.error("timeouts must be positive")
+    port = select_port(
+        "shell", device=connection.device, override=connection.shell_port
+    )
+    if not port:
+        raise DebugError("no authorized fshell USB serial function found")
+    try:
+        with SerialConnection(port) as stream:
+            shell = Shell(stream, options.timeout, options.idle_timeout)
+            if verb == "sh":
+                if options.command is None:
+                    interactive(stream)
+                    return 0
+                result = shell.execute(options.command)
+                sys.stdout.buffer.write(result.output)
+                sys.stdout.buffer.flush()
+                if result.status:
+                    print(f"\nsh: native exit {result.status}", file=sys.stderr)
+                    return 1
+            elif verb == "push":
+                digest = shell.push(
+                    options.source, options.destination, options.overwrite
+                )
+                print(f"{digest}  {options.destination}")
+            elif verb == "pull":
+                digest = shell.pull(
+                    options.source, options.destination, options.overwrite
+                )
+                print(f"{digest}  {options.destination}")
+        return 0
+    except KeyboardInterrupt:
+        print(
+            "cancelled; remote completion is unknown and no command was replayed",
+            file=sys.stderr,
+        )
+        return 130
+    except DeadlineExpired as error:
+        print(
+            f"{verb}: {error}; remote completion is unknown; no replay", file=sys.stderr
+        )
+        return 124

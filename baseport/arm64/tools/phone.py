@@ -13,13 +13,20 @@ with nothing but the Python standard library and the fastboot tool.
   phone.py dump PART OUT     a GPT partition by name (or FIRST:COUNT sectors), read-only, checked against the
                              kernel's SHA-256; prints the hash (docs telephony.md C0: radio partition backups)
   phone.py console           interactive (Ctrl-D ends)
+  phone.py sh [COMMAND]      fshell (USBDEBUG builds): a terminal, or one command with its real exit status
+  phone.py push LOCAL REMOTE [--overwrite]   one file to the phone, checked by length and SHA-256
+  phone.py pull REMOTE LOCAL [--overwrite]   one file from the phone, checked the same way
   phone.py selftest          checks the PNG writer
+
+Ports are found by USB interface (ioreg): the monitor is interface 0, fshell interface 2. Options, before or after
+the verb: --device ID (serial or location, with several phones), --monitor-port PATH, --shell-port PATH; sh/push/pull
+also take --timeout SECONDS (60) and --idle-timeout SECONDS (30). Quote COMMAND, or put -- before one starting with
+a dash. One operation at a time owns the shell port (a lock); the kernel log stays on the monitor.
 
 Monitor answers end with "\\n.\\n"; "shot" answers "SHOT w h\\n" and w*h*4 bytes of BGRX; "blk dump" answers "DUMP n\\n",
 n*512 raw bytes and "dump sha256 HEX err E". Everything else on the line is the kernel log, streamed live.
 """
 
-import glob
 import hashlib
 import os
 import re
@@ -30,6 +37,8 @@ import sys
 import termios
 import time
 import zlib
+
+import fshell_link
 
 END = b"\n.\n"
 
@@ -53,14 +62,12 @@ def wait_fastboot(secs):
     return False
 
 
-def find_port(secs=0):
-    t0 = time.time()
+def find_port(secs=0, *, device=None, override=None):
+    t0 = time.monotonic()
     while True:
-        # macOS names an ACM port after the serial number and its interface + 1: the monitor (interface 0) ends in 1,
-        # fshell's (interface 2, USBDEBUG builds) in 3 -- the monitor's sorts first
-        ports = sorted(glob.glob("/dev/cu.usbmodem*"))
-        if ports or time.time() - t0 >= secs:
-            return ports[0] if ports else None
+        port = fshell_link.select_port("monitor", device=device, override=override)
+        if port or time.monotonic() - t0 >= secs:
+            return port
         time.sleep(1)
 
 
@@ -267,11 +274,14 @@ def selftest():
     print("selftest ok")
 
 
-def main(argv):
+def _main(argv):
+    connection, argv = fshell_link.connection_options(argv)
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
     verb, args = argv[0], argv[1:]
+    if verb in ("sh", "push", "pull"):
+        return fshell_link.run_cli(verb, args, connection)
     if verb == "selftest":
         selftest()
         return 0
@@ -304,7 +314,7 @@ def main(argv):
         r = fastboot("boot", img, timeout=60)
         if not r or r.returncode:
             raise SystemExit(f"fastboot boot failed: {r and r.stderr}")
-        port = find_port(60)
+        port = find_port(60, device=connection.device, override=connection.monitor_port)
         if not port:
             raise SystemExit(
                 "no debug console appeared (the image's AUTOFASTBOOT, if any, will return the phone)"
@@ -333,7 +343,9 @@ def main(argv):
         if not stay and not wait_fastboot(60):
             raise SystemExit("the phone did not come back to fastboot")
         return 0
-    port = find_port(5)
+    if verb not in ("cmd", "dump", "put", "shot", "console"):
+        raise fshell_link.DebugError(f"unknown command {verb!r}; use --help")
+    port = find_port(5, device=connection.device, override=connection.monitor_port)
     if not port:
         raise SystemExit("no debug console (/dev/cu.usbmodem*)")
     con = Console(port)
@@ -378,6 +390,19 @@ def main(argv):
                 sys.stdout.flush()
     con.close()
     return 0
+
+
+def main(argv):
+    try:
+        return _main(argv)
+    except fshell_link.RemoteError as error:
+        if error.output:
+            sys.stderr.buffer.write(error.output)
+        print(f"phone: {error}", file=sys.stderr)
+        return 1
+    except (fshell_link.DebugError, OSError, UnicodeError, termios.error) as error:
+        print(f"phone: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

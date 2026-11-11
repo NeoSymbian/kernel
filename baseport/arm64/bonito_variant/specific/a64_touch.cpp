@@ -303,8 +303,17 @@ static void Post(TRawEvent::TType aType, TInt aX, TInt aY)
 		++Dropped;
 	}
 
+static volatile TBool Asleep;							// the screen is off: no polls, the sensor in F01 sensor sleep
+
 static void PollDfcFn(TAny*)
 	{
+	if (Asleep)												// stop until A64Touch_Sleep(EFalse) restarts the poll
+		{
+		if (Down)
+			Post(TRawEvent::EButton1Up, LastX, LastY);
+		Down = EFalse;
+		return;
+		}
 	TInt next = KPollMs;
 	TBool attn = !(Io(KNorth, 125) & 1);
 	AttnSeen += attn;
@@ -362,6 +371,30 @@ static void PollDfcFn(TAny*)
 			}
 		}
 	PollTimer.OneShot(NKern::TimerTicks(next));			// not Again(): it stops for good after a slow poll
+	}
+
+// screen off/on (a64_display.cpp): F01 device control sleep mode 1 (sensor sleep) or 0, on the touch thread
+static void SleepDfcFn(TAny*)
+	{
+	TUint8 c = 0;
+	TInt r = RmiRead(F01.iCtrl, &c, 1);
+	if (r == KErrNone)
+		{
+		c = (TUint8)((c & ~3) | (Asleep ? 1 : 0));
+		r = RmiWrite(F01.iCtrl, &c, 1);
+		}
+	Log("%s: F01 ctrl %02x -> %d", Asleep ? "sleep" : "wake", c, r);
+	if (!Asleep)
+		PollTimer.OneShot(NKern::TimerTicks(KPollMs));	// KErrInUse if a poll is still pending: it re-arms itself
+	}
+static TDfc SleepDfc(SleepDfcFn, NULL, 1);
+
+void A64Touch_Sleep(TBool aSleep)						// thread context
+	{
+	if (!Polling)
+		return;												// not brought up: nothing to put to sleep
+	Asleep = aSleep;
+	SleepDfc.Enque();
 	}
 
 static void BringUpDfcFn(TAny*)
@@ -440,6 +473,7 @@ static void BringUpDfcFn(TAny*)
 		return;
 		}
 	PollDfc.SetDfcQ(TouchQ);
+	SleepDfc.SetDfcQ(TouchQ);
 	PollTimer.OneShot(NKern::TimerTicks(KPollMs));
 	Polling = ETrue;
 	Step("polling");
@@ -467,6 +501,8 @@ static TA64DevState TouchStatus(TDes8& aDetail)
 		{
 		A64Device_Format(aDetail, "%dx%d, one finger, polled %d ms; %d presses+releases, %d errors, %d dropped", MaxX, MaxY,
 			KPollMs, Logged, Errors, Dropped);
+		if (Asleep)
+			A64Device_Format(aDetail, "; asleep (screen off)");
 		return EA64DevOk;
 		}
 	A64Device_Format(aDetail, BringUpDone ? "stopped at: %s" : "step: %s", CurStep);

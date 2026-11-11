@@ -56,6 +56,8 @@ def wait_fastboot(secs):
 def find_port(secs=0):
     t0 = time.time()
     while True:
+        # macOS names an ACM port after the serial number and its interface + 1: the monitor (interface 0) ends in 1,
+        # fshell's (interface 2, USBDEBUG builds) in 3 -- the monitor's sorts first
         ports = sorted(glob.glob("/dev/cu.usbmodem*"))
         if ports or time.time() - t0 >= secs:
             return ports[0] if ports else None

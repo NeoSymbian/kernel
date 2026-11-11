@@ -2,8 +2,9 @@
 // a64_usb_function.h -- a USB device function (its descriptors, class requests and endpoints) and the device
 // controller core that runs it. The core (sdm670_assp/qcom_dwc3.cpp) owns power and bring-up, the event ring, EP0 and
 // the standard (Chapter 9) requests, and the endpoints' transfers and DMA buffers; the function
-// (common/specific/a64_usb_acm_monitor.cpp: the debug monitor's ACM serial port) supplies the rest.
-// shortcut: one function, chosen at link time (KA64UsbFunction); a list when a second function comes (roadmap T8).
+// (common/specific/a64_usb_acm_monitor.cpp: the debug monitor's ACM serial port) supplies the rest. A second function,
+// A64UsbDebugFunction() (a64_usb_acm_debug.cpp, USBDEBUG=1 builds: fshell's serial port), makes the device composite:
+// the core then puts an IAD before each function's interfaces and gives the device class EF/02/01.
 #ifndef A64_USB_FUNCTION_H
 #define A64_USB_FUNCTION_H
 
@@ -23,7 +24,8 @@ struct SA64UsbFunction
 	{
 	const TUint8* iDevice; TInt iDeviceLen;
 	const TUint8* iQualifier; TInt iQualifierLen;
-	const TUint8* iConfig; TInt iConfigLen;					// the whole configuration (interfaces, endpoints)
+	const TUint8* iFragment; TInt iFragmentLen;				// its interfaces and endpoints (the core adds the header)
+	TInt iFirstInterface, iInterfaceCount;					// its interface numbers (class requests go by wIndex)
 	const char* const* iStrings; TInt iStringCount;			// index 0 unused (the language list is the core's)
 	const SA64UsbEndpoint* iEndpoints; TInt iEndpointCount;	// configured in this order
 	// a class request: the IN data's length (in aBuf), KA64UsbNoData, KA64UsbDataOut (data follows) or KA64UsbStall
@@ -35,8 +37,10 @@ struct SA64UsbFunction
 	void (*iXferComplete)(TInt aPhysEp, TInt aBytes);		// aBytes: what an OUT transfer received
 	void (*iPoll)();										// every poll (1 ms), after the events
 	void (*iDump)();										// status lines in the log
+	void (*iIsr)();											// after A64Usb_Doorbell(), in interrupt context; or NULL
 	};
-extern const SA64UsbFunction KA64UsbFunction;
+extern const SA64UsbFunction KA64UsbFunction;				// the first: its device descriptor and strings are the device's
+const SA64UsbFunction* A64UsbDebugFunction();				// the second (a weak NULL in the core unless linked)
 
 // the core, for the function (thread context, the poll's DFC queue)
 TUint8* A64Usb_Buf(TInt aPhysEp);							// the endpoint's DMA buffer
@@ -46,6 +50,7 @@ void A64Usb_EndXfer(TInt aPhysEp);							// asks for a stop; CanStart turns true
 void A64Usb_ProcessEvents();								// for a writer that waits on its IN transfer
 TBool A64Usb_Ep0Idle();										// no control transfer in progress
 TBool A64Usb_Configured();
+void A64Usb_Doorbell();										// any context: run the functions' iIsr soon, in an interrupt
 struct SA64UsbStats
 	{
 	TInt iEvents, iResets, iSetups, iEp0, iRestarts, iSuspends, iResumes;

@@ -30,8 +30,11 @@ extern "C" void A64_InitThisCpuGic()		// this CPU's redistributor: IPIs (SGI 0-7
 	Gicv3_EnablePpiSgi(sgi, A64_TimerPpi, 0xA0);
 	}
 
+static TUint32 BootCpuMpidr;			// CPU 0's packed affinity: where bound SPIs and device SGIs run
+
 extern "C" void A64_InitGic()
 	{
+	BootCpuMpidr = A64_Mpidr();
 	Gicv3_InitDist(A64_Io(A64_GicdBase));
 	A64_InitThisCpuGic();
 	}
@@ -120,6 +123,23 @@ extern "C" TInt A64_BindSpi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr)
 	return KErrNone;
 	}
 
+/* a device's software doorbell: SGI 5-7 (the IPIs use 0-4; every CPU enables 0-7 at priority 0x80). A64_RaiseSgi
+ * runs the bound ISR on CPU 0, in interrupt context -- what a polled driver needs to call code written for an ISR
+ * (ECOMM's PDD callbacks). Nothing in hardware raises an SGI, unlike a borrowed SPI. */
+extern "C" TInt A64_BindSgi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr)
+	{
+	if (aIntId < 5 || aIntId > 7 || !aIsr)
+		return KErrArgument;
+	SpiBindings[aIntId].iPtr = aPtr;
+	__e32_atomic_store_rel_ptr(&SpiBindings[aIntId].iIsr, (TAny*)aIsr);
+	return KErrNone;
+	}
+
+extern "C" void A64_RaiseSgi(TUint32 aIntId)
+	{
+	A64_SendSgi(BootCpuMpidr, aIntId);
+	}
+
 /* ---- IRQ ----------------------------------------------------------------------------------------------- */
 extern "C" void A64_Irq(SThreadExcStack* aF)
 	{
@@ -142,7 +162,7 @@ extern "C" void A64_Irq(SThreadExcStack* aF)
 			}
 		else if (id == GENERIC_IPI_VECTOR)
 			generic_ipi_isr(&ss);
-		else if (id >= 32 && id < 256 && SpiBindings[id].iIsr)
+		else if (id >= 5 && id < 256 && SpiBindings[id].iIsr)	// bound SPIs and device SGIs
 			(*SpiBindings[id].iIsr)(SpiBindings[id].iPtr);
 		// TRANSFERRED_IRQ_VECTOR: the tail below runs the events
 		}

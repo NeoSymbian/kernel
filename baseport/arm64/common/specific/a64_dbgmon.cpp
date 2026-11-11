@@ -221,6 +221,7 @@ __attribute__((weak)) TInt A64BlkDev_Monitor(TInt, const TPtrC8*, const TUint64*
 	}
 __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
 __attribute__((weak)) void A64UsbCold(TDes8& aOut, TInt) { aOut.Copy((const TUint8*)"usb cold: not on this board", 27); }
+TInt A64UsbDebugSet(TInt aOn);								// a64_variant.cpp (weak) / qcom_dwc3.cpp
 __attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((const TUint8*)"rpmh: not on this board", 23); }
 // qcom_telmon.cpp on the Pixel: the modem path (docs/telephony.md C2/C3)
 __attribute__((weak)) void A64Tel_Monitor(TInt, const TPtrC8*, const TUint64*) { Say("telephony: not on this board"); }
@@ -687,6 +688,8 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		Say("watchdog bite in 1 s");
 		A64_WatchdogBite(1000);
 		}
+	else if (Eq(c, "usb") && argc >= 3 && Eq(arg[1], "dbg"))	// USB debugging on/off, as Settings' switch (HAL 0x4e04)
+		Say("usb dbg %d -> %d", (TInt)num[2], A64UsbDebugSet((TInt)num[2]));
 	else if (Eq(c, "usb"))
 		{
 		TBuf8<240> b;										// a line stays under the monitor's 256 bytes

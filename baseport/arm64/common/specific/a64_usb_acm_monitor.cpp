@@ -259,9 +259,9 @@ void A64UsbStatus(TDes8& aBuf)							// the monitor's "usb" command
 	TUint32 size, ctrl, rsc;
 	A64Usb_Trb(EPhysBulkIn, size, ctrl, rsc);
 	Append(aBuf, "ev %d rst %d setups %d ep0 %d cfg %d dtr %d in %d/%d/%d busy %d abort %d lines %d logpos %d "
-		"trb3 %08x %08x rsc3 %d dma %x/%x/%x restarts %d link %d/%d", s.iEvents, s.iResets, s.iSetups, s.iEp0, s.iConfigured, Dtr,
+		"trb3 %08x %08x rsc3 %d dma %x/%x/%x restarts %d link %d/%d dbg %d", s.iEvents, s.iResets, s.iSetups, s.iEp0, s.iConfigured, Dtr,
 		InStarts, InDone, InFail, InBusy, AbortIn, OutLines, LogPos, size, ctrl, rsc, s.iDmaOwned, s.iDmaPending,
-		s.iDmaQuarantined, s.iRestarts, s.iSuspends, s.iResumes);
+		s.iDmaQuarantined, s.iRestarts, s.iSuspends, s.iResumes, s.iFunctions > 1);
 	}
 
 void A64UsbDump()

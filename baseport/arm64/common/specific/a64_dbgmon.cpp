@@ -213,6 +213,8 @@ __attribute__((weak)) void A64_RebootNormal() { A64_Psci(0x84000009, 0, 0, 0); }
 __attribute__((weak)) TInt A64_PowerOff() { A64_Psci(0x84000008, 0, 0, 0); return KErrGeneral; }
 __attribute__((weak)) TInt A64_RtcSeconds(TUint32&) { return KErrNotSupported; }	// qcom_rtc.cpp
 __attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
+__attribute__((weak)) TInt A64Display_SetState(TInt) { return KErrNotSupported; }	// a64_display.cpp
+__attribute__((weak)) TInt A64Display_SetBrightness(TInt) { return KErrNotSupported; }
 __attribute__((weak)) void A64_WatchdogBite(TInt) { Say("wdt: not on this board"); }
 __attribute__((weak)) TInt A64BlkDev_Probe() { return KErrNotSupported; }
 __attribute__((weak)) TInt A64BlkDev_SelfTest() { return KErrNotSupported; }
@@ -547,7 +549,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console drivers peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt thermal battery rtc date");
+		Say("help log lastlog console drivers peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt thermal battery panel rtc date");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -641,6 +643,12 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		A64TouchDump();
 	else if (Eq(c, "battery"))
 		A64BatteryDump();
+	else if (Eq(c, "panel") && argc >= 2)				// panel on | off | bright <0..1023>
+		{
+		TInt r = Eq(arg[1], "on") ? A64Display_SetState(1) : Eq(arg[1], "off") ? A64Display_SetState(0)
+			: Eq(arg[1], "bright") && argc >= 3 ? A64Display_SetBrightness((TInt)num[2]) : KErrArgument;
+		Say("panel %S -> %d", &arg[1], r);
+		}
 	else if (Eq(c, "thermal"))
 		A64ThermalDump();
 	else if (Eq(c, "keys"))

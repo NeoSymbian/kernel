@@ -44,7 +44,7 @@ A driver joins the running kernel in one of four ways:
 | Way | How | Examples |
 |---|---|---|
 | **Board interface** | Implements `kernel/eka/include/kernel/arm64/board.h` in the board's `BOARD_SRC` file | `pixel_bonito.cpp`, `qemu_virt.cpp`: GIC, timer, console, I/O map (`A64_IoRegions`), framebuffer |
-| **Start hook** | A strong `A64Start*()` overrides a weak empty default in `a64_variant.cpp`. The one kernel extension, `A64ExtensionEntry`, calls the hooks **in a fixed order** | `A64StartCpufreq`, `A64StartKeys`, `A64StartTouch`, `A64StartUsbConsole`, `A64StartSerialKeyboard`, `A64StartReboot` |
+| **Start hook** | A strong `A64Start*()` overrides a weak empty default in `a64_variant.cpp`. The one kernel extension, `A64ExtensionEntry`, calls the hooks **in a fixed order** | `A64StartBuses`, `A64StartCpufreq`, `A64StartKeys`, `A64StartTouch`, `A64StartUsbConsole`, `A64StartSerialKeyboard`, `A64StartReboot` |
 | **Weak override** | A strong definition replaces a weak default that generic code calls | `A64BlkDev_*` (sdhci, virtio_blk), `A64_RtcSeconds` (rtc), `A64CpuBoost` (cpufreq, called from `kernel/eventq.cpp`), `A64_Restart`/`A64_CrashReset` (reboot), `A64Tel_Hal` (telhal) |
 | **Library** | Plain functions that other drivers call | `Spmi_*`, `I2c_*`, `Bcm/Arc/Vrm_Vote` (rpmh), `Smem_*`, `Scm_*`, GLINK, SMP2P |
 
@@ -95,7 +95,7 @@ A second board on an existing SoC (the Pixel 3a "sargo" on SDM670) copies the So
    - a unique basename, because `ekc` names objects by basename, so `x/foo.cpp` and `y/foo.cpp` overwrite each other.
 3. **Add an `ekc` line** to the board's `variant_drivers()`.
 4. **If it runs at boot**, add an `A64Start<Name>()` hook: a weak default in `a64_variant.cpp` and a call in
-   `A64ExtensionEntry` at the right point. Buses come before their users: SPMI comes up today inside `A64StartKeys`.
+   `A64ExtensionEntry` at the right point. Buses come before their users: `A64StartBuses` initializes SPMI before the peripheral hooks; keys only read its cached readiness.
 5. **Map its registers** in the board's `A64_IoRegions` (`board.h`, `SA64IoRegion`).
 6. **For user access,** use a Symbian HAL group or framework if the 2010 user side already speaks it. Otherwise add a
    NeoSymbian `EHalGroupVariant` function (or an LDD once it needs asynchronous notification). User-side logic goes in
@@ -117,7 +117,7 @@ them; this list is **not done yet**.
 | Every boot-time driver edits `common/`: one weak `A64Start*` per driver and a fixed call list | `a64_variant.cpp` (`A64ExtensionEntry`) | Registry: `A64_DRIVER(name, startFn, order)` in a `.a64drv` linker section (`ekern.lds`, `__start_`/`__stop_`), run in `order` |
 | The monitor knows every driver: about 20 weak stubs and an `if` chain; `a64_dbgmon.h` declares the Qualcomm `A64Tel_Monitor` | `a64_dbgmon.cpp`, `common/inc/a64_dbgmon.h` | Registry: `A64_MONCMD("name", fn, "help")` in `.a64mon`; `help` lists them. (The `drivers` command and the status half of the driver registry exist: `A64_DEVICE` in `.a64dev`, `a64_devices.cpp`.) |
 | A dropped `ekc` line fails silently into the weak default | `variant.conf`, weak stubs | The two registries, plus a `drivers` check in the gates |
-| Start order is implicit: the keys driver starts SPMI, and RTC, reboot and touch depend on it | `a64_keys.cpp` (`A64StartKeys` → `Spmi_Init`) | Explicit orders: buses 10, cpufreq 20, display 30, input 40, reboot/USB 50, media 60 |
+| Per-driver start order is still a fixed call list | `a64_variant.cpp` (`A64StartBuses` now starts SPMI independently of keys) | Keep bus-before-peripheral ordering when adding registry-based startup |
 | The SoC's driver list sits in the board's `variant.conf` | `bonito_variant/variant.conf` | `<soc>_assp/assp.conf` with `assp_drivers()`, called before `variant_drivers()` |
 | `ekc` object names collide on equal basenames | `tools/build-ekern.sh` (`ekc`) | Name objects after the path under `baseport/arm64` |
 | Generic code with a `qcom_` name: a GPT + FAT16 reader | `sdm670_assp/qcom_fat16.cpp` | `common/specific/a64_gpt.cpp` + `a64_fat16.cpp` |
@@ -150,3 +150,39 @@ baseport/arm64/
 **Order of the code pass:**
 1. Registries and `ekc` names. Behaviour stays the same; check `drivers` and an `nm` diff on QEMU and bonito.
 2. Moves, as one commit at a quiet point in the telephony work.
+
+## Read-only SoC temperatures (bonito)
+
+`thermal` in the debug monitor lists both SDM670 TSENS v2 controllers (13 and 8
+controller-local sensor IDs) in milli-Celsius. `drivers`/the device-list HAL report
+valid sample count and maximum temperature. The registry deliberately reports
+`partial`: telemetry provides no throttling, trip interrupts or thermal policy.
+The driver never enables, resets or calibrates a controller; disabled/invalid
+samples return unavailable. Sensor IDs are not physical CPU labels.
+
+Host regression check: `python3 baseport/arm64/tools/test-tsens-host.py`.
+The new `thermal` tag is mapped to neoui's existing Thermal device row; showing it
+there requires rebuilding the UI as well as the kernel.
+
+## Read-only battery observations (bonito)
+
+`battery` reads PM660 fuel-gauge/charger observations through SPMI. It prints a
+validity mask before raw fields: an unset bit means unknown, never an actual zero.
+`drivers` reports the available percentage/voltage as `partial`, because this is
+telemetry without charging policy. No PMIC writes, profile/SRAM access, ADC
+triggers or charger-watchdog service are performed. Hardware readiness/shadow
+agreement cannot establish profile correctness or sample age; the percentage is
+the retained PMIC estimate, not Android's smoothed/calibrated UI value.
+
+HAL `EHalGroupVariant` function `0x4e1a` takes an output descriptor in a1 and
+requires `ReadDeviceData`. Exactly 32 little-endian bytes contain eight u32 words:
+version (1), validity mask, presence, reported percentage, microvolts, USB presence,
+USB online, normalized charge state. Validity bits 0..5 correspond to the six data
+words; charge states are 0 unknown, 1 discharging, 2 charging, 3 not charging,
+4 full. Partial data returns success; no data returns `KErrNotReady`; unsupported
+PMIC/boards return `KErrNotSupported`. A short output descriptor returns overflow
+through the standard descriptor write path. Older user interfaces remain unchanged.
+
+`python3 baseport/arm64/tools/test-battery-host.py` checks actual driver code with
+fake SPMI input. Source facts are from the AOSP PM660 Gen3 FG and Linux v6.16
+PMI8998/PM660 charger references cited in `qcom_battery.cpp`.

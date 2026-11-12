@@ -105,7 +105,7 @@ static TInt Fail(TInt aErr, const char* aWhat)
 // one uncached, physically contiguous pool for rings, rri and buffers (the WCN3990 is not coherent: no dma-coherent)
 static TAny* Carve(TUint32 aSize, TPhysAddr& aPhys)
 	{
-	TUint32 at = (PoolUsed + 63) & ~63u;
+	TUint32 at = (PoolUsed + 127) & ~127u;						// 128: the HTT rx buffers' alignment
 	if (at + aSize > PoolSize)
 		return NULL;
 	PoolUsed = at + aSize;
@@ -409,7 +409,7 @@ static TInt SendInit()
 // ---- W3a: the first scan (private/wifi/w3a-scan-spec.md)
 struct SBss { TUint8 iBssid[6]; TUint8 iSsidLen; TUint8 iSsid[32]; TUint8 iChannel; TInt8 iDbm; };
 static SBss Bss[32];
-static TInt NumBss, Beacons, ChanInfos, OtherFrames;
+static TInt NumBss, Beacons, ChanInfos, OtherFrames, HttFrames, HttMgmt;
 static TBool ScanDone;
 
 static void ScanEvent(const TUint8* p, TInt n)
@@ -427,9 +427,44 @@ static void ScanEvent(const TUint8* p, TInt n)
 			if (type & 0x42)
 				ScanDone = ETrue;
 			if (type & 0x2)
-				Kern::Printf("[wifi] scan completed (reason %d, tick %d): %d networks from %d frames; %d channel reports, "
-					"%d frames on other endpoints", reason, NKern::TickCount(), NumBss, Beacons, ChanInfos, OtherFrames);
+				Kern::Printf("[wifi] scan completed (reason %d, tick %d): %d networks from %d beacons; %d channel reports, "
+					"HTT %d frames (%d mgmt), %d other HTT messages", reason, NKern::TickCount(), NumBss, Beacons, ChanInfos,
+					HttFrames, HttMgmt, OtherFrames);
 			}
+	}
+
+// one beacon or probe response: aHdr = its 24-byte 802.11 header, aBody = timestamp, interval, capability, IEs
+static void AddBss(const TUint8* aHdr, const TUint8* aBody, TInt aBodyLen, TInt aChannel, TInt aDbm, const char* aVia)
+	{
+	if ((aHdr[0] != 0x80 && aHdr[0] != 0x50) || aBodyLen < 12)	// beacons and probe responses only
+		return;
+	++Beacons;
+	const TUint8* bssid = aHdr + 16;
+	for (TInt i = 0; i < NumBss; ++i)
+		if (!memcompare(Bss[i].iBssid, 6, bssid, 6))
+			return;												// seen already
+	if (NumBss >= 32)
+		return;
+	SBss& b = Bss[NumBss++];
+	memcpy(b.iBssid, bssid, 6);
+	b.iSsidLen = 0;
+	for (TInt ie = 12; ie + 2 <= aBodyLen && ie + 2 + aBody[ie + 1] <= aBodyLen; ie += 2 + aBody[ie + 1])
+		if (aBody[ie] == 0 && aBody[ie + 1] <= 32 && !b.iSsidLen)
+			{
+			b.iSsidLen = aBody[ie + 1];
+			memcpy(b.iSsid, aBody + ie + 2, b.iSsidLen);
+			}
+		else if (aBody[ie] == 3 && aBody[ie + 1] == 1 && !aChannel)
+			aChannel = aBody[ie + 2];							// DS parameter set: the channel (HTT frames carry none)
+	b.iChannel = (TUint8)aChannel;
+	b.iDbm = (TInt8)aDbm;
+	TBuf8<33> ssid;
+	for (TInt i = 0; i < b.iSsidLen; ++i)
+		ssid.Append(b.iSsid[i] >= 0x20 && b.iSsid[i] < 0x7f ? b.iSsid[i] : '?');
+	if (!b.iSsidLen)
+		ssid.Copy((const TUint8*)"(hidden)", 8);
+	Kern::Printf("[wifi] scan: %S  %02x:%02x:%02x:%02x:%02x:%02x  ch %d  %d dBm%s (%s)", &ssid, bssid[0], bssid[1],
+		bssid[2], bssid[3], bssid[4], bssid[5], aChannel, aDbm, aBody[10] & 0x10 ? "  secured" : "", aVia);
 	}
 
 static void MgmtRx(const TUint8* p, TInt n)
@@ -451,34 +486,107 @@ static void MgmtRx(const TUint8* p, TInt n)
 	TUint32 channel = G32(hdr), snr = G32(hdr + 4), buflen = G32(hdr + 16), status = G32(hdr + 20);
 	if (status & 0x29 || (TInt)buflen > flen || buflen < 36)
 		return;
-	if (frame[0] != 0x80 && frame[0] != 0x50)					// beacons and probe responses only
+	AddBss(frame, frame + 24, buflen - 24, channel, (TInt)snr - 95, "WMI");
+	}
+
+// ---- W3b: the HTT rx ring (private/wifi/w3b-htt-rx-spec.md). The firmware's MAC rx ring is fed from these buffers;
+// without them it receives (CHAN_INFO shows it) but has nowhere to put a frame, beacons included.
+const TInt KHttRing = 2048, KHttBufs = 128, KHttBuf = 2048;
+static volatile TUint32* HttRing;		// KHttRing x le64 buffer addresses
+static volatile TUint32* HttIdx;		// alloc_idx: the firmware reads it
+static TPhysAddr HttRingPhys, HttIdxPhys, HttBufPhys, BankPhys;
+static TUint8* HttBufs;
+
+static void HttPost(TPhysAddr aPhys)
+	{
+	TUint32 i = *HttIdx & (KHttRing - 1);
+	((volatile TUint32*)(HttBufs + (aPhys - HttBufPhys)))[1] = 0;	// the attention word: not done
+	HttRing[2 * i] = aPhys;
+	HttRing[2 * i + 1] = 0;
+	__e32_memory_barrier();
+	*HttIdx = (i + 1) & (KHttRing - 1);
+	}
+
+static TInt HttSetup()
+	{
+	if (!HttRing)
+		{
+		TUint8* bank = (TUint8*)Carve(1056 * 72, BankPhys);		// tx MSDU extension descriptors (unused until TX)
+		HttRing = (volatile TUint32*)Carve(KHttRing * 8, HttRingPhys);
+		HttIdx = (volatile TUint32*)Carve(4, HttIdxPhys);
+		HttBufs = (TUint8*)Carve(KHttBufs * KHttBuf, HttBufPhys);
+		if (!bank || !HttRing || !HttIdx || !HttBufs)
+			return Fail(KErrNoMemory, "HTT rx memory");
+		*HttIdx = 0;
+		for (TInt i = 0; i < KHttBufs; ++i)
+			HttPost(HttBufPhys + i * KHttBuf);
+		}
+	static TUint32 mw[16];
+	TUint8* m = (TUint8*)mw;
+	memclr(m, 64);												// FRAG_DESC_BANK_CFG (64-bit)
+	m[0] = 6;
+	m[2] = 1;													// num_banks
+	m[3] = 72;													// desc_size
+	Le32(m + 4, BankPhys);										// bank_base_addrs[0], le64
+	Le16(m + 38, 1055);											// bank_id[0] max
+	m[60] = 1;													// record_size
+	TInt r = HtcSend(HttEid, m, 64);
+	memclr(m, 48);												// RX_RING_CFG (64-bit), one ring
+	m[0] = 2;
+	m[1] = 1;
+	Le32(m + 4, HttIdxPhys);									// fw_idx_shadow_reg_paddr, le64
+	Le32(m + 12, HttRingPhys);									// rx_ring_base_paddr, le64
+	Le16(m + 20, KHttRing);
+	Le16(m + 22, KHttBuf);
+	Le16(m + 24, 0xffff);										// every part of the descriptor, mgmt frames included
+	Le16(m + 26, (TUint16)*HttIdx);								// fw_idx_init_val: the buffers posted
+	static const TUint16 KOffsets[10] = { 74, 90, 27, 37, 4, 26, 7, 12, 1, 2 };	// wcn3990 htt_rx_desc_v2, in words
+	for (TInt i = 0; i < 10; ++i)
+		Le16(m + 28 + 2 * i, KOffsets[i]);
+	if (r == KErrNone)
+		r = HtcSend(HttEid, m, 48);
+	const TUint8 aggr[4] = { 5, 64, 3, 0 };						// AGGR_CFG v2: 64 A-MPDU, 3 A-MSDU
+	if (r == KErrNone)
+		r = HtcSend(HttEid, aggr, 4);
+	Kern::Printf("[wifi] HTT rx ring: %d entries, %d buffers posted at %08x -> %d", KHttRing, KHttBufs, HttBufPhys, r);
+	return r == KErrNone ? r : Fail(r, "HTT setup");
+	}
+
+// one HTT message from the target (CE1/9/10 by HTC endpoint, CE5 with its 8-byte header stripped)
+static void HttRx(const TUint8* p, TInt n)
+	{
+	if (n < 4)
 		return;
-	++Beacons;
-	const TUint8* bssid = frame + 16;
-	for (TInt i = 0; i < NumBss; ++i)
-		if (!memcompare(Bss[i].iBssid, 6, bssid, 6))
-			return;												// seen already
-	if (NumBss >= 32)
+	if (p[0] != 0x12)											// RX_IN_ORD_PADDR_IND is what full-reorder firmware sends
+		{
+		if (++OtherFrames <= 5)
+			Kern::Printf("[wifi] HTT message %x, %d bytes", p[0], n);
 		return;
-	SBss& b = Bss[NumBss++];
-	memcpy(b.iBssid, bssid, 6);
-	b.iChannel = (TUint8)channel;
-	b.iDbm = (TInt8)((TInt)snr - 95);
-	b.iSsidLen = 0;
-	for (TUint32 ie = 36; ie + 2 <= buflen; ie += 2 + frame[ie + 1])
-		if (frame[ie] == 0 && frame[ie + 1] <= 32 && ie + 2 + frame[ie + 1] <= buflen)
+		}
+	TBool offload = p[1] & 0x20;
+	TInt count = G16(p + 6);
+	for (TInt i = 0; i < count && 8 + 12 * i + 12 <= n; ++i)
+		{
+		TPhysAddr phys = G32(p + 8 + 12 * i);
+		TInt len = G16(p + 16 + 12 * i);
+		if (phys < HttBufPhys || phys >= HttBufPhys + KHttBufs * KHttBuf || (phys - HttBufPhys) % KHttBuf)
+			continue;											// not one of ours
+		++HttFrames;
+		static TUint32 bw[KHttBuf / 4];
+		TUint8* b = (TUint8*)bw;
+		FromDev(b, HttBufs + (phys - HttBufPhys), KHttBuf);
+		TUint32 attention = G32(b + 4), decap = (G32(b + 36) >> 8) & 3;
+		if (!offload && (attention >> 31) && (attention & 0x100) && len >= 24 && len <= KHttBuf - 360)
 			{
-			b.iSsidLen = frame[ie + 1];
-			memcpy(b.iSsid, frame + ie + 2, b.iSsidLen);
-			break;
+			++HttMgmt;
+			TInt dbm = (TInt)b[124] - 95;						// ppdu_start rssi_comb
+			if (decap == 0)										// RAW: the whole MPDU, 4-byte FCS at the end
+				AddBss(b + 360, b + 384, len - 28, 0, dbm, "HTT");
+			else if (decap == 1)								// native wifi: the real header is in rx_hdr_status
+				AddBss(b + 296, b + 360 + 24, len - 24, 0, dbm, "HTT");
 			}
-	TBuf8<33> ssid;
-	for (TInt i = 0; i < b.iSsidLen; ++i)
-		ssid.Append(b.iSsid[i] >= 0x20 && b.iSsid[i] < 0x7f ? b.iSsid[i] : '?');
-	if (!b.iSsidLen)
-		ssid.Copy((const TUint8*)"(hidden)", 8);
-	Kern::Printf("[wifi] scan: %S  %02x:%02x:%02x:%02x:%02x:%02x  ch %d  %d dBm%s", &ssid, bssid[0], bssid[1], bssid[2],
-		bssid[3], bssid[4], bssid[5], channel, b.iDbm, frame[34] & 0x10 ? "  secured" : "");
+		HttPost(phys);
+		}
 	}
 
 static void WmiEvent(const TUint8* p, TInt n)
@@ -560,8 +668,8 @@ static void HtcRx(const TUint8* f, TInt n)
 		HtcControl(p, len);
 	else if (eid == WmiEid)
 		WmiEvent(p, len);
-	else if (++OtherFrames <= 3)								// HTT: not set up; show the first few
-		Kern::Printf("[wifi] endpoint %d frame, %d bytes: %02x %02x %02x %02x", eid, len, p[0], p[1], p[2], p[3]);
+	else if (eid == HttEid)
+		HttRx(p, len);
 	}
 
 // reap every destination ring once: frames whose length the hardware filled in
@@ -585,7 +693,10 @@ static void Poll()
 			if (nbytes <= KCe[c].iMax && nbytes <= (TInt)sizeof(rx) && phys >= d.iBufPhys)
 				{
 				FromDev((TUint8*)rx, d.iBuf + (phys - d.iBufPhys), nbytes);
-				HtcRx((const TUint8*)rx, nbytes);
+				if (c == 5)										// HTT rx on CE5 skips HTC parsing (ath10k snoc.c)
+					HttRx((const TUint8*)rx + 8, nbytes - 8);
+				else
+					HtcRx((const TUint8*)rx, nbytes);
 				}
 			PostRx(c, phys);									// the same buffer goes back
 			}
@@ -720,7 +831,7 @@ start:
 		Cmd32(0x6c604830);
 		}
 	Kern::Printf("[wifi] %s scan", aActive ? "active" : "passive");
-	NumBss = Beacons = ChanInfos = OtherFrames = 0;
+	NumBss = Beacons = ChanInfos = OtherFrames = HttFrames = HttMgmt = 0;
 	ScanDone = EFalse;
 	if (CmdSend("start scan") != KErrNone)
 		return Error;
@@ -740,7 +851,7 @@ static TInt Run()
 	Error = KErrNone;
 	if (!Pool)
 		{
-		PoolSize = 0x80000;										// rings ~90 KB, buffers ~200 KB, host memory requests
+		PoolSize = 0x100000;									// CE rings + buffers ~280 KB, HTT (W3b) ~350 KB
 		NKern::ThreadEnterCS();
 		TInt r = Epoc::AllocPhysicalRam(PoolSize, PoolPhys, 12);
 		DPlatChunkHw* c = NULL;
@@ -797,6 +908,10 @@ static TInt Run()
 	r = HtcSend(HttEid, ver, sizeof(ver));
 	Kern::Printf("[wifi] HTT version request -> %d", r);
 	for (TInt t = 0; t < 300; ++t)
+		Poll(), NKern::Sleep(NKern::TimerTicks(1));
+	if ((r = HttSetup()) != KErrNone)
+		return r;
+	for (TInt t = 0; t < 100; ++t)
 		Poll(), NKern::Sleep(NKern::TimerTicks(1));
 	if ((r = Scan(EFalse)) != KErrNone)
 		return r;

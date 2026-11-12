@@ -68,8 +68,14 @@ TInt CmdDb_Find(const char* aName, TUint32& aAddr, TUint32 aAux[2])
 	return r;
 	}
 
-// ---- one active-only command on TCS 0 (Linux rpmh-rsc.c __tcs_buffer_write + __tcs_set_trigger), polled
-static TInt Rpmh_Write(TUint32 aAddr, TUint32 aData)
+// One command at a time on TCS 0: eMMC, the modem, IPA, USB and call audio vote from different threads, and two
+// interleaved writes reprogram the TCS under each other. A fast mutex: the write only spins (never blocks), and callers
+// may hold other locks (the eMMC's, the audio's), so it must not take part in the mutex order.
+static NFastMutex RpmhLock;
+static TUint32 LastTimeout[3];								// TCS status, IRQ status, command status at the last timeout
+
+// ---- one active-only command on TCS 0 (Linux rpmh-rsc.c __tcs_buffer_write + __tcs_set_trigger), polled; RpmhLock held
+static TInt WriteLocked(TUint32 aAddr, TUint32 aData)
 	{
 	if ((*(volatile TUint32*)A64_Io(KDrv2) >> 16 & 0xff) >= 3)	// RSC_DRV_ID major: v3 moves every register
 		return KErrNotSupported;
@@ -93,9 +99,64 @@ static TInt Rpmh_Write(TUint32 aAddr, TUint32 aData)
 	for (i = 0; i < KSpin && !(TcsGlobal(EIrqStatus) & (1u << KTcs)); ++i)
 		{}
 	TUint32 st = Tcs(ECmdStatus);
+	TBool done = i < KSpin && (st & KCmdCompl);
+	if (!done)
+		{
+		LastTimeout[0] = Tcs(EStatus);
+		LastTimeout[1] = TcsGlobal(EIrqStatus);
+		LastTimeout[2] = st;
+		}
 	TcsGlobal(EIrqClear) = 1u << KTcs;
 	Tcs(ECmdEnable) = 0;
-	return i < KSpin && (st & KCmdCompl) ? KErrNone : KErrTimedOut;
+	return done ? KErrNone : KErrTimedOut;
+	}
+
+static void LogTimeout(TUint32 aAddr)
+	{
+	Kern::Printf("[rpmh] timeout at %05x: tcs status %x, irq %x, cmd status %x", aAddr, LastTimeout[0], LastTimeout[1],
+		LastTimeout[2]);
+	}
+
+static TInt Rpmh_Write(TUint32 aAddr, TUint32 aData)
+	{
+	NKern::FMWait(&RpmhLock);
+	TInt r = WriteLocked(aAddr, aData);
+	NKern::FMSignal(&RpmhLock);
+	if (r == KErrTimedOut)
+		LogTimeout(aAddr);
+	return r;
+	}
+
+// VRM holders (see Vrm_Vote): one entry per rail we voted
+struct SVrm { char iName[8]; TUint16 iHolders, iMv; };
+const TInt KVrms = 16;
+static SVrm Vrms[KVrms];
+
+static TBool SameName(const char* aA, const char* aB)		// cmd-db names: at most 8 characters
+	{
+	for (TInt i = 0; i < 8; ++i)
+		{
+		if (aA[i] != aB[i])
+			return EFalse;
+		if (!aA[i])
+			return ETrue;
+		}
+	return ETrue;
+	}
+
+static SVrm* VrmEntry(const char* aName, TBool aCreate)		// RpmhLock held
+	{
+	SVrm* free = NULL;
+	for (TInt i = 0; i < KVrms; ++i)
+		{
+		if (!Vrms[i].iName[0])
+			free = free ? free : &Vrms[i];
+		else if (SameName(Vrms[i].iName, aName))
+			return &Vrms[i];
+		}
+	for (TInt i = 0; aCreate && free && i < 8 && aName[i]; ++i)
+		free->iName[i] = aName[i];
+	return aCreate ? free : NULL;
 	}
 
 static void Fmt(TDes8& aBuf, const char* aFmt, ...)
@@ -148,8 +209,12 @@ void A64RpmhVote(const TDesC8& aName, TDes8& aOut)
 		{
 		TUint32 addr = 0, aux[2];
 		TInt r = CmdDb_Find(n, addr, aux);
+		NKern::FMWait(&RpmhLock);
+		SVrm* v = VrmEntry(n, EFalse);
+		TInt holders = v ? v->iHolders : 0, mv = v ? v->iMv : 0;
+		NKern::FMSignal(&RpmhLock);
 		TPtrC8 name((const TUint8*)n);
-		Fmt(aOut, "%S: cmd-db addr %05x -> %d (lookup only)", &name, addr, r);
+		Fmt(aOut, "%S: cmd-db addr %05x -> %d; our vote %d mV, %d holders (lookup only)", &name, addr, r, mv, holders);
 		}
 	else if (arc)
 		Arc_Vote(n, 64, &aOut);								// "cx.lvl": low_svs, the eMMC's DT opp at 20 MHz
@@ -191,22 +256,39 @@ TInt Arc_Vote(const char* aName, TUint32 aVlvl, TDes8* aOut)
 	}
 
 // a VRM regulator (an LDO or SMPS by its cmd-db name, e.g. "ldob7" = pm660l ldo7): voltage (mV) at +0, mode at +8
-// (7 = an LDO's high-power mode), enable at +4 -- the layout of the RPMh VRM resource
+// (7 = an LDO's high-power mode), enable at +4 -- the layout of the RPMh VRM resource.
+// Rails are shared (the codec and the USB PHY both use ldob1/ldob7), and RPMh holds one vote per resource for our DRV:
+// each Vrm_Vote is a holder, the rail gets the highest voltage asked, and only the last Vrm_Off turns it off.
 TInt Vrm_Vote(const char* aName, TUint32 aMilliVolts, TDes8* aOut)
 	{
 	TUint32 addr = 0;
 	const TUint8* aux = NULL;
 	TInt len = 0;
 	TInt r = Find(aName, addr, aux, len);
+	TUint32 mv = aMilliVolts, holders = 0;
 	if (r == KErrNone)
-		r = Rpmh_Write(addr + 0, aMilliVolts);
-	if (r == KErrNone)
-		r = Rpmh_Write(addr + 8, 7);
-	if (r == KErrNone)
-		r = Rpmh_Write(addr + 4, 1);
+		{
+		NKern::FMWait(&RpmhLock);
+		SVrm* v = VrmEntry(aName, ETrue);
+		if (v)
+			{
+			if (v->iMv > mv)
+				mv = v->iMv;								// another holder needs more
+			v->iMv = (TUint16)mv;
+			holders = ++v->iHolders;
+			}
+		r = WriteLocked(addr + 0, mv);
+		if (r == KErrNone)
+			r = WriteLocked(addr + 8, 7);
+		if (r == KErrNone)
+			r = WriteLocked(addr + 4, 1);
+		NKern::FMSignal(&RpmhLock);
+		if (r == KErrTimedOut)
+			LogTimeout(addr);
+		}
 	TBuf8<120> b;
 	TPtrC8 name((const TUint8*)aName);
-	Fmt(b, "[rpmh] %S: addr %05x, %d mV, HPM, on -> %d", &name, addr, aMilliVolts, r);
+	Fmt(b, "[rpmh] %S: addr %05x, %d mV, HPM, on (%d holders) -> %d", &name, addr, mv, holders, r);
 	Kern::Printf("%S", &b);
 	if (aOut)
 		aOut->Copy(b);
@@ -233,8 +315,23 @@ TInt Vrm_Off(const char* aName)
 	const TUint8* aux = NULL;
 	TInt len = 0;
 	TInt r = Find(aName, addr, aux, len);
+	TInt left = 0;
 	if (r == KErrNone)
-		r = Rpmh_Write(addr + 4, 0);
-	Kern::Printf("[rpmh] %s: off -> %d", aName, r);
+		{
+		NKern::FMWait(&RpmhLock);
+		SVrm* v = VrmEntry(aName, EFalse);
+		if (v && v->iHolders)
+			left = --v->iHolders;
+		if (!left)
+			{
+			if (v)
+				v->iMv = 0;
+			r = WriteLocked(addr + 4, 0);
+			}
+		NKern::FMSignal(&RpmhLock);
+		if (r == KErrTimedOut)
+			LogTimeout(addr);
+		}
+	Kern::Printf("[rpmh] %s: %s -> %d", aName, left ? "kept on (other holders)" : "off", r);
 	return r;
 	}

@@ -156,8 +156,12 @@ TInt Adsp_Stop()
 	{
 	if (UpBusy)
 		return KErrInUse;
+	// each call that can block is logged: an ADSP stop once never returned and froze the phone (2026-11-12)
+	Kern::Printf("[adsp] stop: glink");
 	Glink_Stop(KSmemHostAdsp);
+	Kern::Printf("[adsp] stop: PAS shutdown (step %d)", Step);
 	TInt r = Step ? Pas_Shutdown(KPasAdsp) : KErrNone;
+	Kern::Printf("[adsp] stop: PAS shutdown -> %d", r);
 	if (r != KErrNone)
 		return Error = r; // firmware and DMA memory remain quarantined
 	Smp2p_Reset(KSmemHostAdsp);

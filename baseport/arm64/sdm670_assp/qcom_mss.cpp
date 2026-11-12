@@ -559,6 +559,9 @@ TInt Mss_Stop()
 	r = Smp2p_Reset(KSmemHostModem); // invalidates generation-checked IPA replies
 	if (r != KErrNone)
 		return Error = r;
+	// the AOP's view goes with it, as Linux's qcom_q6v5_unprepare: boot sends "on" again, and an AOP still at "on"
+	// timed out that second "on" (phone 2026-11-12: qmp load_state -33, the modem never came back after a FATAL)
+	Kern::Printf("[mss] load_state off -> %d", Qmp_Send("{class: image, res: load_state, name: modem, val: off}"));
 	Step = 0;
 	Error = 0;
 	return KErrNone;

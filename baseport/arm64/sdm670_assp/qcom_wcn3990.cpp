@@ -6,7 +6,9 @@
 // asks for this with HAL WlanStart (qcom_telhal.cpp 0x4e1d). Everything runs on our own DFC thread.
 // Register layout, ring and message formats are facts from Linux ath10k (ISC: snoc.c, ce.c/h, hw.c, htc.c/h,
 // wmi-tlv.c/h, wmi.c/h); private/wifi/w2-spec.md cites each one. This file is a new implementation.
-// shortcut: polled, a few rx buffers per ring, no HTT; enough for WMI READY. IRQs and the WHA PDD come with W3.
+// W3a: after READY, a first passive scan (PDEV_SET_PARAM chain masks, SCAN_CHAN_LIST, VDEV_CREATE, START_SCAN; beacons
+// from MGMT_RX logged), facts in private/wifi/w3a-scan-spec.md.
+// shortcut: polled for a fixed window, a few rx buffers per ring, no HTT; IRQs and the WHA PDD come with W3.
 #include <kernel/kern_priv.h>
 #include <platform.h>
 #include "board.h"
@@ -83,7 +85,8 @@ static TPhysAddr PoolPhys;
 static TUint32 PoolUsed, PoolSize;
 
 // ---- state, for the device registry and the log
-static TInt Step;				// 0 idle, 1 rings, 2 HTC ready, 3 connected, 4 service ready, 5 init sent, 6 ready
+static TInt Step;				// 0 idle, 1 rings, 2 HTC ready, 3 connected, 4 service ready, 5 init sent, 6 ready,
+								// 7 scanning, 8 scanned
 static TInt Error;
 static TUint16 CreditSize, Credits;
 static TUint8 HttEid = 0xff, WmiEid = 0xff, Seq[8];
@@ -391,6 +394,80 @@ static TInt SendInit()
 	return HtcSend(WmiEid, m, at);
 	}
 
+// ---- W3a: the first scan (private/wifi/w3a-scan-spec.md)
+struct SBss { TUint8 iBssid[6]; TUint8 iSsidLen; TUint8 iSsid[32]; TUint8 iChannel; TInt8 iDbm; };
+static SBss Bss[32];
+static TInt NumBss, Beacons;
+static TBool ScanDone;
+
+static void ScanEvent(const TUint8* p, TInt n)
+	{
+	TInt at = 0, tag, len;
+	const TUint8* v;
+	while (NextTlv(p, n, at, tag, v, len))
+		if (tag == 36 && len >= 24)
+			{
+			TUint32 type = G32(v), reason = G32(v + 4);
+			if (type & 0x1)
+				Kern::Printf("[wifi] scan started");
+			if (type & 0x40)
+				Kern::Printf("[wifi] scan start failed (reason %d)", reason);
+			if (type & 0x42)
+				ScanDone = ETrue;
+			if (type & 0x2)
+				Kern::Printf("[wifi] scan completed (reason %d): %d networks from %d frames", reason, NumBss, Beacons);
+			}
+	}
+
+static void MgmtRx(const TUint8* p, TInt n)
+	{
+	TInt at = 0, tag, len;
+	const TUint8* v;
+	const TUint8* hdr = NULL;
+	const TUint8* frame = NULL;
+	TInt flen = 0;
+	while (NextTlv(p, n, at, tag, v, len))
+		{
+		if (tag == 44 && len >= 40)
+			hdr = v;
+		else if (tag == 17)
+			frame = v, flen = len;
+		}
+	if (!hdr || !frame)
+		return;
+	TUint32 channel = G32(hdr), snr = G32(hdr + 4), buflen = G32(hdr + 16), status = G32(hdr + 20);
+	if (status & 0x29 || (TInt)buflen > flen || buflen < 36)
+		return;
+	if (frame[0] != 0x80 && frame[0] != 0x50)					// beacons and probe responses only
+		return;
+	++Beacons;
+	const TUint8* bssid = frame + 16;
+	for (TInt i = 0; i < NumBss; ++i)
+		if (!memcompare(Bss[i].iBssid, 6, bssid, 6))
+			return;												// seen already
+	if (NumBss >= 32)
+		return;
+	SBss& b = Bss[NumBss++];
+	memcpy(b.iBssid, bssid, 6);
+	b.iChannel = (TUint8)channel;
+	b.iDbm = (TInt8)((TInt)snr - 95);
+	b.iSsidLen = 0;
+	for (TUint32 ie = 36; ie + 2 <= buflen; ie += 2 + frame[ie + 1])
+		if (frame[ie] == 0 && frame[ie + 1] <= 32 && ie + 2 + frame[ie + 1] <= buflen)
+			{
+			b.iSsidLen = frame[ie + 1];
+			memcpy(b.iSsid, frame + ie + 2, b.iSsidLen);
+			break;
+			}
+	TBuf8<33> ssid;
+	for (TInt i = 0; i < b.iSsidLen; ++i)
+		ssid.Append(b.iSsid[i] >= 0x20 && b.iSsid[i] < 0x7f ? b.iSsid[i] : '?');
+	if (!b.iSsidLen)
+		ssid.Copy((const TUint8*)"(hidden)", 8);
+	Kern::Printf("[wifi] scan: %S  %02x:%02x:%02x:%02x:%02x:%02x  ch %d  %d dBm%s", &ssid, bssid[0], bssid[1], bssid[2],
+		bssid[3], bssid[4], bssid[5], channel, b.iDbm, frame[34] & 0x10 ? "  secured" : "");
+	}
+
 static void WmiEvent(const TUint8* p, TInt n)
 	{
 	if (n < 4)
@@ -422,7 +499,11 @@ static void WmiEvent(const TUint8* p, TInt n)
 				Step = 6;
 				}
 		}
-	else
+	else if (id == 0x3001)										// SCAN_EVENT
+		ScanEvent(p, n);
+	else if (id == 0x7001)										// MGMT_RX: beacons and probe responses
+		MgmtRx(p, n);
+	else if (id != 0x4002)										// CHAN_INFO comes for every channel: not logged
 		Kern::Printf("[wifi] WMI event %x, %d bytes", id, n);
 	}
 
@@ -497,6 +578,103 @@ static TBool WaitFor(TInt aStep, TInt aMs)
 	return Step >= aStep;
 	}
 
+// one WMI command: wait for the single credit (a CREDITS trailer returns it), then send
+static TUint32 CmdBuf[400];
+static TUint8* const Cmd = (TUint8*)CmdBuf;
+static TInt CmdLen;
+static void CmdStart(TUint32 aId) { Le32(Cmd, aId); CmdLen = 4; }
+static void CmdTlv(TInt aTag, TInt aLen) { Le32(Cmd + CmdLen, (TUint32)aTag << 16 | aLen); CmdLen += 4; }
+static void Cmd32(TUint32 aValue) { Le32(Cmd + CmdLen, aValue); CmdLen += 4; }
+static TInt CmdSend(const char* aWhat)
+	{
+	for (TInt t = 0; t < 1000 && !Credits && !Error; ++t)
+		Poll(), NKern::Sleep(NKern::TimerTicks(1));
+	if (!Credits)
+		return Fail(KErrTimedOut, aWhat);
+	TInt r = HtcSend(WmiEid, Cmd, CmdLen);
+	return r == KErrNone ? r : Fail(r, aWhat);
+	}
+
+// channels: 2.4 GHz 1-11 active, 12-13 passive; 5 GHz UNII-1 and UNII-3 passive (no DFS yet). Word 3 = mode | flags
+// (11G = 1, 11A = 0; ALLOW_HT 0x800, ALLOW_VHT 0x1000, ADHOC 0x100, PASSIVE 0x80); powers in 0.5 dBm (20 / 30 dBm)
+struct SChan { TUint16 iMhz; TUint16 iWord; };
+static const SChan KChans[] = {
+	{ 2412, 0x1901 }, { 2417, 0x1901 }, { 2422, 0x1901 }, { 2427, 0x1901 }, { 2432, 0x1901 }, { 2437, 0x1901 },
+	{ 2442, 0x1901 }, { 2447, 0x1901 }, { 2452, 0x1901 }, { 2457, 0x1901 }, { 2462, 0x1901 }, { 2467, 0x1881 },
+	{ 2472, 0x1881 },
+	{ 5180, 0x1880 }, { 5200, 0x1880 }, { 5220, 0x1880 }, { 5240, 0x1880 },
+	{ 5745, 0x1880 }, { 5765, 0x1880 }, { 5785, 0x1880 }, { 5805, 0x1880 }, { 5825, 0x1880 },
+	};
+const TInt KNumChans = sizeof(KChans) / sizeof(KChans[0]);
+// shortcut: one fixed locally administered MAC (the WCN3990 stores none); derive it from the phone before release
+static const TUint8 KMac[6] = { 0x02, 0x4e, 0x53, 0x57, 0x46, 0x01 };
+
+static TInt Scan()
+	{
+	TUint32 chains = (1u << Min(RfChains, 4u)) - 1;
+	for (TUint32 param = 1; param <= 2; ++param)				// PDEV_SET_PARAM TX / RX_CHAIN_MASK
+		{
+		CmdStart(0x4003);
+		CmdTlv(82, 8);
+		Cmd32(param);
+		Cmd32(chains);
+		if (CmdSend("chain mask") != KErrNone)
+			return Error;
+		}
+	CmdStart(0x3003);											// SCAN_CHAN_LIST
+	CmdTlv(79, 4);
+	Cmd32(KNumChans);
+	CmdTlv(18, KNumChans * 28);
+	for (TInt i = 0; i < KNumChans; ++i)
+		{
+		TBool g = KChans[i].iMhz < 3000;
+		CmdTlv(80, 24);
+		Cmd32(KChans[i].iMhz);
+		Cmd32(KChans[i].iMhz);
+		Cmd32(0);
+		Cmd32(KChans[i].iWord);
+		Cmd32(g ? 0x00282800 : 0x003c3c00);
+		Cmd32(g ? 0x00002800 : 0x00003c00);
+		}
+	if (CmdSend("channel list") != KErrNone)
+		return Error;
+	CmdStart(0x5001);											// VDEV_CREATE: vdev 0, station
+	CmdTlv(86, 20);
+	Cmd32(0);
+	Cmd32(2);
+	Cmd32(0);
+	Cmd32(KMac[0] | KMac[1] << 8 | KMac[2] << 16 | (TUint32)KMac[3] << 24);
+	Cmd32(KMac[4] | KMac[5] << 8);
+	if (CmdSend("vdev create") != KErrNone)
+		return Error;
+	CmdStart(0x3001);											// START_SCAN, passive (nothing transmitted)
+	CmdTlv(77, 100);
+	static const TUint32 KScan[25] = { 0xa000, 0xa001, 0, 1, 0x11f, 50, 150, 50, 500, 0, 0, 0, 20000, 5,
+		0x31,			// PASSIVE | CHAN_STAT_EVENT | FILTER_PROBE_REQ (inverted on TLV firmware)
+		0, (TUint32)KNumChans, 1, 0, 0, 3, 0, 0, 0, 0 };
+	for (TInt i = 0; i < 25; ++i)
+		Cmd32(KScan[i]);
+	CmdTlv(16, KNumChans * 4);									// the channels, MHz
+	for (TInt i = 0; i < KNumChans; ++i)
+		Cmd32(KChans[i].iMhz);
+	CmdTlv(19, 0);												// no SSIDs: passive
+	CmdTlv(19, 8);												// BSSIDs: the broadcast address
+	Cmd32(0xffffffff);
+	Cmd32(0x0000ffff);
+	CmdTlv(17, 0);												// no probe request IEs
+	NumBss = Beacons = 0;
+	ScanDone = EFalse;
+	if (CmdSend("start scan") != KErrNone)
+		return Error;
+	Step = 7;
+	for (TInt t = 0; t < 25000 && !ScanDone && !Error; ++t)	// 22 channels x 150 ms dwell + rest, max 20 s
+		Poll(), NKern::Sleep(NKern::TimerTicks(1));
+	if (!ScanDone)
+		return Fail(KErrTimedOut, "scan");
+	Step = 8;
+	return KErrNone;
+	}
+
 // ---- the bring-up, on its own thread
 static TInt Run()
 	{
@@ -557,7 +735,7 @@ static TInt Run()
 	Step = 5;
 	if (!WaitFor(6, 5000))
 		return Fail(KErrTimedOut, "WMI ready");
-	return KErrNone;
+	return Scan();
 	}
 
 static TDynamicDfcQue* Queue;
@@ -566,7 +744,7 @@ static TDfc RunDfc(RunDfcFn, NULL, 1);
 
 TInt Wcn3990_Start()
 	{
-	if (Step && Step < 6 && !Error)
+	if (Step && Step < 6 && Step != 8 && !Error)
 		return KErrInUse;
 	if (!Queue)
 		{
@@ -582,13 +760,15 @@ TInt Wcn3990_Start()
 static TA64DevState WifiStatus(TDes8& aDetail)
 	{
 	static const char* const KSteps[] = { "idle", "rings", "HTC ready", "connected", "service ready", "init sent",
-		"ready" };
+		"ready", "scanning", "scanned" };
 	A64Device_Format(aDetail, "WCN3990 %s", KSteps[Step]);
 	if (Error)
 		A64Device_Format(aDetail, ", error %d", Error);
+	if (Step >= 8)
+		A64Device_Format(aDetail, ", %d networks", NumBss);
 	if (Step == 6)
 		A64Device_Format(aDetail, ", MAC %02x:%02x:%02x:%02x:%02x:%02x", Mac[0], Mac[1], Mac[2], Mac[3], Mac[4],
 			Mac[5]);
-	return Error ? EA64DevError : Step == 6 ? EA64DevPartial : Step ? EA64DevStarting : EA64DevOff;
+	return Error ? EA64DevError : Step >= 6 ? EA64DevPartial : Step ? EA64DevStarting : EA64DevOff;
 	}
 A64_DEVICE("wifi", "WCN3990 Wi-Fi", "qcom_wcn3990", WifiStatus);

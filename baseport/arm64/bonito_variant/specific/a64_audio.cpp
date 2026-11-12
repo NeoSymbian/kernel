@@ -284,9 +284,13 @@ static const TUint32 KCdcInit[][2] = {
 
 static void CdcProbe()
 	{
-	Vrm_Vote("ldoa10", 1800);								// vdd-cdc-io, vdd-cdc-tx-rx-cx, vdd-micbias (DT)
-	Vrm_Vote("ldoa1", 880);
-	Vrm_Vote("ldoa7", 3088);
+	// The DTB's codec supplies (vdd-cdc-*-supply phandles 0x85/0x84/0x86): vdd-cdc-io = PM660 ("a") ldo10 1.8 V;
+	// vdd-cdc-tx-rx-cx = PM660L ("b") ldo1 0.88 V; vdd-micbias = PM660L ldo7 3.088 V. Until 2026-11-12 the last two
+	// went to PM660's ldo1/ldo7 (ldo7 there is a 1.2 V rail): the 3.088 V vote timed out in every call, and the modem
+	// then stayed on 3G or crashed in its RPMh code. The USB PHY shares ldob1/ldob7 (holder-counted in qcom_rpmh.cpp).
+	Vrm_Vote("ldoa10", 1800);
+	Vrm_Vote("ldob1", 880);
+	Vrm_Vote("ldob7", 3088);
 	Spmi_Write(KPm660l, 0xf0db, 0x01);
 	Spmi_Write(KPm660l, 0xf1db, 0x01);
 	for (TUint i = 0; i < sizeof(KCdcInit) / sizeof(KCdcInit[0]); ++i)

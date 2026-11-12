@@ -90,7 +90,7 @@ static TInt Step;				// 0 idle, 1 rings, 2 HTC ready, 3 connected, 4 service rea
 static TInt Error;
 static TUint16 CreditSize, Credits;
 static TUint8 HttEid = 0xff, WmiEid = 0xff, Seq[8];
-static TUint32 AbiVer0, AbiVer1, RfChains, MemReqs, BoardId;
+static TUint32 AbiVer0, AbiVer1, RfChains, MemReqs, BoardId, PhyCap, EepromRd, Low5g, High5g;
 static TUint8 Mac[6];
 static TUint32 Svc[32];			// the service bitmap: word id / 4, bit id % 4 (ath10k WMI_SERVICE_IS_ENABLED)
 static TBool Svc174, Svc179;
@@ -333,9 +333,16 @@ static void ServiceReady(const TUint8* p, TInt n)
 			{
 			AbiVer0 = G32(v + 4);
 			AbiVer1 = G32(v + 8);
+			PhyCap = G32(v + 28);
 			RfChains = G32(v + 36);
 			MemReqs = G32(v + 72);
 			BoardId = G32(v + 80);
+			}
+		else if (tag == 33 && len >= 36)						// HAL_REG_CAPABILITIES
+			{
+			EepromRd = G32(v);
+			Low5g = G32(v + 28);
+			High5g = G32(v + 32);
 			}
 		else if (tag == 16 && first)							// the service bitmap (ARRAY_UINT32)
 			{
@@ -354,6 +361,8 @@ static void ServiceReady(const TUint8* p, TInt n)
 		}
 	Kern::Printf("[wifi] WMI service ready: ABI %d.%d.%d.%d, %d RF chains, %d memory requests (%d allocated), board %x",
 		AbiVer0 >> 24, AbiVer0 & 0xffffff, AbiVer1 >> 16, AbiVer1 & 0xffff, RfChains, MemReqs, NumChunks, BoardId);
+	Kern::Printf("[wifi] reg caps: eeprom_rd %x, phy caps %x (2.4 GHz %d, 5 GHz %d), 5 GHz channels %d-%d", EepromRd,
+		PhyCap, (PhyCap >> 1) & 1, PhyCap & 1, Low5g, High5g);
 	Step = 4;
 	}
 
@@ -397,7 +406,7 @@ static TInt SendInit()
 // ---- W3a: the first scan (private/wifi/w3a-scan-spec.md)
 struct SBss { TUint8 iBssid[6]; TUint8 iSsidLen; TUint8 iSsid[32]; TUint8 iChannel; TInt8 iDbm; };
 static SBss Bss[32];
-static TInt NumBss, Beacons;
+static TInt NumBss, Beacons, ChanInfos, OtherFrames;
 static TBool ScanDone;
 
 static void ScanEvent(const TUint8* p, TInt n)
@@ -409,13 +418,14 @@ static void ScanEvent(const TUint8* p, TInt n)
 			{
 			TUint32 type = G32(v), reason = G32(v + 4);
 			if (type & 0x1)
-				Kern::Printf("[wifi] scan started");
+				Kern::Printf("[wifi] scan started (tick %d)", NKern::TickCount());
 			if (type & 0x40)
 				Kern::Printf("[wifi] scan start failed (reason %d)", reason);
 			if (type & 0x42)
 				ScanDone = ETrue;
 			if (type & 0x2)
-				Kern::Printf("[wifi] scan completed (reason %d): %d networks from %d frames", reason, NumBss, Beacons);
+				Kern::Printf("[wifi] scan completed (reason %d, tick %d): %d networks from %d frames; %d channel reports, "
+					"%d frames on other endpoints", reason, NKern::TickCount(), NumBss, Beacons, ChanInfos, OtherFrames);
 			}
 	}
 
@@ -503,7 +513,9 @@ static void WmiEvent(const TUint8* p, TInt n)
 		ScanEvent(p, n);
 	else if (id == 0x7001)										// MGMT_RX: beacons and probe responses
 		MgmtRx(p, n);
-	else if (id != 0x4002)										// CHAN_INFO comes for every channel: not logged
+	else if (id == 0x4002)										// CHAN_INFO: one per channel, counted
+		++ChanInfos;
+	else
 		Kern::Printf("[wifi] WMI event %x, %d bytes", id, n);
 	}
 
@@ -538,6 +550,8 @@ static void HtcRx(const TUint8* f, TInt n)
 		HtcControl(p, len);
 	else if (eid == WmiEid)
 		WmiEvent(p, len);
+	else if (++OtherFrames <= 3)								// HTT: not set up; show the first few
+		Kern::Printf("[wifi] endpoint %d frame, %d bytes: %02x %02x %02x %02x", eid, len, p[0], p[1], p[2], p[3]);
 	}
 
 // reap every destination ring once: frames whose length the hardware filled in
@@ -638,6 +652,22 @@ static TInt Scan()
 		}
 	if (CmdSend("channel list") != KErrNone)
 		return Error;
+	// PDEV_SET_REGDOMAIN as ath10k (mac.c ath10k_regd_update): eeprom_rd 0 = US FCC3 0x3a, ctl 0x10; else the value as is
+	// with no CTL (world 0x60-0x64: 0xff)
+	TUint32 regd = EepromRd ? EepromRd & 0x7fff : 0x3a, ctl = EepromRd ? 0xff : 0x10;
+	if (regd == 0x8000 || !regd)
+		regd = 0x64;
+	CmdStart(0x4001);
+	CmdTlv(81, 24);
+	Cmd32(0);													// pdev_id
+	Cmd32(regd);
+	Cmd32(regd);
+	Cmd32(regd);
+	Cmd32(ctl);
+	Cmd32(ctl);
+	if (CmdSend("regdomain") != KErrNone)
+		return Error;
+	Kern::Printf("[wifi] regdomain %x, ctl %x", regd, ctl);
 	CmdStart(0x5001);											// VDEV_CREATE: vdev 0, station
 	CmdTlv(86, 20);
 	Cmd32(0);
@@ -662,7 +692,7 @@ static TInt Scan()
 	Cmd32(0xffffffff);
 	Cmd32(0x0000ffff);
 	CmdTlv(17, 0);												// no probe request IEs
-	NumBss = Beacons = 0;
+	NumBss = Beacons = ChanInfos = OtherFrames = 0;
 	ScanDone = EFalse;
 	if (CmdSend("start scan") != KErrNone)
 		return Error;

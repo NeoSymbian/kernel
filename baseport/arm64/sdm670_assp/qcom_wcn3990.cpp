@@ -701,6 +701,8 @@ static void HttRx(const TUint8* p, TInt n)
 		{
 		for (TInt i = 0; i < p[2] && 4 + 2 * i + 2 <= n; ++i)
 			TxDone(G16(p + 4 + 2 * i), p[1] & 7);
+		if (Link == ELinkHandshake)								// W4 diagnosis: msg4's report
+			Kern::Printf("[wifi] tx done: %d msdus from %d, status %d", p[2], n >= 6 ? G16(p + 4) : -1, p[1] & 7);
 		return;
 		}
 	if (p[0] == 0x0b)											// SEC_IND: a key was installed
@@ -1636,12 +1638,15 @@ static TInt DoReq(TInt aOp, const TUint8* aData, TInt aLen)
 		TInt id = DataTx(Frame, 32 + aLen, !PtkInstalled);
 		if (id < 0)
 			return id;
-		for (TInt t = 0; t < 1000 && TxStat[id] < 0 && !Error; ++t)	// msg4 must be out before the PTK goes in
+		// wait for the chip to report it sent (msg4 before the PTK goes in). NO_ENCRYPT was fixed when it was queued, so a
+		// late report is logged, not fatal: on the phone msg4's report did not come within 1 s (msg2's did)
+		TInt t = 0;
+		for (; t < 2000 && TxStat[id] < 0 && !Error; ++t)
 			Poll(), NKern::Sleep(NKern::TimerTicks(1));
 		TInt st = TxStat[id];
 		TxBusy[id] = EFalse;
-		Kern::Printf("[wifi] EAPOL out, %d bytes: tx status %d", aLen, st);
-		return st < 0 ? KErrTimedOut : KErrNone;				// not acked still counts: the AP resends if it missed it
+		Kern::Printf("[wifi] EAPOL out, %d bytes, msdu %d: tx status %d after %d ms", aLen, id, st, t);
+		return KErrNone;										// not acked still counts: the AP resends if it missed it
 		}
 	case EReqKey:
 		{

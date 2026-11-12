@@ -95,6 +95,7 @@ static TUint8 HttEid = 0xff, WmiEid = 0xff, Seq[8];
 static TUint32 AbiVer0, AbiVer1, RfChains, MemReqs, BoardId, PhyCap, EepromRd, Low5g, High5g;
 static TUint8 Mac[6];
 static TUint8 HostMac[6] = { 0x02, 0x4e, 0x53, 0x57, 0x46, 0x01 };	// our station address (PickMac)
+static volatile TBool ModemDown;									// the modem stopped (Wcn3990_ModemDown)
 static TUint32 Svc[32];			// the service bitmap: word id / 4, bit id % 4 (ath10k WMI_SERVICE_IS_ENABLED)
 static TBool Svc174, Svc179;
 
@@ -1748,6 +1749,14 @@ static void Serve()
 	{
 	for (;;)
 		{
+		if (ModemDown)											// the firmware is gone with the modem: hands off the chip
+			{
+			if (Link >= ELinkJoining && Link <= ELinkConnected)
+				SetLink(ELinkLost, 0, 0);
+			Error = KErrDied;
+			Kern::Printf("[wifi] the modem stopped: Wi-Fi is off until a reboot");
+			return;
+			}
 		Poll();
 		if (Step == 7 && (ScanDone || NKern::TickCount() - ScanStartedAt > 25000))
 			{
@@ -1891,8 +1900,17 @@ static TDynamicDfcQue* Queue;
 static void RunDfcFn(TAny*) { Run(); }
 static TDfc RunDfc(RunDfcFn, NULL, 1);
 
+// shortcut: after a modem stop Wi-Fi stays off until a reboot: a second bring-up would carve new rings over the
+// HTT/tx memory still in use, and the MSA regions stay with the modem's VMIDs. Upgrade with a full re-init path.
+void Wcn3990_ModemDown()
+	{
+	ModemDown = ETrue;
+	}
+
 TInt Wcn3990_Start()
 	{
+	if (ModemDown)
+		return KErrNotSupported;
 	if (Step && !Error)
 		return KErrInUse;										// up (or coming up): one bring-up per boot
 	if (!Queue)

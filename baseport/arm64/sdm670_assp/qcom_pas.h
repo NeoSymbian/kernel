@@ -18,4 +18,5 @@ TInt Pas_Begin(TUint32 aPas, const TUint8* aMdt, TUint32 aMdtLen, TUint32 aPhys,
 TInt Pas_Segment(TUint32 aIndex, TUint32 aOffset, const TUint8* aData, TUint32 aLen);
 TInt Pas_End();
 void Pas_Abort();
+TInt Pas_Shutdown(TUint32 aPas);
 #endif

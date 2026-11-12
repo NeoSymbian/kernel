@@ -23,7 +23,8 @@
 const TUint32 KAdspPhys = 0x95800000, KAdspSize = 0x02200000;
 const TUint32 KCrashReason = 423;							// SMEM_SSR_REASON_LPASS0
 
-static TInt Step, Error;									// 1 loading, 2 authenticated, 3 ready + GLINK, 4 handover
+static TInt Step, Error;
+static volatile TBool UpBusy;									// 1 loading, 2 authenticated, 3 ready + GLINK, 4 handover
 
 static TInt Fail(TInt aErr, const char* aWhat)
 	{
@@ -72,7 +73,7 @@ static void Up()
 	}
 
 static TDynamicDfcQue* Queue;
-static void UpDfcFn(TAny*) { Up(); }
+static void UpDfcFn(TAny*) { Up(); __e32_memory_barrier(); UpBusy = EFalse; }
 static TDfc UpDfc(UpDfcFn, NULL, 1);
 
 TInt Adsp_Load(TInt aOp, TInt aSegment, TUint32 aOffset, const TUint8* aData, TUint32 aLen)
@@ -81,8 +82,8 @@ TInt Adsp_Load(TInt aOp, TInt aSegment, TUint32 aOffset, const TUint8* aData, TU
 	switch (aOp)
 		{
 	case 0:
-		if (Step >= 2 && !Error)
-			return KErrInUse;									// booted already (no restart yet)
+		if (Step || UpBusy)
+			return KErrInUse;									// a failed or running generation must be stopped before another load
 		Step = 1;
 		Error = 0;
 		if ((r = Qmp_Open()) != KErrNone)
@@ -116,6 +117,7 @@ TInt Adsp_Load(TInt aOp, TInt aSegment, TUint32 aOffset, const TUint8* aData, TU
 				return Fail(r, "thread");
 			UpDfc.SetDfcQ(Queue);
 			}
+		UpBusy = ETrue;
 		UpDfc.Enque();
 		return KErrNone;
 		}
@@ -149,3 +151,22 @@ static TA64DevState AdspStatus(TDes8& aDetail)
 	return Step == 0 ? EA64DevOff : Step == 4 ? EA64DevOk : EA64DevStarting;
 	}
 A64_DEVICE("adsp", "Audio DSP (ADSP)", "qcom_adsp", AdspStatus);
+
+TInt Adsp_Stop()
+	{
+	if (UpBusy)
+		return KErrInUse;
+	// each call that can block is logged: an ADSP stop once never returned and froze the phone (2026-11-12)
+	Kern::Printf("[adsp] stop: glink");
+	Glink_Stop(KSmemHostAdsp);
+	Kern::Printf("[adsp] stop: PAS shutdown (step %d)", Step);
+	TInt r = Step ? Pas_Shutdown(KPasAdsp) : KErrNone;
+	Kern::Printf("[adsp] stop: PAS shutdown -> %d", r);
+	if (r != KErrNone)
+		return Error = r; // firmware and DMA memory remain quarantined
+	Smp2p_Reset(KSmemHostAdsp);
+	Qmp_Send("{class: image, res: load_state, name: adsp, val: off}");
+	Step = 0;
+	Error = 0;
+	return KErrNone;
+	}

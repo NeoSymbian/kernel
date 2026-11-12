@@ -10,5 +10,6 @@ TInt Glink_Start(TInt aRemote);								// the edge's FIFOs + version handshake +
 // (edge << 8 | lcid: the modem's are 1..8)
 TInt Glink_Open(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr);
 TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen);	// KErrNotReady until the remote gave an intent
+TInt Glink_Stop(TInt aRemote); // quiesces callbacks and invalidates all edge channels
 void Glink_Dump(void (*aSay)(const char*, ...));
 #endif

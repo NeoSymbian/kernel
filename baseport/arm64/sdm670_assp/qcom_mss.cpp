@@ -55,6 +55,7 @@ static volatile TUint32& Reg(TUint32 aPhys) { return *(volatile TUint32*)A64_Io(
 
 // ---- state the monitor can read
 static TInt Step, Error;
+static volatile TBool BootBusy;
 static TUint64 MpssPerm = 1ull << KScmVmidHlos, MbaPerm = 1ull << KScmVmidHlos;
 
 static TInt Fail(TInt aStep, TInt aErr, const char* aWhat)
@@ -161,26 +162,46 @@ static void AltReset()
 	Reg(KPdcSyncReset) &= ~KPdcModemBit;
 	}
 
-static void HaltAxi(TUint32 aBase)							// Linux q6v5proc_halt_axi_port
+static TInt HaltAxi(TUint32 aBase)							// Linux q6v5proc_halt_axi_port
 	{
 	if (Reg(aBase + 8))										// already idle
-		return;
+		return KErrNone;
 	Reg(aBase) = 1;
 	for (TInt i = 0; i < 100 && !Reg(aBase + 4); ++i)
 		NKern::Sleep(NKern::TimerTicks(1));
 	if (!Reg(aBase + 8))
 		Kern::Printf("[mss] AXI port %08x failed to halt", aBase);
+	TInt r = Reg(aBase + 8) ? KErrNone : KErrTimedOut;
 	Reg(aBase) = 0;
+	return r;
 	}
 
-static void Stop()											// halt the ports, reset, and take the memory back
+static TInt Stop()											// halt the ports, reset, and take the memory back
 	{
-	HaltAxi(KHaltQ6);
-	HaltAxi(KHaltModem);
-	HaltAxi(KHaltNc);
-	AltReset();
-	Xfer(MpssPerm, ETrue, EFalse, KMpssPhys, KMpssSize);
-	Xfer(MbaPerm, ETrue, EFalse, KMbaPhys, KMbaSize);
+	TInt r = HaltAxi(KHaltQ6);
+	TInt modem = HaltAxi(KHaltModem), nc = HaltAxi(KHaltNc);
+	if (r != KErrNone || modem != KErrNone || nc != KErrNone)
+		Kern::Printf("[mss] AXI halt incomplete (%d/%d/%d); forcing MSS reset", r, modem, nc);
+	// A crashed modem may never drain its AXI port. Linux's q6v5proc_halt_axi_port warns and
+	// q6v5_mba_reclaim still resets MSS; an AXI warning must not prevent the hard-stop fallback.
+	// https://github.com/torvalds/linux/blob/v6.12/drivers/remoteproc/qcom_q6v5_mss.c
+	// q6v5_reset_assert(has_alt_reset): pulse MSS restart while PDC sync reset is asserted.
+	// Unlike boot's AltReset, do not set RMB_MBA_ALT_RESET (that starts the MBA reset path).
+	// https://github.com/torvalds/linux/blob/master/drivers/remoteproc/qcom_q6v5_mss.c
+	Reg(KPdcSyncReset) |= KPdcModemBit;
+	Reg(KAossMssRestart) = 1;
+	__e32_memory_barrier();
+	Kern::NanoWait(300000);
+	Reg(KAossMssRestart) = 0;
+	Kern::NanoWait(300000);
+	Reg(KPdcSyncReset) &= ~KPdcModemBit;
+	__asm__ __volatile__("dsb sy" ::: "memory"); // reset writes complete before asking TZ to reclaim memory
+	// Secure SSR permits reclaiming MPSS only after the MBA has been loaded again. Leave it reserved
+	// with its current ownership here; the next boot checks MPSS reclaim before mapping any segment.
+	// Linux v6.12 q6v5_mba_reclaim and q6v5_mpss_load (the secure subsystem-restart comment).
+	r = Xfer(MbaPerm, ETrue, EFalse, KMbaPhys, KMbaSize);
+	Kern::Printf("[mss] reset complete; MBA reclaim -> %d (MPSS deferred until MBA boot)", r);
+	return r;
 	}
 
 struct SPhdr { TUint32 iType, iOffset, iVaddr, iPaddr, iFilesz, iMemsz, iFlags, iAlign; };
@@ -287,6 +308,8 @@ static TInt Boot()
 		minAddr, reloc ? " (relocatable)" : "");
 
 	Step = 2;												// MBA into its carve-out (before the modem owns it)
+	if (MbaPerm != (1ull << KScmVmidHlos))
+		return Fail(Step, KErrNotReady, "MBA ownership not reclaimed");
 	DPlatChunkHw* c;
 	TUint8* p = Map(KMbaPhys, KMbaSize, c);
 	if (!p)
@@ -361,11 +384,17 @@ static TInt Boot()
 		Stop();
 		return Fail(Step, r, "metadata buffer");
 		}
-	if ((p = Map(md, 0x3000, c)) != NULL)
+	p = Map(md, 0x3000, c);
+	if (!p)
 		{
-		memcpy(p, hdr, mdt.iSize);
-		Unmap(c);
+		NKern::ThreadEnterCS();
+		Epoc::FreePhysicalRam(md, 0x3000); // ownership has not left HLOS
+		NKern::ThreadLeaveCS();
+		Stop();
+		return Fail(Step, KErrNoMemory, "metadata mapping");
 		}
+	memcpy(p, hdr, mdt.iSize);
+	Unmap(c);
 	TUint64 mdPerm = 1ull << KScmVmidHlos;
 	r = Xfer(mdPerm, EFalse, ETrue, md, mdt.iSize);
 	if (r == KErrNone)
@@ -373,11 +402,18 @@ static TInt Boot()
 		Reg(KRmb + ERmbMetaData) = md;
 		Reg(KRmb + ERmbCommand) = KCmdMetaDataReady;
 		r = RmbWait(KStatusMetaOk, 1000);
-		Xfer(mdPerm, ETrue, EFalse, md, mdt.iSize);
+		TInt reclaim = Xfer(mdPerm, ETrue, EFalse, md, mdt.iSize);
+		if (reclaim != KErrNone)
+			r = reclaim;
 		}
-	NKern::ThreadEnterCS();
-	Epoc::FreePhysicalRam(md, 0x3000);
-	NKern::ThreadLeaveCS();
+	if (mdPerm == (1ull << KScmVmidHlos))
+		{
+		NKern::ThreadEnterCS();
+		Epoc::FreePhysicalRam(md, 0x3000);
+		NKern::ThreadLeaveCS();
+		}
+	else
+		Kern::Printf("[mss] metadata quarantined: ownership reclaim failed");
 	if (r != KStatusMetaOk)
 		{
 		Stop();
@@ -386,7 +422,11 @@ static TInt Boot()
 	Kern::Printf("[mss] headers authenticated");
 
 	Step = 6;												// the segments, shared with the modem while loading
-	Xfer(MpssPerm, ETrue, EFalse, KMpssPhys, KMpssSize);
+	if ((r = Xfer(MpssPerm, ETrue, EFalse, KMpssPhys, KMpssSize)) != KErrNone)
+		{
+		Stop();
+		return Fail(Step, r, "reclaim mpss after MBA boot");
+		}
 	if ((r = Xfer(MpssPerm, ETrue, ETrue, KMpssPhys, KMpssSize)) != KErrNone)
 		{
 		Stop();
@@ -478,12 +518,12 @@ static TInt Boot()
 
 // ---- the boot's own thread
 static TDynamicDfcQue* Queue;
-static void BootDfcFn(TAny*) { Boot(); }
+static void BootDfcFn(TAny*) { Boot(); __e32_memory_barrier(); BootBusy = EFalse; }
 static TDfc BootDfc(BootDfcFn, NULL, 1);
 
 TInt Mss_StartBoot()
 	{
-	if (Step && Step < 8 && !Error)
+	if (BootBusy || Step)
 		return KErrInUse;
 	if (!Queue)
 		{
@@ -493,6 +533,7 @@ TInt Mss_StartBoot()
 		BootDfc.SetDfcQ(Queue);
 		}
 	Step = 0;
+	BootBusy = ETrue;
 	BootDfc.Enque();
 	return KErrNone;
 	}
@@ -505,4 +546,23 @@ void Mss_State(TInt& aStep, TInt& aError, TUint32 aRmb[4])
 	aRmb[1] = Reg(KRmb + ERmbStatus);
 	aRmb[2] = Reg(KRmb + ERmbMssStatus);
 	aRmb[3] = Reg(KRmb + ERmbCodeLength);
+	}
+
+TInt Mss_Stop()
+	{
+	if (BootBusy)
+		return KErrInUse;
+	Glink_Stop(KSmemHostModem);
+	TInt r = Step ? Stop() : KErrNone;
+	if (r != KErrNone)
+		return Error = r;
+	r = Smp2p_Reset(KSmemHostModem); // invalidates generation-checked IPA replies
+	if (r != KErrNone)
+		return Error = r;
+	// the AOP's view goes with it, as Linux's qcom_q6v5_unprepare: boot sends "on" again, and an AOP still at "on"
+	// timed out that second "on" (phone 2026-11-12: qmp load_state -33, the modem never came back after a FATAL)
+	Kern::Printf("[mss] load_state off -> %d", Qmp_Send("{class: image, res: load_state, name: modem, val: off}"));
+	Step = 0;
+	Error = 0;
+	return KErrNone;
 	}

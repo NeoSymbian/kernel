@@ -15,6 +15,7 @@
 // shortcut: no amp interrupt handling (protection errors are only logged on start); no ACDB calibration.
 #include <kernel/kern_priv.h>
 #include "board.h"
+#include "a64_mutex.h"
 #include "qcom_spmi.h"
 #include "qcom_rpmh.h"
 #include "qcom_geni_i2c.h"
@@ -311,21 +312,51 @@ static void MicBias(TBool aOn)
 	SpmiUpd(0xf140, 0x40, 0x40);							// no external bypass capacitor
 	}
 
+// Shared by the audio parts and DRV2624; never reprogram a live shared GENI engine.
+static DMutex* BusLock;
+static NFastMutex BusInit;
+TInt A64Board_I2c10()
+	{
+	TInt r = A64Mutex_Init(BusLock, BusInit, _L("BoardI2c10"), KMutexOrdGeneral1);
+	if (r != KErrNone)
+		return r;
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*BusLock);
+	static TBool ready;
+	if (!ready)
+		{
+		Reg(KGccVote1) |= 1u << 24;
+		Reg(KSe2RcgCfg) = 1;									// XO 19.2 MHz
+		Reg(KSe2RcgCmd) |= 1;
+		for (TInt i = 0; i < 100000 && (Reg(KSe2RcgCmd) & 1); ++i)
+			{}
+		for (TInt i = 0; i < 100000 && (Reg(KSe2Cbcr) & (1u << 31)); ++i)
+			{}
+		Ctl(KTlmmNorth, 55) = 0x004;							// qup10: I2C10 SDA/SCL
+		Ctl(KTlmmNorth, 56) = 0x004;
+		if ((Reg(KSe2RcgCmd) & 1) || (Reg(KSe2Cbcr) & (1u << 31)))
+			r = KErrTimedOut;
+		else
+			{
+			TInt proto = I2c_Open(KBus, KSe2, 400);
+			r = proto == 3 ? KErrNone : KErrNotReady;
+			ready = r == KErrNone;
+			}
+		}
+	Kern::MutexSignal(*BusLock);
+	NKern::ThreadLeaveCS();
+	return r;
+	}
+
 // ---- bring-up
 static TInt Probe()
 	{
 	if (Probed)
 		return ProbeErr;
 	Probed = ETrue;
-	Reg(KGccVote1) |= 1u << 24;
-	Reg(KSe2RcgCfg) = 1;									// XO 19.2 MHz
-	Reg(KSe2RcgCmd) |= 1;
-	for (TInt i = 0; i < 100000 && (Reg(KSe2RcgCmd) & 1); ++i)
-		{}
-	for (TInt i = 0; i < 100000 && (Reg(KSe2Cbcr) & (1u << 31)); ++i)
-		{}
-	Ctl(KTlmmNorth, 55) = 0x004;							// qup10: I2C10 SDA/SCL
-	Ctl(KTlmmNorth, 56) = 0x004;
+	TInt bus = A64Board_I2c10();
+	if (bus != KErrNone)
+		return ProbeErr = bus;
 	for (TInt p = 65; p <= 68; ++p)
 		Ctl(KTlmmNorth, p) = 0x0c4;							// pri_mi2s (the mic's TDM), 8 mA
 	Ctl(KTlmmNorth, 79) = 0x001;							// amp IRQs: inputs, pulled down
@@ -338,12 +369,6 @@ static TInt Probe()
 	Io(KTlmmWest, 14) = 2;
 	Io(KTlmmWest, 16) = 2;
 	Ms(3);
-	TInt proto = I2c_Open(KBus, KSe2, 400);
-	if (proto != 3)
-		{
-		Kern::Printf("[audio] I2C10: protocol %d (clock %08x)", proto, Reg(KSe2Cbcr));
-		return ProbeErr = KErrNotReady;
-		}
 	TInt top = AmpProbe(0), bottom = AmpProbe(1), rt = RtProbe();
 	CdcProbe();
 	Kern::Printf("[audio] amps: top %d (rev %x%s), bottom %d (rev %x%s); mic %d (%08x); i2c faults %d", top,
@@ -410,7 +435,7 @@ static void Stop()
 	Kern::Printf("[audio] off");
 	}
 
-TInt A64Audio_Control(TInt aOp, TInt aArg)
+static TInt Control(TInt aOp, TInt aArg)
 	{
 	switch (aOp)
 		{
@@ -442,6 +467,18 @@ TInt A64Audio_Control(TInt aOp, TInt aArg)
 		return KErrNone;
 		}
 	return KErrArgument;
+	}
+
+TInt A64Audio_Control(TInt aOp, TInt aArg)
+	{
+	TUint32 before = Faults;
+	TInt r = Control(aOp, aArg);
+	if (Faults != before)
+		{
+		Stop(); // best effort safe state; never advertise an I2C failure as applied success
+		return r == KErrNone ? KErrGeneral : r;
+		}
+	return r;
 	}
 
 void A64Audio_Report(void (*aSay)(const char*, ...))

@@ -9,6 +9,9 @@ TInt Wcn3990_Start();
 TInt Wcn3990_ScanHal(TAny* a1, TAny* a2);
 // HAL WlanLink (0x4e1f): a1 = op, a2 = TDes8* (join, leave, status, EAPOL in/out, keys, authorize; W4)
 TInt Wcn3990_LinkHal(TAny* a1, TAny* a2);
+// the modem was stopped (C7 recovery, qcom_telhal.cpp): the WLAN firmware ran inside it, so the driver stops using
+// the chip and reports the link lost
+void Wcn3990_ModemDown();
 // the debug monitor's "wifi" (0), "wifi join N" (1, N), "wifi leave" (2)
 void Wcn3990_Monitor(TInt aOp, TInt aArg);
 #endif

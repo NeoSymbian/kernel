@@ -204,3 +204,16 @@ TInt Pas_Load(TUint32 aPas, const TUint8* aImage, TUint32 aLen, TUint32 aMdtLen,
 		Pas_Abort();
 	return r;
 	}
+
+// Linux qcom_scm_pas_shutdown: PIL service 2, command 6, one value argument (peripheral ID).
+TInt Pas_Shutdown(TUint32 aPas)
+	{
+	if (L.iBusy)
+		{
+		if (L.iPas != aPas)
+			return KErrInUse;
+		Done();
+		}
+	TUint64 args[1] = { aPas };
+	return Pil(6, Args(1), args, 1, "shutdown");
+	}

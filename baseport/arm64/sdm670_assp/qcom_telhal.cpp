@@ -29,11 +29,19 @@
 //   0x4e1d WlanStart   after WLAN cfg + mission mode: the copy engines, HTC and WMI up to READY on the driver's own
 //                      thread (qcom_wcn3990.cpp, docs wifi.md W2); KErrInUse while it runs
 //   0x4e23 Prng        a1 = TDes8* (length 1..256 = the bytes wanted): the SoC's hardware PRNG (Wi-Fi W4 nonces)
+//   C7 (calls): 0x4e24 RprocStop SIo{a = mask 1 MSS, 2 ADSP}, asynchronous; poll 0x4e25 RprocState
+//                      [phase, error, mss_gen, adsp_gen], phase 0 idle, 1 stopping, 2 stopped, 3 failed (never reload
+//                      after 3 until a later stop succeeds).
+//                      0x4e26 AudioMem SIo: 0 info -> {b = phys, len = 64 KiB, buf = adsp_gen}; 1 copy {b = offset,
+//                      len, buf}; 2 publish -> {b = ticket, len = 64 KiB, buf = adsp_gen}; 3 complete {b = ticket,
+//                      buf = adsp_gen} after the DSP is done.
+//                      0x4e27 Haptic SIo{a = ms 0..2000, b = amplitude 0..127}; zero stops, a timer bounds each pulse.
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
 #include <platform.h>
 #include "board.h"
+#include "a64_mutex.h"
 #include "a64_blk.h"
 #include "qcom_scm.h"
 #include "qcom_smp2p.h"
@@ -48,10 +56,12 @@
 
 TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
 // the board's codecs (bonito a64_audio.cpp); a board without call audio has none
+__attribute__((weak)) TInt A64Haptic_Control(TInt, TInt) { return KErrNotSupported; }
 __attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupported; }
 
 enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
-	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa, EWlanStart, EPrng = 0x4e23 };
+	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa, EWlanStart, EPrng = 0x4e23, ERprocStop, ERprocState, EAudioMem,
+	EHaptic };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -68,6 +78,62 @@ struct SRing
 	};
 static SRing Rings[KTelRings];
 static TBool RingsInit;
+static TBool FatalSaid;
+static TUint32 Generations[2];
+static volatile TInt StopPhase, StopError;
+static TUint32 StopMask;
+static NFastMutex StopLock;
+#if defined(TEL_DIAGNOSTICS) && TEL_DIAGNOSTICS
+static TUint32 DiagnosticFaultMask, DiagnosticFaultId;
+
+TInt Tel_DiagnosticFault(TUint32 aMask)
+	{
+	if (aMask != 1 && aMask != 2)
+		return KErrArgument;
+	// Reject a request against a booting or genuinely failed processor. This never writes remote state.
+	TInt step, error;
+	TUint32 bits = 0, rmb[4];
+	if (aMask == 1)
+		Mss_State(step, error, rmb);
+	else
+		Adsp_State(step, error);
+	TInt r = Smp2p_In(aMask == 1 ? KSmemHostModem : KSmemHostAdsp, "slave-kernel", bits);
+	if (r != KErrNone || error || step != (aMask == 1 ? 8 : 4) || (bits & KMssFatal))
+		return KErrNotReady;
+	NKern::FMWait(&StopLock);
+	if (DiagnosticFaultMask || StopPhase == 1 || StopPhase == 3)
+		r = KErrInUse;
+	else
+		{
+		DiagnosticFaultMask = aMask;
+		if (!++DiagnosticFaultId)
+			++DiagnosticFaultId;
+		}
+	TUint32 id = DiagnosticFaultId;
+	NKern::FMSignal(&StopLock);
+	if (r == KErrNone)
+		Kern::Printf("[tel] synthetic detection id %d mask %d latched; MODEMD owns recovery", id, aMask);
+	return r;
+	}
+
+static TUint32 DiagnosticFatal(TUint32 aMask)
+	{
+	NKern::FMWait(&StopLock);
+	TUint32 bits = DiagnosticFaultMask & aMask ? KMssFatal : 0;
+	NKern::FMSignal(&StopLock);
+	return bits;
+	}
+
+static void DiagnosticStopped(TUint32 aMask)
+	{
+	NKern::FMWait(&StopLock);
+	TUint32 done = DiagnosticFaultMask & aMask, id = DiagnosticFaultId;
+	DiagnosticFaultMask &= ~aMask;
+	NKern::FMSignal(&StopLock);
+	if (done)
+		Kern::Printf("[tel] synthetic detection id %d mask %d cleared after acknowledged stop", id, done);
+	}
+#endif
 
 TAny* Tel_Ring(TInt aRing)
 	{
@@ -119,15 +185,19 @@ void Tel_Dump(void (*aSay)(const char*, ...))
 	for (TInt i = 0; i < KTelRings; ++i)
 		aSay("tel ring %d: channel %x, %d bytes queued, %d dropped", i, Rings[i].iChannel,
 			Rings[i].iHead - Rings[i].iTail, Rings[i].iDrops);
+	NKern::FMWait(&StopLock);
+	TInt phase = StopPhase, error = StopError;
+	TUint32 mask = StopMask, mss = Generations[0], adsp = Generations[1];
+	NKern::FMSignal(&StopLock);
+	aSay("tel stop phase %d error %d mask %d generations %d/%d", phase, error, mask, mss, adsp);
 	}
 
 // the modem's own reason, once, when it raises FATAL while running (the boot path prints it for boot failures)
 static void FatalReason(TUint32 aSlaveKernel)
 	{
-	static TBool said;
-	if (!(aSlaveKernel & KMssFatal) || said)
+	if (!(aSlaveKernel & KMssFatal) || FatalSaid)
 		return;
-	said = ETrue;
+	FatalSaid = ETrue;
 	TUint32 len = 0;
 	const char* why = (const char*)Smem_Get(KSmemHostGlobal, 421, &len);	// SMEM_SSR_REASON_MSS0
 	char buf[160];											// a short copy: monitor output over 256 bytes faults
@@ -350,6 +420,223 @@ static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 	return KErrNone;
 	}
 
+// One bounded physical region retained for this boot. The daemon owns ASM map/write acknowledgements;
+// a published region cannot be overwritten until its exact ticket is completed or PAS shutdown succeeds.
+const TUint32 KAudioBytes = 0x10000;
+static TPhysAddr AudioPhys;
+static DPlatChunkHw* AudioChunk;
+static TUint32 AudioTicket, AudioGeneration;
+static TBool AudioBusy;
+static DMutex* AudioLock;
+static NFastMutex AudioInit;
+static TInt AudioMem(SIo& aIo)
+	{
+	TInt r = A64Mutex_Init(AudioLock, AudioInit, _L("AudioMem"), KMutexOrdGeneral0);
+	if (r != KErrNone)
+		return r;
+	// op 1's bytes come from the caller first, outside any critical section or lock: kumemget may fault on a bad
+	// pointer, which must not happen holding AudioLock (the kernel's rule for kumemget)
+	TUint8* copy = NULL;
+	if (aIo.iA == 1)
+		{
+		if (aIo.iB > KAudioBytes || aIo.iLen > KAudioBytes - aIo.iB)
+			return KErrArgument;
+		NKern::ThreadEnterCS();
+		copy = (TUint8*)Kern::Alloc(aIo.iLen ? aIo.iLen : 1);
+		NKern::ThreadLeaveCS();
+		if (!copy)
+			return KErrNoMemory;
+		kumemget(copy, (const TAny*)aIo.iBuf, aIo.iLen);
+		}
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*AudioLock);
+	if (!AudioChunk && aIo.iA == 0)
+		{
+		r = Epoc::AllocPhysicalRam(KAudioBytes, AudioPhys);
+		if (r == KErrNone)
+			{
+			r = DPlatChunkHw::New(AudioChunk, AudioPhys, KAudioBytes, EMapAttrSupRw | EMapAttrBufferedNC);
+			if (r != KErrNone)
+				Epoc::FreePhysicalRam(AudioPhys, KAudioBytes);
+			else
+				memclr((TAny*)AudioChunk->LinearAddress(), KAudioBytes);
+			}
+		}
+	if (r == KErrNone && !AudioChunk)
+		r = KErrNotReady;
+	if (r == KErrNone)
+		switch (aIo.iA)
+			{
+		case 0:
+			aIo.iB = AudioPhys;
+			aIo.iLen = KAudioBytes;
+			aIo.iBuf = Generations[1];
+			break;
+		case 1:
+			if (AudioBusy)
+				r = KErrInUse;
+			else
+				memcpy((TUint8*)AudioChunk->LinearAddress() + aIo.iB, copy, aIo.iLen);
+			break;
+		case 2:
+			if (AudioBusy)
+				r = KErrInUse;
+			else
+				{
+				__e32_memory_barrier(); // PCM reaches noncached DRAM before the daemon sends ASM WRITE
+				AudioBusy = ETrue;
+				AudioGeneration = Generations[1];
+				if (!++AudioTicket)
+					++AudioTicket;
+				aIo.iB = AudioTicket;
+				aIo.iLen = KAudioBytes;
+				aIo.iBuf = AudioGeneration;
+				}
+			break;
+		case 3:
+			if (!AudioBusy || aIo.iB != AudioTicket || aIo.iBuf != AudioGeneration || aIo.iBuf != Generations[1])
+				r = KErrNotReady;
+			else
+				AudioBusy = EFalse;
+			break;
+		default:
+			r = KErrArgument;
+			}
+	Kern::MutexSignal(*AudioLock);
+	Kern::Free(copy);
+	NKern::ThreadLeaveCS();
+	return r;
+	}
+
+static void ResetRings(TInt aFirst, TInt aEnd)
+	{
+	for (TInt i = aFirst; i < aEnd; ++i)
+		{
+		SRing& ring = *(SRing*)Tel_Ring(i);
+		NKern::FMWait(&ring.iLock);
+		ring.iChannel = -1;
+		ring.iHead = ring.iTail = 0;
+		NKern::FMSignal(&ring.iLock);
+		}
+	}
+
+static TDynamicDfcQue* StopQueue;
+// One monotonic retry-wait budget across both processors. Calls into the boot, GLINK or secure-firmware
+// paths can themselves block beyond it: expiry never cancels those calls or claims their memory is ours.
+static TUint32 StopElapsedMs(TUint32 aStarted)
+	{
+	return (TUint32)((TUint64)(TUint32)(NKern::TickCount() - aStarted) * NKern::TickPeriod() / 1000);
+	}
+
+static TInt StopProcessor(TUint32 aMask, TUint32 aStarted)
+	{
+	Kern::Printf("[tel] stop stage %d enter at %d ms", aMask, StopElapsedMs(aStarted));
+	TInt r = KErrTimedOut;
+	while ((TUint32)(NKern::TickCount() - aStarted) < (TUint32)NKern::TimerTicks(30000))
+		{
+		r = aMask == 1 ? Mss_Stop() : Adsp_Stop();
+		if (r != KErrInUse)
+			break;
+		NKern::Sleep(NKern::TimerTicks(1));
+		}
+	if (r == KErrInUse)
+		r = KErrTimedOut;
+	Kern::Printf("[tel] stop stage %d -> %d at %d ms", aMask, r, StopElapsedMs(aStarted));
+	return r;
+	}
+
+static void StopDfcFn(TAny*)
+	{
+	TInt r = KErrNone;
+	TUint32 started = NKern::TickCount(), mask = StopMask;
+	Kern::Printf("[tel] stop mask %d begin, generations %d/%d", mask, Generations[0], Generations[1]);
+#if defined(TEL_DIAGNOSTICS) && TEL_DIAGNOSTICS
+	NKern::FMWait(&StopLock);
+	TUint32 fault = DiagnosticFaultMask, id = DiagnosticFaultId;
+	NKern::FMSignal(&StopLock);
+	if (fault)
+		Kern::Printf("[tel] synthetic detection id %d mask %d selected stop mask %d", id, fault, mask);
+#endif
+	// MODEMD has stopped sending before requesting this. Both operations wait for their existing boot DFC
+	// to finish; an unresponsive processor never authorizes memory reuse or another firmware load.
+	if (mask & 1)
+		r = StopProcessor(1, started);
+	if (r == KErrNone && (mask & 1))
+		{
+		ResetRings(0, 1);
+		++Generations[0];
+		Wcn3990_ModemDown();							// the Wi-Fi firmware ran inside the modem
+		FatalSaid = EFalse;
+#if defined(TEL_DIAGNOSTICS) && TEL_DIAGNOSTICS
+		DiagnosticStopped(1);
+#endif
+		}
+	if (r == KErrNone && (mask & 2))
+		{
+		A64Audio_Control(2, 0);
+		A64Haptic_Control(0, 0);
+		r = StopProcessor(2, started);
+		if (r == KErrNone)
+			{
+			ResetRings(1, 3);
+			if (AudioLock)
+				{
+				NKern::ThreadEnterCS();
+				Kern::MutexWait(*AudioLock);
+				++Generations[1];
+				AudioBusy = EFalse; // successful PAS shutdown is the DSP ownership boundary
+				Kern::MutexSignal(*AudioLock);
+				NKern::ThreadLeaveCS();
+				}
+			else
+				++Generations[1];
+#if defined(TEL_DIAGNOSTICS) && TEL_DIAGNOSTICS
+			DiagnosticStopped(2);
+#endif
+			}
+		}
+	if (r == KErrInUse)
+		r = KErrTimedOut;
+	__e32_memory_barrier();
+	NKern::FMWait(&StopLock);
+	StopError = r;
+	StopPhase = r == KErrNone ? 2 : 3;
+	NKern::FMSignal(&StopLock);
+	Kern::Printf("[tel] stop mask %d -> %d at %d ms, generations %d/%d", mask, r,
+		StopElapsedMs(started), Generations[0], Generations[1]);
+	}
+static TDfc StopDfc(StopDfcFn, NULL, 1);
+
+static TInt QueueStop(TUint32 aMask)
+	{
+	if (!aMask || aMask > 3)
+		return KErrArgument;
+	NKern::FMWait(&StopLock);
+	if (StopPhase == 1)
+		{
+		NKern::FMSignal(&StopLock);
+		return KErrInUse;
+		}
+	StopPhase = 1; // reserve the request before queue creation can sleep
+	StopMask = aMask;
+	StopError = 0;
+	NKern::FMSignal(&StopLock);
+	TInt r = StopQueue ? KErrNone : Kern::DynamicDfcQCreate(StopQueue, 24, _L8("TelStop"));
+	if (r == KErrNone)
+		{
+		StopDfc.SetDfcQ(StopQueue);
+		StopDfc.Enque();
+		}
+	else
+		{
+		NKern::FMWait(&StopLock);
+		StopError = r;
+		StopPhase = 3;
+		NKern::FMSignal(&StopLock);
+		}
+	return r;
+	}
+
 // ---- Prng (0x4e23): a1 = TDes8* whose length (1..256) is the bytes wanted, filled from the SoC's PRNG (the
 // execution-environment view at 0x793000, as Linux qcom-rng "prng-ee": DATA_OUT +0, STATUS +4 bit 0 = data
 // available, nothing to configure). Its AHB clock is the modem's proxy "prng" vote (GCC 0x152004 bit 13), which
@@ -386,8 +673,42 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 	{
 	if (!Kern::CurrentThreadHasCapability(ECapabilityCommDD, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian modem")))
 		return KErrPermissionDenied;
+	if ((StopPhase == 1 || StopPhase == 3) && aFunction != ERprocState && aFunction != ERprocStop &&
+		aFunction != EState && aFunction != EAdspState && aFunction != EHaptic && aFunction != EPrng)
+		return KErrNotReady;
 	switch (aFunction)
 		{
+	case ERprocStop:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		return QueueStop(io.iA);
+		}
+	case ERprocState:
+		{
+		NKern::FMWait(&StopLock);
+		TUint32 out[4] = { (TUint32)StopPhase, (TUint32)StopError, Generations[0], Generations[1] };
+		NKern::FMSignal(&StopLock);
+		kumemput32(a1, out, sizeof(out));
+		return KErrNone;
+		}
+	case EAudioMem:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		TInt r = AudioMem(io);
+		if (r == KErrNone)
+			kumemput32(a1, &io, sizeof(io));
+		return r;
+		}
+	case EHaptic:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		if (io.iA > 2000 || io.iB > 127)
+			return KErrArgument;
+		return A64Haptic_Control(io.iA, io.iB);
+		}
 	case EBoot:
 		return Mss_StartBoot();
 	case EState:
@@ -397,8 +718,13 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		Mss_State(step, err, rmb);
 		out[0] = step;
 		out[1] = err;
-		Smp2p_In(KSmemHostModem, "slave-kernel", out[2]);
+		TInt r = Smp2p_In(KSmemHostModem, "slave-kernel", out[2]);
+		if (step == 8 && r != KErrNone)
+			return r; // a running processor's unreadable remote state must not be reported healthy
 		FatalReason(out[2]);
+#if defined(TEL_DIAGNOSTICS) && TEL_DIAGNOSTICS
+		out[2] |= DiagnosticFatal(1); // output snapshot only; never remote SMP2P/SMEM
+#endif
 		kumemput32(a1, out, sizeof(out));
 		return KErrNone;
 		}
@@ -462,7 +788,12 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		Adsp_State(step, err);
 		out[0] = step;
 		out[1] = err;
-		Smp2p_In(KSmemHostAdsp, "slave-kernel", out[2]);
+		TInt r = Smp2p_In(KSmemHostAdsp, "slave-kernel", out[2]);
+		if (step >= 3 && r != KErrNone)
+			return r;
+#if defined(TEL_DIAGNOSTICS) && TEL_DIAGNOSTICS
+		out[2] |= DiagnosticFatal(2); // output snapshot only; never remote SMP2P/SMEM
+#endif
 		out[3] = Tel_Open(1) | Tel_Open(2) << 1;
 		kumemput32(a1, out, sizeof(out));
 		return KErrNone;

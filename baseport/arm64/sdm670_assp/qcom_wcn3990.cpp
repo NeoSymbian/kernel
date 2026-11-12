@@ -882,7 +882,7 @@ static void Serve()
 			{
 			ScanWanted = EFalse;
 			ScanStartedAt = NKern::TickCount();
-			if (ScanStart(ETrue) != KErrNone)					// active: probe responses arrive at once
+			if (ScanStart(EFalse) != KErrNone)					// passive: on this phone active scans missed 2.4 GHz
 				return;
 			}
 		NKern::Sleep(NKern::TimerTicks(Step == 7 ? 1 : 10));
@@ -1001,7 +1001,7 @@ static TInt Run()
 	if ((r = ScanSetup()) != KErrNone)
 		return r;
 	ScanStartedAt = NKern::TickCount();
-	if ((r = ScanStart(ETrue)) != KErrNone)						// a first list right away
+	if ((r = ScanStart(EFalse)) != KErrNone)					// a first list right away
 		return r;
 	Serve();
 	return Error;

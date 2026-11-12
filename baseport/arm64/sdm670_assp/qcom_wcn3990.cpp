@@ -514,7 +514,14 @@ static void WmiEvent(const TUint8* p, TInt n)
 	else if (id == 0x7001)										// MGMT_RX: beacons and probe responses
 		MgmtRx(p, n);
 	else if (id == 0x4002)										// CHAN_INFO: one per channel, counted
-		++ChanInfos;
+		{
+		TInt at = 0, tag, len;
+		const TUint8* v;
+		while (++ChanInfos <= 6 && NextTlv(p, n, at, tag, v, len))
+			if (tag == 38 && len >= 36)							// err, freq, flags, noise floor, rx clear, cycles, rx frames
+				Kern::Printf("[wifi] channel %d MHz: err %d flags %x noise %d dBm, rx clear %d / %d cycles, %d frames",
+					G32(v + 4), G32(v), G32(v + 8), (TInt)G32(v + 12), G32(v + 16), G32(v + 20), G32(v + 32));
+		}
 	else
 		Kern::Printf("[wifi] WMI event %x, %d bytes", id, n);
 	}

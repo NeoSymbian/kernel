@@ -49,6 +49,34 @@ const TInt KDesc = 16;			// struct ce_desc_64
 struct SDesc { TUint32 iAddrLo, iAddrHi; TUint16 iNbytes, iFlags; TUint32 iHash; };
 struct SRing { SDesc* iDesc; TPhysAddr iPhys; TUint32 iMask, iSw, iWr; TUint8* iBuf; TPhysAddr iBufPhys; };
 static SRing Src[12], Dst[12];
+
+// The pool is mapped as device memory: only aligned 32-bit accesses (the compiler merged two descriptor fields into an
+// 8-byte store at a 4-byte boundary, and that faulted). Descriptors are written word by word, buffers copied in words.
+static void DescWrite(SDesc* aDesc, TUint32 aAddr, TUint16 aNbytes, TUint16 aFlags)
+	{
+	volatile TUint32* w = (volatile TUint32*)aDesc;
+	w[0] = aAddr;
+	w[1] = 0;												// address bits 36:32 (our RAM is below 4 GB), no gather
+	w[2] = aNbytes | (TUint32)aFlags << 16;
+	w[3] = 0;
+	}
+static TUint16 DescNbytes(const SDesc* aDesc) { return (TUint16)(((volatile const TUint32*)aDesc)[2] & 0xffff); }
+static TUint32 DescAddr(const SDesc* aDesc) { return ((volatile const TUint32*)aDesc)[0]; }
+static void DescClearNbytes(SDesc* aDesc) { volatile TUint32* w = (volatile TUint32*)aDesc; w[2] &= 0xffff0000u; }
+static void ToDev(TUint8* aDst, const TUint8* aSrc, TInt aLen)	// aSrc 4-byte aligned, aLen rounded up
+	{
+	volatile TUint32* d = (volatile TUint32*)aDst;
+	const TUint32* s = (const TUint32*)aSrc;
+	for (TInt i = 0; i < (aLen + 3) / 4; ++i)
+		d[i] = s[i];
+	}
+static void FromDev(TUint8* aDst, const TUint8* aSrc, TInt aLen)
+	{
+	volatile const TUint32* s = (volatile const TUint32*)aSrc;
+	TUint32* d = (TUint32*)aDst;
+	for (TInt i = 0; i < (aLen + 3) / 4; ++i)
+		d[i] = s[i];
+	}
 static volatile TUint32* Rri;	// 12 words the hardware mirrors its read indices into (bits 15:0 SRRI, 31:16 DRRI)
 static TUint8* Pool;
 static TPhysAddr PoolPhys;
@@ -143,11 +171,7 @@ static TInt InitRings()
 static void PostRx(TInt aCe, TPhysAddr aPhys)
 	{
 	SRing& d = Dst[aCe];
-	SDesc& e = d.iDesc[d.iWr];
-	e.iAddrLo = aPhys;
-	e.iAddrHi = 0;
-	e.iNbytes = 0;
-	e.iFlags = 0;
+	DescWrite(&d.iDesc[d.iWr], aPhys, 0, 0);
 	__e32_memory_barrier();
 	d.iWr = (d.iWr + 1) & d.iMask;
 	R(CeReg(aCe, EDstWrIdx)) = d.iWr;
@@ -170,13 +194,8 @@ static TInt Send(TInt aCe, TUint8 aEid, const TUint8* aData, TInt aLen)
 	TUint32 sw = Rri[aCe] & 0xffff & s.iMask;
 	if (((s.iWr + 1) & s.iMask) == sw)
 		return KErrOverflow;									// full: one slot always stays empty
-	TUint8* buf = s.iBuf + s.iWr * KCe[aCe].iMax;
-	memcpy(buf, aData, aLen);
-	SDesc& e = s.iDesc[s.iWr];
-	e.iAddrLo = s.iBufPhys + s.iWr * KCe[aCe].iMax;
-	e.iAddrHi = 0;
-	e.iNbytes = (TUint16)aLen;
-	e.iFlags = (TUint16)((aEid << 4) & 0xfff0);
+	ToDev(s.iBuf + s.iWr * KCe[aCe].iMax, aData, aLen);
+	DescWrite(&s.iDesc[s.iWr], s.iBufPhys + s.iWr * KCe[aCe].iMax, (TUint16)aLen, (TUint16)((aEid << 4) & 0xfff0));
 	__e32_memory_barrier();
 	s.iWr = (s.iWr + 1) & s.iMask;
 	R(Shadow(aCe)) = s.iWr;
@@ -186,8 +205,9 @@ static TInt Send(TInt aCe, TUint8 aEid, const TUint8* aData, TInt aLen)
 // ---- HTC (ath10k htc.c, w2-spec.md 4)
 static TInt HtcSend(TUint8 aEid, const TUint8* aPayload, TInt aLen)
 	{
-	static TUint8 f[2048];										// the DFC thread's stack is small
-	if (aLen + 8 > (TInt)sizeof(f))
+	static TUint32 fw[512];										// the DFC thread's stack is small; word aligned
+	TUint8* f = (TUint8*)fw;
+	if (aLen + 8 > (TInt)sizeof(fw))
 		return KErrArgument;
 	TBool wmi = aEid == WmiEid;
 	f[0] = aEid;
@@ -449,16 +469,19 @@ static void Poll()
 			continue;
 		for (TInt guard = 0; guard < 64; ++guard)
 			{
-			SDesc& e = d.iDesc[d.iSw];
-			TUint16 nbytes = e.iNbytes;
+			SDesc* e = &d.iDesc[d.iSw];
+			TUint16 nbytes = DescNbytes(e);
 			if (!nbytes)
 				break;
-			TPhysAddr phys = e.iAddrLo;
-			e.iNbytes = 0;
+			TPhysAddr phys = DescAddr(e);
+			DescClearNbytes(e);
 			d.iSw = (d.iSw + 1) & d.iMask;
-			TUint8* buf = d.iBuf + (phys - d.iBufPhys);
-			if (nbytes <= KCe[c].iMax && phys >= d.iBufPhys)
-				HtcRx(buf, nbytes);
+			static TUint32 rx[512];								// a cached copy to parse (byte access is fine there)
+			if (nbytes <= KCe[c].iMax && nbytes <= (TInt)sizeof(rx) && phys >= d.iBufPhys)
+				{
+				FromDev((TUint8*)rx, d.iBuf + (phys - d.iBufPhys), nbytes);
+				HtcRx((const TUint8*)rx, nbytes);
+				}
 			PostRx(c, phys);									// the same buffer goes back
 			}
 		}

@@ -327,6 +327,13 @@ static TInt Boot()
 	Arc_Vote("cx.lvl", 0xffff);
 	Arc_Vote("mss.lvl", 0xffff);
 	Rpmh_Set("xo.lvl", 0, 3);								// the "xo" proxy clock (Linux clk-rpmh bi_tcxo, on = 3)
+	// the WCN3990's supplies and reference clock, which Linux's ath10k_snoc turns on before the modem's WLAN
+	// domain announces its firmware service (docs wifi.md W0b; DTB wifi@18800000, PM660 = RPMh "a")
+	Vrm_Vote("ldoa5", 800);									// vdd-0.8-cx-mx
+	Vrm_Vote("ldoa9", 1800);								// vdd-1.8-xo
+	Vrm_Vote("ldoa6", 1304);								// vdd-1.3-rfa (DTB 1248..1304 mV)
+	Vrm_Vote("ldoa19", 3300);								// vdd-3.3-ch0 (DTB 3000..3312 mV)
+	Rpmh_Set("rfclka2", 4, 1);								// cxo_ref_clk_pin = RF_CLK2 (clk-rpmh VRM clock, enable at +4)
 	ClocksOn(KProxyClks, sizeof(KProxyClks) / sizeof(SClk));
 	ClocksOn(KResetClks, sizeof(KResetClks) / sizeof(SClk));
 	AltReset();

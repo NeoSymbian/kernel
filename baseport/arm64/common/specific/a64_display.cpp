@@ -19,8 +19,57 @@
 
 static DPlatChunkHw* TheFbChunk;
 static TPhysAddr TheFbPhys;
-__attribute__((weak)) TInt A64Panel_SetState(TBool) { return KErrNotSupported; }
 static TInt TheDisplayState = 1;					// on
+static TInt TheBrightness = -1;						// not set yet: the level ABL left
+static DMutex* ThePanelLock;						// one panel command sequence at a time (HAL callers, the monitor)
+
+// the board's panel (bonito: panel_sofef00.cpp over qcom_dsi.cpp); boards without one (QEMU) only keep the flag
+__attribute__((weak)) TInt A64Panel_Power(TBool) { return KErrNone; }
+__attribute__((weak)) TInt A64Panel_Brightness(TInt) { return KErrNotSupported; }
+__attribute__((weak)) TInt A64Panel_MaxBrightness() { return KErrNotSupported; }
+__attribute__((weak)) void A64Touch_Sleep(TBool) {}	// the touchscreen sleeps while the screen is off
+
+// screen on/off and brightness, for the HAL and the monitor's "panel" (thread context; sleeps for the panel's waits)
+TInt A64Display_SetState(TInt aOn)
+	{
+	aOn = aOn ? 1 : 0;
+	NKern::ThreadEnterCS();
+	if (ThePanelLock)
+		Kern::MutexWait(*ThePanelLock);
+	TInt r = KErrNone;
+	if (aOn != TheDisplayState)
+		{
+		if (!aOn)
+			A64Touch_Sleep(ETrue);
+		r = A64Panel_Power(aOn);
+		if (aOn && r == KErrNone && TheBrightness >= 0)
+			A64Panel_Brightness(TheBrightness);			// sleep in can forget it; resend
+		if (aOn)
+			A64Touch_Sleep(EFalse);
+		if (r == KErrNone)
+			TheDisplayState = aOn;
+		}
+	if (ThePanelLock)
+		Kern::MutexSignal(*ThePanelLock);
+	NKern::ThreadLeaveCS();
+	if (r != KErrNone)
+		Kern::Printf("[display] screen %s failed: %d", aOn ? "on" : "off", r);
+	return r;
+	}
+
+TInt A64Display_SetBrightness(TInt aLevel)
+	{
+	NKern::ThreadEnterCS();
+	if (ThePanelLock)
+		Kern::MutexWait(*ThePanelLock);
+	TInt r = A64Panel_Brightness(aLevel);
+	if (r == KErrNone)
+		TheBrightness = aLevel;
+	if (ThePanelLock)
+		Kern::MutexSignal(*ThePanelLock);
+	NKern::ThreadLeaveCS();
+	return r;
+	}
 
 static TInt ModeInfo(TInt aMode, TVideoInfoV01& a)
 	{
@@ -84,13 +133,27 @@ static TInt DisplayHal(TAny*, TInt aFunction, TAny* a1, TAny* a2)
 		kumemput32(a1, &TheDisplayState, sizeof(TheDisplayState));
 		return KErrNone;
 	case EDisplayHalSetState:
+		return A64Display_SetState(a1 ? 1 : 0);
+	case EDisplayHalMaxDisplayBrightness:
 		{
-		TInt state = a1 ? 1 : 0;
-		TInt r = state == TheDisplayState ? KErrNone : A64Panel_SetState(state != 0);
-		if (r == KErrNone)
-			TheDisplayState = state;
-		return r;
+		TInt m = A64Panel_MaxBrightness();
+		if (m < 0)
+			return m;
+		kumemput32(a1, &m, sizeof(m));
+		return KErrNone;
 		}
+	case EDisplayHalSetDisplayBrightness:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityWriteDeviceData,
+				__PLATSEC_DIAGNOSTIC_STRING("Checked by Hal function EDisplayHalSetDisplayBrightness")))
+			return KErrPermissionDenied;
+		return A64Display_SetBrightness((TInt)a1);
+	case EDisplayHalDisplayBrightness:
+		if (A64Panel_MaxBrightness() < 0)
+			return KErrNotSupported;
+		if (TheBrightness < 0)
+			return KErrNotReady;							// still ABL's level, unknown
+		kumemput32(a1, &TheBrightness, sizeof(TheBrightness));
+		return KErrNone;
 	case EDisplayHalCurrentModeInfo:
 	case EDisplayHalSpecifiedModeInfo:
 		{
@@ -110,7 +173,7 @@ static TInt DisplayHal(TAny*, TInt aFunction, TAny* a1, TAny* a2)
 	case EDisplayHalWsSwitchOnScreen:
 		return KErrNone;
 	default:
-		return KErrNotSupported;					// palette, backlight, contrast, brightness, secure screen
+		return KErrNotSupported;					// palette, backlight, contrast, secure screen
 		}
 	}
 
@@ -136,6 +199,9 @@ void A64StartDisplay()
 		}
 	if (!A64_FbPhys)
 		memclr((TAny*)TheFbChunk->LinearAddress(), size);
+	_LIT(KLockName, "PanelLock");
+	if (Kern::MutexCreate(ThePanelLock, KLockName, KMutexOrdGeneral1) != KErrNone)
+		ThePanelLock = NULL;							// commands then run unserialised (one caller at boot)
 	r = Kern::AddHalEntry(EHalGroupDisplay, DisplayHal, NULL);
 	Kern::Printf("[display] %dx%d 32 bpp, framebuffer phys %08x size %x, user linear %08x, HAL -> %d",
 		A64_FbWidth, A64_FbHeight, TheFbPhys, size, TheFbChunk->LinearAddress(), r);
@@ -149,6 +215,8 @@ static TA64DevState DisplayStatus(TDes8& aDetail)
 	A64Device_Format(aDetail, "%dx%d 32 bpp, %s framebuffer", A64_FbWidth, A64_FbHeight, A64_FbPhys ? "the bootloader's" : "a RAM");
 	if (!TheDisplayState)
 		A64Device_Format(aDetail, ", off");
+	if (TheBrightness >= 0)
+		A64Device_Format(aDetail, ", brightness %d", TheBrightness);
 	return TheDisplayState ? EA64DevOk : EA64DevOff;
 	}
 A64_DEVICE("display", "Display", "a64_display", DisplayStatus);

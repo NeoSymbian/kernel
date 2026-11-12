@@ -32,6 +32,9 @@ void A64_TickHook(TSubScheduler& aSS, TUint64 aElr);
  * routed to CPU 0 */
 typedef void (*TA64Isr)(TAny* aPtr);
 TInt A64_BindSpi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr);
+/* a software doorbell: SGI 5-7 bound to an ISR; A64_RaiseSgi (any context) runs it on CPU 0, in interrupt context */
+TInt A64_BindSgi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr);
+void A64_RaiseSgi(TUint32 aIntId);
 
 /* PSCI 0.2+ through the board's conduit (QEMU virt: HVC, Pixel/TrustZone: SMC) */
 TInt A64_Psci(TUint64 aFn, TUint64 aA1, TUint64 aA2, TUint64 aA3);

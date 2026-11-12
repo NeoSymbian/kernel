@@ -20,8 +20,7 @@ const TInt KSpinPerSecond = 5000;
 static const TUint8 KDevice[] = {
 	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1 };
 static const TUint8 KQualifier[] = { 10, 6, 0x00, 0x02, 0x02, 0x00, 0x00, 64, 1, 0 };
-static const TUint8 KConfig[] = {
-	9, 2, 67, 0, 2, 1, 0, 0x80, 50,							// configuration: 2 interfaces, bus powered 100 mA
+static const TUint8 KFragment[] = {						// the core's header: 1 configuration, bus powered 100 mA
 	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,						// interface 0: CDC communication, ACM, AT commands
 	5, 0x24, 0x00, 0x10, 0x01,								// header 1.10
 	5, 0x24, 0x01, 0x00, 0x01,								// call management: data on interface 1
@@ -260,9 +259,9 @@ void A64UsbStatus(TDes8& aBuf)							// the monitor's "usb" command
 	TUint32 size, ctrl, rsc;
 	A64Usb_Trb(EPhysBulkIn, size, ctrl, rsc);
 	Append(aBuf, "ev %d rst %d setups %d ep0 %d cfg %d dtr %d in %d/%d/%d busy %d abort %d lines %d logpos %d "
-		"trb3 %08x %08x rsc3 %d dma %x/%x/%x restarts %d link %d/%d", s.iEvents, s.iResets, s.iSetups, s.iEp0, s.iConfigured, Dtr,
+		"trb3 %08x %08x rsc3 %d dma %x/%x/%x restarts %d link %d/%d dbg %d", s.iEvents, s.iResets, s.iSetups, s.iEp0, s.iConfigured, Dtr,
 		InStarts, InDone, InFail, InBusy, AbortIn, OutLines, LogPos, size, ctrl, rsc, s.iDmaOwned, s.iDmaPending,
-		s.iDmaQuarantined, s.iRestarts, s.iSuspends, s.iResumes);
+		s.iDmaQuarantined, s.iRestarts, s.iSuspends, s.iResumes, s.iFunctions > 1);
 	}
 
 void A64UsbDump()
@@ -277,7 +276,7 @@ void A64UsbDump()
 	}
 
 const SA64UsbFunction KA64UsbFunction = {
-	KDevice, sizeof(KDevice), KQualifier, sizeof(KQualifier), KConfig, sizeof(KConfig),
+	KDevice, sizeof(KDevice), KQualifier, sizeof(KQualifier), KFragment, sizeof(KFragment), 0, 2,
 	KStrings, sizeof(KStrings) / sizeof(KStrings[0]), KEndpoints, sizeof(KEndpoints) / sizeof(KEndpoints[0]),
-	ClassSetup, ClassOutData, Ready, Reset, XferComplete, Poll, A64UsbDump,
+	ClassSetup, ClassOutData, Ready, Reset, XferComplete, Poll, A64UsbDump, NULL,
 	};

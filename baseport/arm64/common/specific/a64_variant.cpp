@@ -55,24 +55,38 @@ public:
 //   ENeoHalBootOk      no arguments -> mark the booted A/B slot "successful" for ABL (FS5b; neoui calls it once the
 //                      launcher is drawn). KErrNone if done or already set; KErrNotSupported without A/B slots
 // Reading needs ReadDeviceData, switching the console and ENeoHalBootOk WriteDeviceData. Each read fills at most
-// 1024 bytes. 0x4e04/0x4e05 are kept for the dev-mode switch.
+// 1024 bytes.
+//   ENeoHalUsbDebugSet a1 = 1 on / 0 off -> USB debugging: fshell's ACM port joins (or leaves) the USB device and the
+//                      host re-enumerates (Settings -> Developer, docs debug-access.md; WriteDeviceData).
+//                      KErrNotSupported without it (QEMU: its second serial port is always there)
+//   ENeoHalUsbDebugGet a1 = TInt* out -> 1 on, 0 off
 //   ENeoHalSlotInfo    a1 = TDes8* -> one line: the booted A/B slot and both slots' state (ReadDeviceData)
 //   ENeoHalBuildInfo   a1 = TDes8* -> this kernel's build: "kernel <commit>[+dirty] <UTC time> <board>" (no capability)
-enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalBootOk = 0x4e06,
-	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c, ENeoHalDeviceList = 0x4e19 };
+enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalUsbDebugSet,
+	ENeoHalUsbDebugGet, ENeoHalBootOk = 0x4e06,
+	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c, ENeoHalDeviceList = 0x4e19, ENeoHalBatteryRead = 0x4e1a, ENeoHalWlanScan = 0x4e1e, ENeoHalWlanLink = 0x4e1f };
 //   ENeoHalPower       a1 = 0 restart, 1 restart to fastboot, 2 power off (PowerMgmt). Returns only on a failure; the
 //                      caller finalises the drives first (neoui's Power menu)
 //   ENeoHalRtcRead     a1 = TUint32* -> the PMIC RTC's raw seconds; KErrNotSupported without one (QEMU)
 //   0x4e0d..0x4e18     the modem and the ADSP (telephony C4-C6): boot, state, QRTR send/receive, EFS partition reads,
 //                      the rmtfs carve-out, IPA, ADSP channels, audio; CommDD. qcom_telhal.cpp on the Pixel,
-//                      KErrNotSupported elsewhere
+//                      KErrNotSupported elsewhere; 0x4e1b reads a firmware file of modem_a (the modem's TFTP, Wi-Fi W0)
 //   ENeoHalDeviceList  a1 = TUint32* cursor (in/out; 0 = the first), a2 = TDes8* (1024 bytes) -> the device registry
 //                      as lines "tag\tstate\tname\tdriver\tdetail\n", none past the end (a64_devices.cpp; ReadDeviceData)
+__attribute__((weak)) TInt A64Battery_Hal(TAny*) { return KErrNotSupported; }
+// ENeoHalWlanScan: a1 = TDes8* (>= 1348 bytes) -> the Wi-Fi scan results, a2 = 1 asks for a new scan (ReadDeviceData;
+// qcom_wcn3990.cpp on the Pixel, KErrNotSupported elsewhere)
+__attribute__((weak)) TInt Wcn3990_ScanHal(TAny*, TAny*) { return KErrNotSupported; }
+// ENeoHalWlanLink: a1 = op, a2 = TDes8*: join a network, its state, EAPOL frames both ways, keys (Wi-Fi W4; Read+Write
+// DeviceData)
+__attribute__((weak)) TInt Wcn3990_LinkHal(TAny*, TAny*) { return KErrNotSupported; }
 void A64_RebootNormal();									// a64_reboot.cpp (weak QEMU defaults: a64_dbgmon.cpp)
 void A64_RebootToFastboot();
 TInt A64_PowerOff();
 TInt A64_RtcSeconds(TUint32& aSecs);						// qcom_rtc.cpp
 __attribute__((weak)) TInt A64Tel_Hal(TInt, TAny*, TAny*) { return KErrNotSupported; }	// qcom_telhal.cpp
+__attribute__((weak)) TInt A64UsbDebugSet(TInt) { return KErrNotSupported; }		// qcom_dwc3.cpp
+__attribute__((weak)) TInt A64UsbDebugGet() { return 0; }
 #ifndef NEO_BUILD_KERNEL
 #define NEO_BUILD_KERNEL "kernel unknown"				// build-ekern.sh passes the real one
 #endif
@@ -108,6 +122,17 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 			return KErrPermissionDenied;
 		A64_ConsoleShow((TInt)a1);
 		return KErrNone;
+	case ENeoHalUsbDebugSet:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityWriteDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian USB debugging")))
+			return KErrPermissionDenied;
+		Kern::Printf("[usb] USB debugging requested %d", (TInt)a1);
+		return A64UsbDebugSet((TInt)a1);
+	case ENeoHalUsbDebugGet:
+		{
+		TInt on = A64UsbDebugGet();
+		kumemput32(a1, &on, sizeof(on));
+		return KErrNone;
+		}
 	case ENeoHalBootOk:
 		{
 		if (!Kern::CurrentThreadHasCapability(ECapabilityWriteDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian boot OK")))
@@ -155,8 +180,22 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 		return r;
 		}
 	case 0x4e0d: case 0x4e0e: case 0x4e0f: case 0x4e10: case 0x4e11: case 0x4e12: case 0x4e13:
-	case 0x4e14: case 0x4e15: case 0x4e16: case 0x4e17: case 0x4e18: case 0x4e1a: case 0x4e1b: case 0x4e1c: case 0x4e1d:
+	case 0x4e14: case 0x4e15: case 0x4e16: case 0x4e17: case 0x4e18: case 0x4e1b: case 0x4e1c: case 0x4e1d:
+	case 0x4e23: case 0x4e24: case 0x4e25: case 0x4e26: case 0x4e27:			// Prng; C7: RprocStop/State, AudioMem, Haptic
 		return A64Tel_Hal(aFunction, a1, a2);
+	case ENeoHalWlanScan:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityReadDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian Wi-Fi")))
+			return KErrPermissionDenied;
+		return Wcn3990_ScanHal(a1, a2);
+	case ENeoHalWlanLink:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityReadDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian Wi-Fi")) ||
+			!Kern::CurrentThreadHasCapability(ECapabilityWriteDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian Wi-Fi")))
+			return KErrPermissionDenied;
+		return Wcn3990_LinkHal(a1, a2);
+	case ENeoHalBatteryRead:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityReadDeviceData, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian battery")))
+			return KErrPermissionDenied;
+		return A64Battery_Hal(a1);
 	case ENeoHalDeviceList:
 		return A64Device_Hal(a1, a2);
 	case ENeoHalConsoleGet:
@@ -317,6 +356,8 @@ static TInt ProbeThread(TAny*)
 
 void A64StartMedia();									// a64_media.cpp
 void A64StartDisplay();									// a64_display.cpp
+// Board/ASSP buses, before any peripheral starts using them (SDM670: SPMI).
+__attribute__((weak)) void A64StartBuses() {}
 // a64_serialkbd.cpp on QEMU virt; boards without a serial keyboard keep this
 __attribute__((weak)) void A64StartSerialKeyboard() {}
 // a64_ecomm.cpp: the serial LDD + the board's debug serial PDD (QEMU virt's second PL011)
@@ -339,6 +380,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 		return KErrNone;
 	A64Log_Report();									// the first point where Kern::Printf reaches the log ring
 	Kern::Printf("[neo] %s", NEO_BUILD_KERNEL);			// which kernel this is (HAL ENeoHalBuildInfo too)
+	A64StartBuses();
 	A64StartCpufreq();									// before the input drivers: their events boost the clocks
 	A64StartDisplay();									// the screen's HAL, for the window server
 	A64StartSerialKeyboard();

@@ -12,13 +12,20 @@
 // reset, or a failed start or stop, restarts the controller (halt, core reset, bring-up), the one thing that frees
 // a quarantined endpoint. After startup only the poll DFC (UsbQ) touches the controller and the DMA area.
 // The link's suspend and resume (a host asleep) are logged and counted.
-// shortcut: polled every 1 ms on its own DFC queue, no interrupt; HS only; one function.
+// Functions: the monitor's ACM (KA64UsbFunction) and fshell's ACM (A64UsbDebugFunction()), exposed only while USB
+// debugging is on (A64UsbDebugSet: HAL 0x4e04 from Settings, the monitor's "usb dbg"; on at boot in USBDEBUG=1 builds).
+// A switch recomposes the descriptors and restarts the controller, so the host re-enumerates. Two functions
+// make the device composite (an IAD before each function, device class EF/02/01). A64Usb_Doorbell() raises SGI 7 (a
+// software interrupt, A64_BindSgi), so a function's iIsr runs in interrupt context, as ECOMM's PDD callbacks must.
+// (DWC3's own SPI 133 was tried: it fires during traffic despite the masked event interrupt, thousands a second.)
+// shortcut: polled every 1 ms on its own DFC queue, no interrupt; HS only; two functions at most.
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_usb_function.h"
 #include "a64_usb_dma.h"
 #include "a64_usb_link.h"
 #include "qcom_rpmh.h"
+#include <nkernsmp/arm64/a64_platform.h>
 
 const TUint32 KDwc3 = 0x0a600000;
 const TUint32 KQscratch = 0x0a6f8800, KQusb2 = 0x088e2000;	// the Qualcomm wrapper; the HS PHY (qusb2-v2)
@@ -39,21 +46,31 @@ enum { ETrbNormal = 1 << 4, ETrbSetup = 2 << 4, ETrbStatus2 = 3 << 4, ETrbStatus
 enum { EEvXferComplete = 1, EEvXferNotReady = 3, EEvCommandComplete = 7 };
 enum { EDevDisconnect = 0, EDevReset = 1, EDevConnectDone = 2 };
 enum { EPhysEp0Out = 0, EPhysEp0In = 1 };
-const TInt KEp0Max = 64, KPhysEps = 8;
+const TInt KEp0Max = 64, KPhysEps = 16;
 const TInt KMaxEvents = 64;									// per pass; the rest stay in the ring for the next
 const TUint32 KStopTimeout = 2000;							// ticks (ms) for an ENDTRANSFER to complete
 
 // DMA area, physically contiguous and mapped non-cached: event buffer, TRBs, setup packet, EP0 data, then the
 // function's endpoint buffers (from EOffEpBufs, in its endpoint order)
-const TInt KAreaSize = 0x4000, KEvSize = 4096;
+const TInt KAreaSize = 0x8000, KEvSize = 4096;
 enum { EOffEv = 0x0000, EOffTrb = 0x1000, EOffSetup = 0x1100, EOffEp0Buf = 0x1200, EOffEpBufs = 0x2000 };
 static TPhysAddr AreaPhys;
 static TLinAddr Area;
 static TUint32 EvPos;
 
-static const SA64UsbFunction& Fn = KA64UsbFunction;
+const TInt KMaxFns = 2;
+const TUint32 KDoorbellSgi = 7;								// a software interrupt (the IPIs use SGI 0-4)
+static const SA64UsbFunction* Fns[KMaxFns];
+static TInt FnCount, Interfaces;
+static TInt ActiveFns;									// the functions exposed: 1, or 2 with USB debugging on
+static volatile TInt WantFns;								// what A64UsbDebugSet asked for; the poll applies it
 static TInt BufOff[KPhysEps], Armed[KPhysEps];				// each endpoint's buffer; the length its transfer was armed with
-static TUint32 FnMask;										// the function's endpoints
+static TInt EpOwner[KPhysEps];								// the function an endpoint belongs to
+static TUint32 FnMask;										// the functions' endpoints
+static TUint8 Device[18], Qualifier[10], Config[256];		// the device's descriptors (the core composes them)
+static TInt ConfigLen;
+static TBool DoorbellBound;
+static TInt OutDataFn;										// the function whose class request has a data stage
 
 struct STrb { TUint32 iBpl, iBph, iSize, iCtrl; };
 static volatile STrb* Trb(TInt aPhysEp) { return (volatile STrb*)(Area + EOffTrb + 16 * aPhysEp); }
@@ -194,6 +211,7 @@ void A64Usb_Stats(SA64UsbStats& aStats)
 	aStats.iDmaQuarantined = Dma.iQuarantined;
 	aStats.iSuspends = Suspends;
 	aStats.iResumes = Resumes;
+	aStats.iFunctions = ActiveFns;
 	}
 
 void A64Usb_Trb(TInt aPhysEp, TUint32& aSize, TUint32& aCtrl, TUint32& aRscIdx)
@@ -212,10 +230,10 @@ static TInt StringDesc(TInt aIndex, TUint8* aBuf)
 		aBuf[0] = 4; aBuf[1] = 3; aBuf[2] = 0x09; aBuf[3] = 0x04;
 		return 4;
 		}
-	if (aIndex >= Fn.iStringCount)
+	if (aIndex >= Fns[0]->iStringCount)
 		return -1;
 	TInt n = 0;
-	for (const char* s = Fn.iStrings[aIndex]; *s; ++s, ++n)
+	for (const char* s = Fns[0]->iStrings[aIndex]; *s; ++s, ++n)
 		{
 		aBuf[2 + 2 * n] = (TUint8)*s;
 		aBuf[3 + 2 * n] = 0;
@@ -228,9 +246,10 @@ static TInt StringDesc(TInt aIndex, TUint8* aBuf)
 static TInt Configure()
 	{
 	TInt r = DepCmd(EPhysEp0Out, ECmdStartCfg | (2 << 16));	// transfer resources for the other endpoints
-	for (TInt i = 0; r == KErrNone && i < Fn.iEndpointCount; ++i)
+	for (TInt f = 0; f < ActiveFns; ++f)
+	for (TInt i = 0; r == KErrNone && i < Fns[f]->iEndpointCount; ++i)
 		{
-		const SA64UsbEndpoint& e = Fn.iEndpoints[i];
+		const SA64UsbEndpoint& e = Fns[f]->iEndpoints[i];
 		r = EpConfig(e.iPhysEp, e.iType, e.iMaxPacket, 0, e.iInterval);
 		if (r == KErrNone)
 			r = DepCmd(e.iPhysEp, ECmdSetXferRes, 1);
@@ -238,7 +257,8 @@ static TInt Configure()
 			R(EDalepena) |= 1u << e.iPhysEp;
 		}
 	if (r == KErrNone)
-		r = Fn.iConfigured();
+		for (TInt f = 0; r == KErrNone && f < ActiveFns; ++f)
+			r = Fns[f]->iConfigured();
 	Configured = r == KErrNone;
 	return r;
 	}
@@ -280,7 +300,8 @@ static void EndSession()
 	{
 	PendingConfig = DeferredStatusEp = -1;
 	Configured = EFalse;
-	Fn.iReset();
+	for (TInt f = 0; f < ActiveFns; ++f)
+		Fns[f]->iReset();
 	StopFunction();
 	}
 
@@ -295,17 +316,17 @@ static void HandleSetup()
 	TUint8* buf = (TUint8*)(Area + EOffEp0Buf);
 	TInt in = -1;											// bytes to send, -1 = none
 	TBool out = EFalse, ok = ETrue;
-	const TUint16 interfaces = Fn.iConfig[4];				// bNumInterfaces
+	const TUint16 interfaces = Interfaces;
 	if ((type & 0x60) == 0x00)								// standard
 		switch (req)
 			{
 		case 6:												// GET_DESCRIPTOR
 			switch (value >> 8)
 				{
-			case 1: memcpy(buf, Fn.iDevice, Fn.iDeviceLen); in = Fn.iDeviceLen; break;
-			case 2: memcpy(buf, Fn.iConfig, Fn.iConfigLen); in = Fn.iConfigLen; break;
+			case 1: memcpy(buf, Device, sizeof(Device)); in = sizeof(Device); break;
+			case 2: memcpy(buf, Config, ConfigLen); in = ConfigLen; break;
 			case 3: in = StringDesc(value & 0xff, buf); ok = in >= 0; break;
-			case 6: memcpy(buf, Fn.iQualifier, Fn.iQualifierLen); in = Fn.iQualifierLen; break;
+			case 6: memcpy(buf, Qualifier, sizeof(Qualifier)); in = sizeof(Qualifier); break;
 			default: ok = EFalse; break;
 				}
 			break;
@@ -348,7 +369,13 @@ static void HandleSetup()
 			}
 	else if ((type & 0x60) == 0x20)						// class: the function's
 		{
-		TInt r = Fn.iClassSetup(Setup, buf);
+		TInt r = KA64UsbStall;								// to the function that owns the interface (wIndex)
+		for (TInt f = 0; f < ActiveFns; ++f)
+			if (Setup[4] >= Fns[f]->iFirstInterface && Setup[4] < Fns[f]->iFirstInterface + Fns[f]->iInterfaceCount)
+				{
+				r = Fns[f]->iClassSetup(Setup, buf);
+				OutDataFn = f;
+				}
 		ok = r != KA64UsbStall;
 		out = r == KA64UsbDataOut;
 		if (r >= 0)
@@ -389,7 +416,7 @@ static void Ep0Event(TInt aPhysEp, TInt aType, TInt aStatus)
 			Ep0 = EWaitStatus3Out;
 		else if (Ep0 == EDataOut)
 			{
-			Fn.iClassOutData(Setup, (const TUint8*)(Area + EOffEp0Buf));
+			Fns[OutDataFn]->iClassOutData(Setup, (const TUint8*)(Area + EOffEp0Buf));
 			Ep0 = EWaitStatus3In;
 			}
 		else if (Ep0 == EStatus)
@@ -446,7 +473,7 @@ void A64Usb_ProcessEvents()
 			if (ep <= 1)
 				Ep0Event(ep, type, status);
 			else if (type == EEvXferComplete && Dma.Completed(ep))	// else: a stop is pending, or it's an old one
-				Fn.iXferComplete(ep, Armed[ep] - (TInt)(Trb(ep)->iSize & 0xffffff));
+				Fns[EpOwner[ep]]->iXferComplete(ep, Armed[ep] - (TInt)(Trb(ep)->iSize & 0xffffff));
 			}
 		else if (((e >> 1) & 0x7f) == 0)					// a device event
 			{
@@ -502,8 +529,18 @@ TInt A64UsbPowerOn(TUint32& aPll);						// qcom_usbpower.cpp
 static TInt Halt()
 	{
 	R(EDctl) &= ~(1u << 31);								// RunStop off
+	// The core halts only once its pending events are taken (as Linux dwc3_gadget_run_stop): a switch or restart
+	// during traffic otherwise timed out here and left USB stopped. The events are dropped: a halt is always followed
+	// by a core reset (Bringup) or a power-off, which rebuild the event buffer.
 	for (TInt i = 0; i < 1000000 && !(R(EDsts) & (1u << 22)); ++i)		// until halted
-		{}
+		{
+		const TUint32 n = R(EGevntCount) & 0xffff;
+		if (n)
+			{
+			EvPos = (EvPos + n) % KEvSize;
+			R(EGevntCount) = n;
+			}
+		}
 	return R(EDsts) & (1u << 22) ? KErrNone : KErrTimedOut;
 	}
 
@@ -588,20 +625,58 @@ static TInt Bringup()
 
 // from the poll only: halt (the host sees a disconnect), then a full bring-up. On failure USB stays stopped and
 // everything the controller might own stays quarantined.
+static TInt RestartFailures;								// in a row; a few more tries before USB stays stopped
+const TInt KRestartTries = 3;
+// After a restart the host must reset the bus within KHostWaitMs; else the device goes and comes again, a few times
+// (a host that missed the reconnect: seen on a Mac when the USB debugging switch changed the device's functions)
+static TUint32 RestartTick;
+static TInt ResetsAtRestart, Reconnects;
+const TInt KHostWaitMs = 5000, KReconnects = 3;
+
 static void RestartController()
 	{
 	Restart = EFalse;
 	Running = EFalse;
 	++Restarts;
 	TInt r = Halt();
-	if (r == KErrNone)
+	const TBool halted = r == KErrNone;
+	if (halted)
 		{
-		NKern::Sleep(NKern::TimerTicks(100));				// long enough for the host to see the device go
+		NKern::Sleep(NKern::TimerTicks(1000));				// long enough for the host to see the device go
 		r = Bringup();
 		}
 	if (r != KErrNone)
 		Dma.iQuarantined |= Dma.iOwned | Dma.iPending;
-	Kern::Printf("[usb] controller restart %d; DMA %s", r, r == KErrNone ? "reinitialised" : "kept quarantined");
+	Kern::Printf("[usb] controller restart %d (%s; dctl %08x dsts %08x); DMA %s", r, halted ? "bring-up" : "halt",
+		R(EDctl), R(EDsts), r == KErrNone ? "reinitialised" : "kept quarantined");
+	// another full try (halt, core reset, bring-up): only a proven halt + reset frees the quarantined DMA
+	Restart = r != KErrNone && ++RestartFailures <= KRestartTries;
+	if (r == KErrNone)
+		{
+		RestartFailures = 0;
+		RestartTick = NKern::TickCount();
+		ResetsAtRestart = Resets;
+		}
+	}
+
+// from the poll: a restart the host hasn't answered with a bus reset in time gets another disconnect and connect
+static void WatchHost()
+	{
+	if (!RestartTick)
+		return;
+	if (Resets != ResetsAtRestart)
+		{
+		RestartTick = 0;
+		Reconnects = 0;
+		return;
+		}
+	if (NKern::TickCount() - RestartTick < (TUint32)NKern::TimerTicks(KHostWaitMs))
+		return;
+	RestartTick = 0;
+	if (++Reconnects > KReconnects)
+		return;
+	Kern::Printf("[usb] no bus reset %d ms after a restart (dsts %08x): reconnect %d", KHostWaitMs, R(EDsts), Reconnects);
+	Restart = ETrue;
 	}
 
 static void PollDfcFn(TAny*);
@@ -610,8 +685,26 @@ static void PollTimerFn(TAny*) { PollDfc.Add(); }
 static NTimer PollTimer(PollTimerFn, NULL);
 static TDynamicDfcQue* UsbQ;
 
+static TInt ComposeDescriptors();
+
+// USB debugging switched (A64UsbDebugSet): the leaving function loses its host first (its carrier drops), then the
+// host re-enumerates the new composition
+static void SwitchFunctions()
+	{
+	const TInt want = WantFns;
+	for (TInt f = want; f < ActiveFns; ++f)
+		Fns[f]->iReset();
+	ActiveFns = want;
+	TInt r = ComposeDescriptors();
+	Kern::Printf("[usb] USB debugging %s (%d functions, compose %d)", want > 1 ? "on" : "off", want, r);
+	if (Running)
+		RestartController();
+	}
+
 static void PollDfcFn(TAny*)
 	{
+	if (WantFns != ActiveFns)
+		SwitchFunctions();
 	if (Restart)
 		RestartController();
 	if (Running)
@@ -627,10 +720,12 @@ static void PollDfcFn(TAny*)
 			Kern::Printf("[usb] link %s (dsts %08x)", link == TUsbResumeTracker::ESuspend ? "suspend" : "resume", dsts);
 			}
 		A64Usb_ProcessEvents();
+		WatchHost();
 		if (Restart)
 			RestartController();
 		if (Running && !Restart)
-			Fn.iPoll();
+			for (TInt f = 0; f < ActiveFns; ++f)
+				Fns[f]->iPoll();
 		if (Restart)										// the function's writer polled events, too
 			RestartController();
 		}
@@ -668,7 +763,87 @@ void A64UsbCold(TDes8& aOut, TInt aMask)
 	r = Bringup();
 	if (r != KErrNone)
 		Kern::Printf("[usb] cold: bring-up failed %d; DMA kept", r);
-	Fn.iDump();
+	for (TInt f = 0; f < FnCount; ++f)
+		Fns[f]->iDump();
+	}
+
+// the device, qualifier and configuration descriptors from the functions': one function = its own bytes; two = composite
+static TInt ComposeDescriptors()
+	{
+	memcpy(Device, Fns[0]->iDevice, sizeof(Device));
+	memcpy(Qualifier, Fns[0]->iQualifier, sizeof(Qualifier));
+	const TBool composite = ActiveFns > 1;
+	if (composite)											// "Interface Association Descriptor" device class
+		{
+		Device[4] = Qualifier[4] = 0xef;
+		Device[5] = Qualifier[5] = 0x02;
+		Device[6] = Qualifier[6] = 0x01;
+		}
+	TInt len = 9;
+	Interfaces = 0;
+	for (TInt f = 0; f < ActiveFns; ++f)
+		{
+		const SA64UsbFunction& fn = *Fns[f];
+		if (len + 8 + fn.iFragmentLen > (TInt)sizeof(Config))
+			return KErrOverflow;
+		if (composite)										// IAD: first interface, count, class (the function's first)
+			{
+			const TUint8 iad[8] = { 8, 0x0b, (TUint8)fn.iFirstInterface, (TUint8)fn.iInterfaceCount,
+				fn.iFragment[5], fn.iFragment[6], fn.iFragment[7], 0 };
+			memcpy(Config + len, iad, 8);
+			len += 8;
+			}
+		memcpy(Config + len, fn.iFragment, fn.iFragmentLen);
+		len += fn.iFragmentLen;
+		Interfaces += fn.iInterfaceCount;
+		}
+	const TUint8 header[9] = { 9, 2, (TUint8)len, (TUint8)(len >> 8), (TUint8)Interfaces, 1, 0, 0x80, 50 };	// 100 mA
+	memcpy(Config, header, 9);
+	ConfigLen = len;
+	return KErrNone;
+	}
+
+__attribute__((weak)) const SA64UsbFunction* A64UsbDebugFunction() { return NULL; }	// a64_usb_acm_debug.cpp
+__attribute__((weak)) TBool A64UsbDebugAtBoot() { return EFalse; }
+
+// a normal boot leaves USB off until USB debugging is switched on (T12); then both ports come up, as adb does
+static TBool Deferred, ForceOn;
+void A64StartUsbConsole();
+
+// USB debugging on or off (HAL 0x4e04, the monitor's "usb dbg"): any thread; the poll DFC applies it
+TInt A64UsbDebugSet(TInt aOn)
+	{
+	if (Deferred)											// a normal boot: power USB up in this (the caller's) thread
+		{
+		if (!aOn)
+			return KErrNone;
+		Deferred = EFalse;
+		ForceOn = ETrue;
+		A64StartUsbConsole();
+		// shortcut: "off" afterwards drops fshell only; the monitor stays until a reboot (add A64UsbPowerOff if wanted)
+		}
+	if (FnCount < 2)
+		return KErrNotSupported;							// no debug function, or USB never started
+	WantFns = aOn ? 2 : 1;
+	return KErrNone;
+	}
+
+TInt A64UsbDebugGet()
+	{
+	return WantFns > 1;
+	}
+
+void A64Usb_Doorbell()
+	{
+	if (DoorbellBound)
+		A64_RaiseSgi(KDoorbellSgi);
+	}
+
+static void DoorbellIsr(TAny*)
+	{
+	for (TInt f = 0; f < FnCount; ++f)
+		if (Fns[f]->iIsr)
+			Fns[f]->iIsr();
 	}
 
 void A64StartUsbConsole()
@@ -676,14 +851,16 @@ void A64StartUsbConsole()
 	// ABL powers the USB controller only for fastboot: after a normal boot (the phone installed) its power domain and
 	// clocks are off, and a DWC3 register access would stall the bus -- so look at them first (usb30_prim GDSC 0xf004
 	// PWR_ON bit 31, master clock 0xf00c CLK_OFF bit 31). Off: only in dev mode (the kernel console on at boot,
-	// CONSOLE=1) does the debug console power USB itself (qcom_usbpower.cpp) -- it gives full control of the phone.
+	// CONSOLE=1) does the debug console power USB itself (qcom_usbpower.cpp) -- it gives full control of the phone --
+	// or later, when Settings turns USB debugging on (A64UsbDebugSet).
 	// A fastboot RAM boot keeps it as before: whoever can RAM-boot holds the phone already.
 	const TUint32 gdsc = *(volatile TUint32*)A64_Io(0x0010f004), master = *(volatile TUint32*)A64_Io(0x0010f00c);
 	if (!(gdsc & (1u << 31)) || (master & (1u << 31)))
 		{
-		if (!A64_ConsoleShown())
+		if (!A64_ConsoleShown() && !ForceOn)
 			{
-			Kern::Printf("[usb] controller off (a normal boot) and not in dev mode: no USB debug console");
+			Deferred = ETrue;
+			Kern::Printf("[usb] normal boot: USB off until USB debugging is on");
 			return;
 			}
 		TUint32 pll = 0;
@@ -698,18 +875,26 @@ void A64StartUsbConsole()
 		R(EDcfg), R(EGctl));
 	if ((id >> 16) != 0x5533)
 		return;
-	TInt off = EOffEpBufs;									// the function's endpoint buffers
-	for (TInt i = 0; i < Fn.iEndpointCount; ++i)
+	Fns[FnCount++] = &KA64UsbFunction;
+	if (A64UsbDebugFunction())
+		Fns[FnCount++] = A64UsbDebugFunction();
+	ActiveFns = WantFns = A64UsbDebugAtBoot() || ForceOn ? FnCount : 1;
+	if (ComposeDescriptors() != KErrNone)
+		return;
+	TInt off = EOffEpBufs;									// the functions' endpoint buffers
+	for (TInt f = 0; f < FnCount; ++f)
+	for (TInt i = 0; i < Fns[f]->iEndpointCount; ++i)
 		{
-		const SA64UsbEndpoint& e = Fn.iEndpoints[i];
-		if (e.iPhysEp < 2 || e.iPhysEp >= KPhysEps || off + e.iBufSize > KAreaSize)
+		const SA64UsbEndpoint& e = Fns[f]->iEndpoints[i];
+		if (e.iPhysEp < 2 || e.iPhysEp >= KPhysEps || off + e.iBufSize > KAreaSize || (FnMask & (1u << e.iPhysEp)))
 			{
-			Kern::Printf("[usb] function endpoint %d (phys %d, buffer %d) doesn't fit", i, e.iPhysEp, e.iBufSize);
+			Kern::Printf("[usb] function %d endpoint %d (phys %d, buffer %d) doesn't fit", f, i, e.iPhysEp, e.iBufSize);
 			return;
 			}
 		BufOff[e.iPhysEp] = off;
 		off += e.iBufSize;
 		FnMask |= 1u << e.iPhysEp;
+		EpOwner[e.iPhysEp] = f;
 		}
 	NKern::ThreadEnterCS();
 	TInt r = Epoc::AllocPhysicalRam(KAreaSize, AreaPhys, 12);
@@ -734,13 +919,17 @@ void A64StartUsbConsole()
 		return;
 		}
 	Area = chunk->LinearAddress();
+	for (TInt f = 0; f < FnCount; ++f)
+		if (Fns[f]->iIsr && !DoorbellBound)
+			DoorbellBound = A64_BindSgi(KDoorbellSgi, DoorbellIsr, NULL) == KErrNone;
 	r = Bringup();
 	if (r != KErrNone)
 		{
 		Kern::Printf("[usb] controller startup failed %d; DMA area kept", r);
 		return;
 		}
-	Fn.iDump();
+	for (TInt f = 0; f < FnCount; ++f)
+		Fns[f]->iDump();
 
 	PollDfc.SetDfcQ(UsbQ);
 	PollTimer.OneShot(1);

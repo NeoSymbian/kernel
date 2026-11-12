@@ -20,11 +20,22 @@
 //   0x4e16 ChanSend    a1 = SIo { channel 1 = the ADSP's IPCRTR, 2 = APR (apr_audio_svc); 0; len; buf }
 //   0x4e17 ChanRecv    a1 = SIo { channel; 0; size; buf } -> the next queued message's length, KErrNotReady if none
 //   0x4e18 Audio       a1 = SIo { op; arg; 0; 0 }: the board's codecs and amps (A64Audio_Control, a64_audio.cpp)
-// C7: 0x4e1a Stop SIo{mask1=MSS,2=ADSP}; asynchronous, poll 0x4e1b [phase,error,mss_gen,adsp_gen].
-// phase: 0 idle,1 stopping,2 stopped,3 failed. Never reload after phase3 until a later stop succeeds.
-// 0x4e1c AudioMem SIo: 0 info ->{b=phys,len=64KiB,buf=adsp_gen}; 1 copy{b=offset,len,buf};
-// 2 publish ->{b=ticket,len=64KiB,buf=adsp_gen}; 3 complete{b=ticket,buf=adsp_gen} after DSP completion.
-// 0x4e1d Haptic SIo{a=duration_ms 0..2000,b=amplitude0..127}; zero stops, timer bounds each pulse.
+//   0x4e1b FwRead      a1 = SIo { 0; byte offset; len <= 64 KB; buf }, a2 = "IMAGE/NAME.EXT" (8.3, in a 32-byte
+//                      buffer): a file of modem_a's FAT16, read-only, for MODEMD's TFTP reads (the modem's WLAN
+//                      domain loads IMAGE/WLANMDSP.MBN, docs wifi.md W0). len 0 -> its size; else the bytes read
+//   0x4e1c WlanMsa     a1 = SIo { op 1 assign, 0 release; phys; size; secure }: a region of the Wi-Fi firmware's MSA
+//                      carve-out (DTB wlan-msa 0x94d00000 + 1 MB) handed from HLOS to MSS_MSA + WLAN (+ WLAN_CE unless
+//                      secure) and back, as Linux ath10k_qmi_map_msa_permission (docs wifi.md W1)
+//   0x4e1d WlanStart   after WLAN cfg + mission mode: the copy engines, HTC and WMI up to READY on the driver's own
+//                      thread (qcom_wcn3990.cpp, docs wifi.md W2); KErrInUse while it runs
+//   0x4e23 Prng        a1 = TDes8* (length 1..256 = the bytes wanted): the SoC's hardware PRNG (Wi-Fi W4 nonces)
+//   C7 (calls): 0x4e24 RprocStop SIo{a = mask 1 MSS, 2 ADSP}, asynchronous; poll 0x4e25 RprocState
+//                      [phase, error, mss_gen, adsp_gen], phase 0 idle, 1 stopping, 2 stopped, 3 failed (never reload
+//                      after 3 until a later stop succeeds).
+//                      0x4e26 AudioMem SIo: 0 info -> {b = phys, len = 64 KiB, buf = adsp_gen}; 1 copy {b = offset,
+//                      len, buf}; 2 publish -> {b = ticket, len = 64 KiB, buf = adsp_gen}; 3 complete {b = ticket,
+//                      buf = adsp_gen} after the DSP is done.
+//                      0x4e27 Haptic SIo{a = ms 0..2000, b = amplitude 0..127}; zero stops, a timer bounds each pulse.
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
@@ -41,6 +52,7 @@
 #include "qcom_ipa.h"
 #include "qcom_adsp.h"
 #include "qcom_telhal.h"
+#include "qcom_wcn3990.h"
 
 TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
 // the board's codecs (bonito a64_audio.cpp); a board without call audio has none
@@ -48,7 +60,8 @@ __attribute__((weak)) TInt A64Haptic_Control(TInt, TInt) { return KErrNotSupport
 __attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupported; }
 
 enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
-	EChanRecv, EAudio, ERprocStop = 0x4e1a, ERprocState, EAudioMem, EHaptic };
+	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa, EWlanStart, EPrng = 0x4e23, ERprocStop, ERprocState, EAudioMem,
+	EHaptic };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -302,6 +315,89 @@ static TInt PartRead(const SIo& aIo)
 	return r;
 	}
 
+// a file of the modem's firmware partition (modem_a, FAT16) by its 8.3 path under IMAGE/
+static TInt FwRead(const SIo& aIo, const TAny* aUserPath)
+	{
+	char path[32];
+	kumemget(path, aUserPath, sizeof(path) - 1);
+	path[sizeof(path) - 1] = 0;
+	TInt n = 0;
+	for (; path[n]; ++n)
+		{
+		char c = path[n];
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+			(c == '.' && n && path[n - 1] != '.') || (c == '/' && n == 5)))
+			return KErrArgument;
+		}
+	if (n < 7 || memcompare((const TUint8*)path, 6, (const TUint8*)"IMAGE/", 6) || aIo.iLen > (TUint32)KChunk)
+		return KErrArgument;
+	TInt r = Fat_Mount("modem_a");						// one volume at a time; the modem's boot is past it
+	SFatFile f;
+	if (r == KErrNone)
+		r = Fat_Find(path, f);
+	if (r != KErrNone)
+		return r;
+	if (!aIo.iLen)
+		return (TInt)f.iSize;
+	if (aIo.iB >= f.iSize)
+		return 0;
+	TUint32 len = Min(aIo.iLen, f.iSize - aIo.iB);
+	NKern::ThreadEnterCS();
+	TUint8* k = (TUint8*)Kern::Alloc(len);
+	NKern::ThreadLeaveCS();
+	if (!k)
+		return KErrNoMemory;
+	r = Fat_Read(f, aIo.iB, k, len);
+	if (r == KErrNone)
+		kumemput((TAny*)aIo.iBuf, k, len);
+	NKern::ThreadEnterCS();
+	Kern::Free(k);
+	NKern::ThreadLeaveCS();
+	return r == KErrNone ? (TInt)len : r;
+	}
+
+// the Wi-Fi firmware's MSA regions (ath10k qmi.c): at most two, inside the carve-out, each with its current owners
+const TUint32 KWlanMsaPhys = 0x94d00000, KWlanMsaSize = 0x100000, KVmidWlan = 0x18, KVmidWlanCe = 0x19;
+static struct { TUint32 iPhys, iSize; TUint64 iOwners; } Msa[2];
+
+static TInt WlanMsa(const SIo& aIo)
+	{
+	TUint32 phys = aIo.iB, size = aIo.iLen;
+	if (aIo.iA > 1 || !size || (phys | size) & 0xfff || phys < KWlanMsaPhys || size > KWlanMsaSize ||
+		phys - KWlanMsaPhys > KWlanMsaSize - size)
+		return KErrArgument;
+	TInt slot = -1;
+	for (TInt i = 0; i < 2; ++i)
+		if (Msa[i].iSize && Msa[i].iPhys == phys && Msa[i].iSize == size)
+			slot = i;
+	if (aIo.iA == 1)											// assign
+		{
+		if (slot >= 0)
+			return KErrNone;									// already the firmware's
+		for (TInt i = 0; i < 2 && slot < 0; ++i)
+			if (!Msa[i].iSize)
+				slot = i;
+		if (slot < 0)
+			return KErrOverflow;
+		SScmVmPerm dst[3] = { { KScmVmidMssMsa, KScmPermRw }, { KVmidWlan, KScmPermRw }, { KVmidWlanCe, KScmPermRw } };
+		TUint64 owners = 1ull << KScmVmidHlos;
+		TInt r = Scm_AssignMem(phys, size, owners, dst, aIo.iBuf ? 2 : 3);	// iBuf = secure: no WLAN_CE
+		if (r != KErrNone)
+			return r;
+		Msa[slot].iPhys = phys;
+		Msa[slot].iSize = size;
+		Msa[slot].iOwners = owners;
+		return KErrNone;
+		}
+	if (slot < 0)
+		return KErrNotFound;
+	SScmVmPerm hlos = { KScmVmidHlos, KScmPermRw };				// release: back to us
+	TInt r = Scm_AssignMem(phys, size, Msa[slot].iOwners, &hlos, 1);
+	if (r == KErrNone)
+		Msa[slot].iSize = 0;
+	return r;
+	}
+
 static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 	{
 	TInt r = RmtfsMap();
@@ -338,6 +434,20 @@ static TInt AudioMem(SIo& aIo)
 	TInt r = A64Mutex_Init(AudioLock, AudioInit, _L("AudioMem"), KMutexOrdGeneral0);
 	if (r != KErrNone)
 		return r;
+	// op 1's bytes come from the caller first, outside any critical section or lock: kumemget may fault on a bad
+	// pointer, which must not happen holding AudioLock (the kernel's rule for kumemget)
+	TUint8* copy = NULL;
+	if (aIo.iA == 1)
+		{
+		if (aIo.iB > KAudioBytes || aIo.iLen > KAudioBytes - aIo.iB)
+			return KErrArgument;
+		NKern::ThreadEnterCS();
+		copy = (TUint8*)Kern::Alloc(aIo.iLen ? aIo.iLen : 1);
+		NKern::ThreadLeaveCS();
+		if (!copy)
+			return KErrNoMemory;
+		kumemget(copy, (const TAny*)aIo.iBuf, aIo.iLen);
+		}
 	NKern::ThreadEnterCS();
 	Kern::MutexWait(*AudioLock);
 	if (!AudioChunk && aIo.iA == 0)
@@ -365,10 +475,8 @@ static TInt AudioMem(SIo& aIo)
 		case 1:
 			if (AudioBusy)
 				r = KErrInUse;
-			else if (aIo.iB > KAudioBytes || aIo.iLen > KAudioBytes - aIo.iB)
-				r = KErrArgument;
 			else
-				kumemget((TUint8*)AudioChunk->LinearAddress() + aIo.iB, (const TAny*)aIo.iBuf, aIo.iLen);
+				memcpy((TUint8*)AudioChunk->LinearAddress() + aIo.iB, copy, aIo.iLen);
 			break;
 		case 2:
 			if (AudioBusy)
@@ -395,6 +503,7 @@ static TInt AudioMem(SIo& aIo)
 			r = KErrArgument;
 			}
 	Kern::MutexSignal(*AudioLock);
+	Kern::Free(copy);
 	NKern::ThreadLeaveCS();
 	return r;
 	}
@@ -456,6 +565,7 @@ static void StopDfcFn(TAny*)
 		{
 		ResetRings(0, 1);
 		++Generations[0];
+		Wcn3990_ModemDown();							// the Wi-Fi firmware ran inside the modem
 		FatalSaid = EFalse;
 #if defined(TEL_DIAGNOSTICS) && TEL_DIAGNOSTICS
 		DiagnosticStopped(1);
@@ -527,12 +637,44 @@ static TInt QueueStop(TUint32 aMask)
 	return r;
 	}
 
+// ---- Prng (0x4e23): a1 = TDes8* whose length (1..256) is the bytes wanted, filled from the SoC's PRNG (the
+// execution-environment view at 0x793000, as Linux qcom-rng "prng-ee": DATA_OUT +0, STATUS +4 bit 0 = data
+// available, nothing to configure). Its AHB clock is the modem's proxy "prng" vote (GCC 0x152004 bit 13), which
+// qcom_mss.cpp drops after boot, so it is voted again here. For the Wi-Fi handshake's nonces (W4).
+const TUint32 KPrng = 0x00793000, KPrngClkVote = 0x00152004;
+static TInt Prng(TAny* aDes)
+	{
+	TInt len = Kern::ThreadGetDesLength(&Kern::CurrentThread(), aDes);
+	if (len < 1 || len > 256)
+		return KErrArgument;
+	volatile TUint32* prng = (volatile TUint32*)A64_Io(KPrng);
+	*(volatile TUint32*)A64_Io(KPrngClkVote) |= 1u << 13;
+	for (TInt i = 0; i < len; i += 4)
+		{
+		TUint32 v = 0;
+		for (TInt t = 0; t < 1000 && !v; ++t)		// a word takes well under 1 ms; 0 counts as "not yet", as Linux
+			{
+			if (prng[1] & 1)
+				v = prng[0];
+			if (!v)
+				Kern::NanoWait(1000);
+			}
+		if (!v)
+			return KErrNotReady;
+		TPtrC8 word((const TUint8*)&v, Min(4, len - i));
+		TInt r = Kern::ThreadDesWrite(&Kern::CurrentThread(), aDes, word, i, KChunkShiftBy0, NULL);
+		if (r != KErrNone)
+			return r;
+		}
+	return KErrNone;
+	}
+
 TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 	{
 	if (!Kern::CurrentThreadHasCapability(ECapabilityCommDD, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian modem")))
 		return KErrPermissionDenied;
 	if ((StopPhase == 1 || StopPhase == 3) && aFunction != ERprocState && aFunction != ERprocStop &&
-		aFunction != EState && aFunction != EAdspState && aFunction != EHaptic)
+		aFunction != EState && aFunction != EAdspState && aFunction != EHaptic && aFunction != EPrng)
 		return KErrNotReady;
 	switch (aFunction)
 		{
@@ -670,6 +812,22 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		SIo io;
 		kumemget32(&io, a1, sizeof(io));
 		return A64Audio_Control(io.iA, io.iB);
+		}
+	case EFwRead:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		return FwRead(io, a2);
+		}
+	case EWlanStart:
+		return Wcn3990_Start();
+	case EPrng:
+		return Prng(a1);
+	case EWlanMsa:
+		{
+		SIo io;
+		kumemget32(&io, a1, sizeof(io));
+		return WlanMsa(io);
 		}
 		}
 	return KErrNotSupported;

@@ -22,6 +22,10 @@ const unsigned int A64_TimerPpi = 19;	// Qualcomm wires the virtual timer to PPI
 const unsigned int A64_UserCpuAffinity = 0xffffffff;
 unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu << 8; }		// Aff1 = core
 const SA64IoRegion A64_IoRegions[] = {
+	{ 0x0c263000, 0x00001000, 1 }, // TSENS0 temperature monitor
+	{ 0x0c265000, 0x00001000, 1 }, // TSENS1 temperature monitor
+	{ 0x0c222000, 0x00001000, 1 }, // TSENS0 configuration (read only)
+	{ 0x0c223000, 0x00001000, 1 }, // TSENS1 configuration (read only)
 	{ 0x17a00000, 0x00200000, 1 },		// GICv3 distributor + redistributors
 	{ 0x9c000000, 0x00900000, 2 },		// the framebuffer's 4320 x 2160 bytes (in RAM: the bank must stop below it)
 	{ 0x0c440000, 0x00002000, 1 },		// SPMI PMIC arbiter core: version + the apid map (qcom_spmi.cpp)
@@ -29,6 +33,7 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x0c40a000, 0x00001000, 1 },		// SPMI arbiter cnfg: the channel ownership table (writes)
 	{ 0x00118000, 0x00001000, 1 },		// GCC: QUP wrapper 1 AHB + SE1 clock branches and RCG (a64_touch.cpp)
 	{ 0x00152000, 0x00001000, 1 },		// GCC: APCS clock branch enable vote 1
+	{ 0x00793000, 0x00001000, 1 },		// PRNG, execution-environment view (qcom_telhal.cpp HAL Prng 0x4e23)
 	{ 0x00126000, 0x00001000, 1 },		// GCC: sdcc1 (eMMC) clock branches and RCG (qcom_sdhci.cpp)
 	{ 0x0010f000, 0x00001000, 1 },		// GCC: usb30_prim BCR, GDSC, clock branches and RCGs (qcom_usbpower.cpp)
 	{ 0x00105000, 0x00001000, 1 },		// GCC: cfg_noc_usb3_prim_axi clock branch
@@ -65,7 +70,6 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x01e04000, 0x0002c000, 1 },		// GSI, IPA's DMA engine (qcom_ipa.cpp; read only once IPA is clocked)
 	{ 0x01e40000, 0x00009000, 1 },		// IPA registers + its shared memory
 	{ 0x00a88000, 0x00004000, 1 },		// GENI serial engine 2 of QUP wrapper 1: I2C10, the call-audio codecs (C6)
-	{ 0x0ae94000, 0x00001000, 1 },      // DSI0 command FIFO, SOFEF00 OLED
 	{ 0x03918000, 0x00001000, 1 },      // TLMM north gpio24: DRV2624 reset
 	{ 0x03937000, 0x00002000, 1 },		// TLMM north tile: gpio55, gpio56 (I2C10)
 	{ 0x03941000, 0x00004000, 1 },		// TLMM north tile: gpio65-68 (the mic's TDM, pri_mi2s)
@@ -73,6 +77,11 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x0350e000, 0x00001000, 1 },		// TLMM west tile: gpio14 (Top amp reset)
 	{ 0x03510000, 0x00001000, 1 },		// TLMM west tile: gpio16 (Bottom amp reset)
 	{ 0x62b48000, 0x00004000, 1 },		// LPASS LPI TLMM gpio8-11: the amps' TDM (i2s1; touched once the ADSP is up)
+	{ 0x0ae00000, 0x00090000, 1 },		// MDSS + MDP (DPU): ABL's splash pipeline, read for the DSI work (D2 display)
+	{ 0x0ae94000, 0x00001000, 1 },		// DSI0 controller (+0) and its 10-nm PHY (+0x400): the SOFEF00 panel
+	{ 0x18832000, 0x00001000, 1 },		// WCN3990: the shadow registers (source write-index doorbells, qcom_wcn3990.cpp)
+	{ 0x18a40000, 0x0000d000, 1 },		// WCN3990: copy engines 0-11 + the CE wrapper (rri address)
+	{ 0x9a027000, 0x00001000, 2 },		// ABL's DSI command packet page (RAM outside our bank): qcom_dsi.cpp's packets
 	{ 0x9e3e0000, 0x00020000, 2 },		// the log ring that survives a reset (a64_dbgmon.cpp lastlog): the tail of
 										// the DTB's no-map framebuffer-region, kept by ABL across PSCI and watchdog resets
 	};

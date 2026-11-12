@@ -7,7 +7,7 @@
 //   help | log | lastlog | drivers (the device registry, a64_device.h) | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel) | scm | smem | fw ls|sha | smp2p | qmp | mss | glink (telephony, Pixel: qcom_telmon.cpp)
 //   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> (vendor_a/_b, EMMC_C=2) | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
-//   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | rtc | date <unix UTC s> [UTC offset s]
+//   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | thermal | rtc | date <unix UTC s> [UTC offset s]
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; "blk dump" sends "DUMP <n>\n", n*512 raw bytes,
 // then a text line with their SHA-256; every other answer is text, ending "\n.\n".
 // Debug builds only, on a development phone: peek/poke/spmi w reach any register.
@@ -205,12 +205,17 @@ void A64Mon_Say(const char* aFmt, ...)						// Say for board files' commands (a6
 __attribute__((weak)) void A64TouchDump() {}
 __attribute__((weak)) void A64BlkDump() {}
 __attribute__((weak)) void A64KeysDump() {}
+__attribute__((weak)) void A64BatteryDump() { Say("battery: not on this board"); }
+__attribute__((weak)) void Wcn3990_Monitor(TInt, TInt) { Say("wifi: not on this board"); }	// qcom_wcn3990.cpp
+__attribute__((weak)) void A64ThermalDump() { Say("thermal: not on this board"); }
 __attribute__((weak)) void A64_RebootToFastboot() { Say("fastboot: not on this board"); }
 // QEMU virt: PSCI resets or stops the guest (a64_reboot.cpp on the Pixel, with the PMIC's reboot reason)
 __attribute__((weak)) void A64_RebootNormal() { A64_Psci(0x84000009, 0, 0, 0); }
 __attribute__((weak)) TInt A64_PowerOff() { A64_Psci(0x84000008, 0, 0, 0); return KErrGeneral; }
 __attribute__((weak)) TInt A64_RtcSeconds(TUint32&) { return KErrNotSupported; }	// qcom_rtc.cpp
 __attribute__((weak)) TLinAddr A64_FbLinear() { return 0; }
+__attribute__((weak)) TInt A64Display_SetState(TInt) { return KErrNotSupported; }	// a64_display.cpp
+__attribute__((weak)) TInt A64Display_SetBrightness(TInt) { return KErrNotSupported; }
 __attribute__((weak)) void A64_WatchdogBite(TInt) { Say("wdt: not on this board"); }
 __attribute__((weak)) TInt A64BlkDev_Probe() { return KErrNotSupported; }
 __attribute__((weak)) TInt A64BlkDev_SelfTest() { return KErrNotSupported; }
@@ -221,6 +226,7 @@ __attribute__((weak)) TInt A64BlkDev_Monitor(TInt, const TPtrC8*, const TUint64*
 	}
 __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8*)"no USB console", 14); }
 __attribute__((weak)) void A64UsbCold(TDes8& aOut, TInt) { aOut.Copy((const TUint8*)"usb cold: not on this board", 27); }
+TInt A64UsbDebugSet(TInt aOn);								// a64_variant.cpp (weak) / qcom_dwc3.cpp
 __attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((const TUint8*)"rpmh: not on this board", 23); }
 // qcom_telmon.cpp on the Pixel: the modem path (docs/telephony.md C2/C3)
 __attribute__((weak)) void A64Tel_Monitor(TInt, const TPtrC8*, const TUint64*) { Say("telephony: not on this board"); }
@@ -544,7 +550,7 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 	NKern::ThreadEnterCS();
 	const TPtrC8& c = arg[0];
 	if (Eq(c, "help"))
-		Say("help log lastlog console drivers peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt rtc date");
+		Say("help log lastlog console drivers peek poke spmi rpmh scm smem fw smp2p qmp mss glink blk slot touch keys threads cpus cpufreq usb tap swipe key type shot reboot poweroff fastboot wdt thermal battery panel rtc date");
 	else if (Eq(c, "console"))							// dev mode: the kernel log on screen (Pixel)
 		{
 		if (argc >= 2)
@@ -636,6 +642,19 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		}
 	else if (Eq(c, "touch"))
 		A64TouchDump();
+	else if (Eq(c, "battery"))
+		A64BatteryDump();
+	else if (Eq(c, "wifi"))								// wifi | wifi join <n> | wifi leave (Wi-Fi W4)
+		Wcn3990_Monitor(argc >= 3 && Eq(arg[1], "join") ? 1 : argc >= 2 && Eq(arg[1], "leave") ? 2 : 0,
+			argc >= 3 ? (TInt)num[2] : 0);
+	else if (Eq(c, "panel") && argc >= 2)				// panel on | off | bright <0..1023>
+		{
+		TInt r = Eq(arg[1], "on") ? A64Display_SetState(1) : Eq(arg[1], "off") ? A64Display_SetState(0)
+			: Eq(arg[1], "bright") && argc >= 3 ? A64Display_SetBrightness((TInt)num[2]) : KErrArgument;
+		Say("panel %S -> %d", &arg[1], r);
+		}
+	else if (Eq(c, "thermal"))
+		A64ThermalDump();
 	else if (Eq(c, "keys"))
 		A64KeysDump();
 	else if (Eq(c, "threads"))
@@ -687,6 +706,8 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		Say("watchdog bite in 1 s");
 		A64_WatchdogBite(1000);
 		}
+	else if (Eq(c, "usb") && argc >= 3 && Eq(arg[1], "dbg"))	// USB debugging on/off, as Settings' switch (HAL 0x4e04)
+		Say("usb dbg %d -> %d", (TInt)num[2], A64UsbDebugSet((TInt)num[2]));
 	else if (Eq(c, "usb"))
 		{
 		TBuf8<240> b;										// a line stays under the monitor's 256 bytes

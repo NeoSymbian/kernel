@@ -7,4 +7,8 @@
 TInt Wcn3990_Start();
 // HAL WlanScan (0x4e1e): the latest scan results into the TDes8* a1; a2 != 0 asks for a new scan (qcom_wcn3990.cpp)
 TInt Wcn3990_ScanHal(TAny* a1, TAny* a2);
+// HAL WlanLink (0x4e1f): a1 = op, a2 = TDes8* (join, leave, status, EAPOL in/out, keys, authorize; W4)
+TInt Wcn3990_LinkHal(TAny* a1, TAny* a2);
+// the debug monitor's "wifi" (0), "wifi join N" (1, N), "wifi leave" (2)
+void Wcn3990_Monitor(TInt aOp, TInt aArg);
 #endif

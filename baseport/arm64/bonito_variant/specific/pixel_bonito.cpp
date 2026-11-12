@@ -33,6 +33,7 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x0c40a000, 0x00001000, 1 },		// SPMI arbiter cnfg: the channel ownership table (writes)
 	{ 0x00118000, 0x00001000, 1 },		// GCC: QUP wrapper 1 AHB + SE1 clock branches and RCG (a64_touch.cpp)
 	{ 0x00152000, 0x00001000, 1 },		// GCC: APCS clock branch enable vote 1
+	{ 0x00793000, 0x00001000, 1 },		// PRNG, execution-environment view (qcom_telhal.cpp HAL Prng 0x4e23)
 	{ 0x00126000, 0x00001000, 1 },		// GCC: sdcc1 (eMMC) clock branches and RCG (qcom_sdhci.cpp)
 	{ 0x0010f000, 0x00001000, 1 },		// GCC: usb30_prim BCR, GDSC, clock branches and RCGs (qcom_usbpower.cpp)
 	{ 0x00105000, 0x00001000, 1 },		// GCC: cfg_noc_usb3_prim_axi clock branch

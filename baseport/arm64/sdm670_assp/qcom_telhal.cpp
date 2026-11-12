@@ -28,6 +28,7 @@
 //                      secure) and back, as Linux ath10k_qmi_map_msa_permission (docs wifi.md W1)
 //   0x4e1d WlanStart   after WLAN cfg + mission mode: the copy engines, HTC and WMI up to READY on the driver's own
 //                      thread (qcom_wcn3990.cpp, docs wifi.md W2); KErrInUse while it runs
+//   0x4e23 Prng        a1 = TDes8* (length 1..256 = the bytes wanted): the SoC's hardware PRNG (Wi-Fi W4 nonces)
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
@@ -50,7 +51,7 @@ TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
 __attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupported; }
 
 enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
-	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa, EWlanStart };
+	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa, EWlanStart, EPrng = 0x4e23 };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -349,6 +350,38 @@ static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 	return KErrNone;
 	}
 
+// ---- Prng (0x4e23): a1 = TDes8* whose length (1..256) is the bytes wanted, filled from the SoC's PRNG (the
+// execution-environment view at 0x793000, as Linux qcom-rng "prng-ee": DATA_OUT +0, STATUS +4 bit 0 = data
+// available, nothing to configure). Its AHB clock is the modem's proxy "prng" vote (GCC 0x152004 bit 13), which
+// qcom_mss.cpp drops after boot, so it is voted again here. For the Wi-Fi handshake's nonces (W4).
+const TUint32 KPrng = 0x00793000, KPrngClkVote = 0x00152004;
+static TInt Prng(TAny* aDes)
+	{
+	TInt len = Kern::ThreadGetDesLength(&Kern::CurrentThread(), aDes);
+	if (len < 1 || len > 256)
+		return KErrArgument;
+	volatile TUint32* prng = (volatile TUint32*)A64_Io(KPrng);
+	*(volatile TUint32*)A64_Io(KPrngClkVote) |= 1u << 13;
+	for (TInt i = 0; i < len; i += 4)
+		{
+		TUint32 v = 0;
+		for (TInt t = 0; t < 1000 && !v; ++t)		// a word takes well under 1 ms; 0 counts as "not yet", as Linux
+			{
+			if (prng[1] & 1)
+				v = prng[0];
+			if (!v)
+				Kern::NanoWait(1000);
+			}
+		if (!v)
+			return KErrNotReady;
+		TPtrC8 word((const TUint8*)&v, Min(4, len - i));
+		TInt r = Kern::ThreadDesWrite(&Kern::CurrentThread(), aDes, word, i, KChunkShiftBy0, NULL);
+		if (r != KErrNone)
+			return r;
+		}
+	return KErrNone;
+	}
+
 TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 	{
 	if (!Kern::CurrentThreadHasCapability(ECapabilityCommDD, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian modem")))
@@ -457,6 +490,8 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		}
 	case EWlanStart:
 		return Wcn3990_Start();
+	case EPrng:
+		return Prng(a1);
 	case EWlanMsa:
 		{
 		SIo io;

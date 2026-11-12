@@ -206,6 +206,7 @@ __attribute__((weak)) void A64TouchDump() {}
 __attribute__((weak)) void A64BlkDump() {}
 __attribute__((weak)) void A64KeysDump() {}
 __attribute__((weak)) void A64BatteryDump() { Say("battery: not on this board"); }
+__attribute__((weak)) void Wcn3990_Monitor(TInt, TInt) { Say("wifi: not on this board"); }	// qcom_wcn3990.cpp
 __attribute__((weak)) void A64ThermalDump() { Say("thermal: not on this board"); }
 __attribute__((weak)) void A64_RebootToFastboot() { Say("fastboot: not on this board"); }
 // QEMU virt: PSCI resets or stops the guest (a64_reboot.cpp on the Pixel, with the PMIC's reboot reason)
@@ -643,6 +644,9 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		A64TouchDump();
 	else if (Eq(c, "battery"))
 		A64BatteryDump();
+	else if (Eq(c, "wifi"))								// wifi | wifi join <n> | wifi leave (Wi-Fi W4)
+		Wcn3990_Monitor(argc >= 3 && Eq(arg[1], "join") ? 1 : argc >= 2 && Eq(arg[1], "leave") ? 2 : 0,
+			argc >= 3 ? (TInt)num[2] : 0);
 	else if (Eq(c, "panel") && argc >= 2)				// panel on | off | bright <0..1023>
 		{
 		TInt r = Eq(arg[1], "on") ? A64Display_SetState(1) : Eq(arg[1], "off") ? A64Display_SetState(0)

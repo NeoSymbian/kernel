@@ -465,13 +465,20 @@ const TInt KEapolSlots = 4, KEapolMax = 512;
 static TUint8 Eapol[KEapolSlots][KEapolMax];
 static TUint16 EapolLen[KEapolSlots];
 static TInt EapolHead, EapolCount;
+// W5: Ethernet II frames for the user side's IP stack (NEONET.EXE, HAL WlanLink ops 8/9), under LinkLock; a full rx
+// queue drops (counted), a full tx queue refuses
+const TInt KEthMax = 1514, KRxFrames = 32, KTxFrames = 16;
+static TUint8 RxQ[KRxFrames][KEthMax], TxQ[KTxFrames][KEthMax];
+static TUint16 RxQLen[KRxFrames], TxQLen[KTxFrames];
+static TInt RxQHead, RxQCount, TxQHead, TxQCount;
+static TUint32 RxQDropped, TxQSent, TxQFailed;
 // set by the rx handlers (this thread), read by Join/Teardown
 static TBool StartRespGot, VdevStoppedGot, PeerMapped, PeerUnmapped, AuthDone, AssocDone, LostWanted, AbortWanted;
 static TInt StartStatus;
 static TUint16 AuthStatus, AssocStatus, AssocAid, AssocCap, LostReason, PeerId;
 static TUint32 KeyAcks;
 // pending tx frames (management and data), each in its own DMA slot until the chip reports it sent
-const TInt KTxSlots = 8, KTxSlot = 512;
+const TInt KTxSlots = 8, KTxSlot = 1536;					// a full Ethernet frame as native wifi: 1532
 static TUint8* TxBuf;
 static TPhysAddr TxBufPhys;
 static TBool TxBusy[KTxSlots], TxAuto[KTxSlots];
@@ -494,6 +501,8 @@ static void SetLink(TInt aState, TUint16 aStatus, TUint16 aReason)
 	LinkReason = aReason;
 	if (aState == ELinkIdle || aState == ELinkJoining)
 		EapolCount = 0;
+	if (aState != ELinkConnected)
+		RxQCount = TxQCount = 0;									// no IP traffic outlives the link
 	NKern::FMSignal(&LinkLock);
 	static const char* const KNames[] = { "idle", "joining", "handshake", "connected", "lost", "error" };
 	Kern::Printf("[wifi] link %s (status %d, reason %d)", KNames[aState], aStatus, aReason);
@@ -667,8 +676,8 @@ static TInt HttSetup()
 	}
 
 // a native-wifi data frame from the AP: 24-byte header (no QoS), LLC/SNAP, payload (w4-join-spec.md 4). EAPOL goes to the
-// supplicant; the rest is only counted until there is a network interface (W5)
-static void DataIn(const TUint8* f, TInt aLen)
+// supplicant; the rest to the rx queue as Ethernet II (W5). aBad: the rx descriptor reported a decrypt, MIC or FCS error.
+static void DataIn(const TUint8* f, TInt aLen, TBool aBad)
 	{
 	static const TUint8 KSnap[6] = { 0xaa, 0xaa, 0x03, 0, 0, 0 };
 	if (aLen < 32 || Link < ELinkHandshake || Link > ELinkConnected || (f[0] & 0x0c) != 0x08 ||
@@ -677,9 +686,30 @@ static void DataIn(const TUint8* f, TInt aLen)
 	TUint16 type = (TUint16)(f[30] << 8 | f[31]);
 	++RxData;
 	if (type == 0x888e)
+		{
 		EapolIn(f + 32, aLen - 32);
-	else if (type == 0x0806 || type == 0x0800 || type == 0x86dd)
+		return;
+		}
+	if (type == 0x0806 || type == 0x0800 || type == 0x86dd)
 		++RxIp;
+	// only once the keys are in, decrypted cleanly, FromDS, to us or a group, and not our own broadcast coming back
+	TInt n = aLen - 32 + 14;
+	if (aBad || Link != ELinkConnected || (f[1] & 3) != 2 || n > KEthMax ||
+		(!(f[4] & 1) && memcompare(f + 4, 6, HostMac, 6)) || !memcompare(f + 16, 6, HostMac, 6))
+		return;
+	NKern::FMWait(&LinkLock);
+	if (RxQCount < KRxFrames)
+		{
+		TInt slot = (RxQHead + RxQCount++) % KRxFrames;
+		TUint8* e = RxQ[slot];
+		memcpy(e, f + 4, 6);										// DA = addr1
+		memcpy(e + 6, f + 16, 6);									// SA = addr3 (FromDS)
+		memcpy(e + 12, f + 30, aLen - 30);							// the ethertype, then the payload
+		RxQLen[slot] = (TUint16)n;
+		}
+	else
+		++RxQDropped;
+	NKern::FMSignal(&LinkLock);
 	}
 
 // one HTT message from the target (CE1/9/10 by HTC endpoint, CE5 with its 8-byte header stripped)
@@ -731,9 +761,9 @@ static void HttRx(const TUint8* p, TInt n)
 		FromDev(b, HttBufs + (phys - HttBufPhys), KHttBuf);
 		TUint32 attention = G32(b + 4), decap = (G32(b + 36) >> 8) & 3;
 		if (offload && G16(b) + 7 <= KHttBuf)					// {msdu_len, peer_id, vdev, tid, fw_desc} + the frame
-			DataIn(b + 7, G16(b));
+			DataIn(b + 7, G16(b), EFalse);						// no rx descriptor: the firmware handled it itself
 		else if (!offload && (attention >> 31) && !(attention & 0x100) && decap == 1 && len <= KHttBuf - 360)
-			DataIn(b + 360, len);								// a native-wifi data frame (W4)
+			DataIn(b + 360, len, (attention & 0x70000000) != 0);	// a native-wifi data frame (W4); FCS/decrypt/MIC errors
 		if (!offload && (attention >> 31) && (attention & 0x100) && len >= 24 && len <= KHttBuf - 360)
 			{
 			++HttMgmt;
@@ -1119,6 +1149,9 @@ static TInt PostReq(TInt aOp, const TUint8* aData, TInt aLen)
 // {frame}, 6 install key {0 pairwise / 1 group, key index, 16-byte CCMP key}, 7 authorize: carried out by the driver
 // thread, the caller waits (3 s at most). 3 status -> {version 1, state, aid, status, reason (le16), bssid, our MAC,
 // rx data, rx ARP/IP (le32), AP RSN length, AP RSN element}; 4 the next EAPOL frame (KErrNotReady if none).
+// W5, for the IP stack, never waiting on the driver thread: 8 the next received Ethernet II frame (KErrNotReady if none);
+// 9 queue one Ethernet II frame to send, 14..1514 bytes from our MAC (KErrNotReady unless connected, KErrOverflow if the
+// queue is full).
 TInt Wcn3990_LinkHal(TAny* a1, TAny* a2)
 	{
 	TInt op = (TInt)(TLinAddr)a1;
@@ -1126,15 +1159,51 @@ TInt Wcn3990_LinkHal(TAny* a1, TAny* a2)
 	if (Step < 7)
 		return KErrNotReady;									// not up (or not on this board)
 	if (op != 3 && op != 4 && op != EReqJoin && op != EReqLeave && op != EReqSend && op != EReqKey &&
-		op != EReqAuthorize)
+		op != EReqAuthorize && op != 8 && op != 9)
 		return KErrArgument;
 	NKern::ThreadEnterCS();
-	TUint8* buf = (TUint8*)Kern::Alloc(KEapolMax);				// not on the caller's small supervisor stack
+	TUint8* buf = (TUint8*)Kern::Alloc(KEthMax);					// not on the caller's small supervisor stack
 	NKern::ThreadLeaveCS();
 	if (!buf)
 		return KErrNoMemory;
 	TInt r = KErrNone, n = 0;
-	if (op == 3 || op == 4)
+	if (op == 8)
+		{
+		NKern::FMWait(&LinkLock);
+		if (RxQCount)
+			{
+			n = RxQLen[RxQHead];
+			memcpy(buf, RxQ[RxQHead], n);
+			RxQHead = (RxQHead + 1) % KRxFrames;
+			--RxQCount;
+			}
+		NKern::FMSignal(&LinkLock);
+		r = !n ? KErrNotReady : Kern::ThreadDesWrite(t, a2, TPtrC8(buf, n), 0, KChunkShiftBy0, NULL);
+		}
+	else if (op == 9)
+		{
+		n = a2 ? Kern::ThreadGetDesLength(t, a2) : 0;
+		TPtr8 des(buf, KEthMax);
+		if (n < 14 || n > KEthMax || Kern::ThreadDesRead(t, a2, des, 0, KChunkShiftBy0) != KErrNone ||
+			memcompare(buf + 6, 6, HostMac, 6))
+			r = KErrArgument;
+		else
+			{
+			NKern::FMWait(&LinkLock);
+			if (Link != ELinkConnected)
+				r = KErrNotReady;
+			else if (TxQCount == KTxFrames)
+				r = KErrOverflow;
+			else
+				{
+				TInt slot = (TxQHead + TxQCount++) % KTxFrames;
+				memcpy(TxQ[slot], buf, n);
+				TxQLen[slot] = (TUint16)n;
+				}
+			NKern::FMSignal(&LinkLock);
+			}
+		}
+	else if (op == 3 || op == 4)
 		{
 		NKern::FMWait(&LinkLock);
 		if (op == 3)
@@ -1196,6 +1265,8 @@ void Wcn3990_Monitor(TInt aOp, TInt aArg)
 		{
 		A64Mon_Say("wifi: step %d error %d; link %d aid %d status %d reason %d; rx data %d ip %d; eapol queued %d; "
 			"wmi credits %d", Step, Error, Link, LinkAid, LinkStatus, LinkReason, RxData, RxIp, EapolCount, Credits);
+		A64Mon_Say("wifi ip: rx queued %d dropped %d; tx queued %d sent %d failed %d", RxQCount, RxQDropped, TxQCount,
+			TxQSent, TxQFailed);
 		for (TInt i = 0; i < NumResults; ++i)
 			A64Mon_Say("  %d: %02x:%02x:%02x:%02x:%02x:%02x ch %d %d dBm%s", i, Results[i].iBssid[0],
 				Results[i].iBssid[1], Results[i].iBssid[2], Results[i].iBssid[3], Results[i].iBssid[4],
@@ -1363,6 +1434,21 @@ static TInt DataTx(const TUint8* aFrame, TInt aLen, TBool aNoEncrypt)
 static TBool PeerUp, VdevStarted, VdevUp, PtkInstalled;
 static TUint32 FrameW[KTxSlot / 4];								// frames are built here (word aligned for ToDev)
 static TUint8* const Frame = (TUint8*)FrameW;
+
+// a native-wifi data header in Frame: data, ToDS (Protected once the PTK is in), the AP, us, aDa; LLC/SNAP with aType
+// (2 bytes, big endian). The payload goes at Frame + 32.
+static void DataHdr(const TUint8* aDa, const TUint8* aType)
+	{
+	static const TUint8 KSnap[6] = { 0xaa, 0xaa, 0x03, 0, 0, 0 };
+	memclr(Frame, 32);
+	Frame[0] = 0x08;
+	Frame[1] = (TUint8)(0x01 | (PtkInstalled ? 0x40 : 0));
+	memcpy(Frame + 4, Target.iBssid, 6);
+	memcpy(Frame + 10, HostMac, 6);
+	memcpy(Frame + 16, aDa, 6);
+	memcpy(Frame + 24, KSnap, 6);
+	memcpy(Frame + 30, aType, 2);
+	}
 
 // a management header to the AP: FC, duration 0, AP, us, AP, sequence 0 (the firmware numbers it)
 static TInt MgmtHdr(TUint8 aType)
@@ -1649,14 +1735,8 @@ static TInt DoReq(TInt aOp, const TUint8* aData, TInt aLen)
 			return KErrNotReady;
 		if (32 + aLen > KTxSlot)
 			return KErrArgument;
-		memclr(Frame, 32);										// native wifi: data, to the AP; LLC/SNAP EAPOL
-		Frame[0] = 0x08;
-		Frame[1] = (TUint8)(0x01 | (PtkInstalled ? 0x40 : 0));
-		memcpy(Frame + 4, Target.iBssid, 6);
-		memcpy(Frame + 10, HostMac, 6);
-		memcpy(Frame + 16, Target.iBssid, 6);
-		static const TUint8 KSnapEapol[8] = { 0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e };
-		memcpy(Frame + 24, KSnapEapol, 8);
+		static const TUint8 KEapolType[2] = { 0x88, 0x8e };
+		DataHdr(Target.iBssid, KEapolType);
 		memcpy(Frame + 32, aData, aLen);
 		TInt id = DataTx(Frame, 32 + aLen, !PtkInstalled);
 		if (id < 0)
@@ -1744,7 +1824,38 @@ static void ServeReq()
 		Join();
 	}
 
-// after bring-up: poll for good, scan when asked (polled; shortcut: no IRQs, 10 ms latency when idle)
+// W5: the user side's Ethernet frames out, as native wifi to the AP; a frame waits in the queue while every tx slot is busy
+static void DrainTx()
+	{
+	while (Link == ELinkConnected)
+		{
+		TBool slot = EFalse;
+		for (TInt i = 0; i < KTxSlots && !slot; ++i)
+			slot = !TxBusy[i];
+		if (!slot)
+			return;
+		NKern::FMWait(&LinkLock);
+		TInt n = TxQCount ? TxQLen[TxQHead] : 0;
+		if (n)
+			{
+			const TUint8* e = TxQ[TxQHead];
+			DataHdr(e, e + 12);
+			memcpy(Frame + 32, e + 14, n - 14);
+			TxQHead = (TxQHead + 1) % KTxFrames;
+			--TxQCount;
+			}
+		NKern::FMSignal(&LinkLock);
+		if (!n)
+			return;
+		if (DataTx(Frame, 32 + n - 14, !PtkInstalled) < 0)
+			++TxQFailed;
+		else
+			++TxQSent;
+		}
+	}
+
+// after bring-up: poll for good, scan when asked (polled; shortcut: no IRQs, 10 ms latency when idle and 2 ms while
+// connected; move to the CE interrupts when power matters)
 static void Serve()
 	{
 	for (;;)
@@ -1764,6 +1875,7 @@ static void Serve()
 			Step = 8;
 			}
 		ServeReq();
+		DrainTx();
 		if (LostWanted && Link >= ELinkJoining && Link <= ELinkConnected)
 			Teardown(ELinkLost, 0, LostReason, EFalse);
 		TBool linked = Link >= ELinkJoining && Link <= ELinkConnected;
@@ -1774,7 +1886,7 @@ static void Serve()
 			if (ScanStart(EFalse) != KErrNone)					// passive: on this phone active scans missed 2.4 GHz
 				return;
 			}
-		NKern::Sleep(NKern::TimerTicks(Step == 7 || Link == ELinkHandshake ? 1 : 10));
+		NKern::Sleep(NKern::TimerTicks(Step == 7 || Link == ELinkHandshake ? 1 : Link == ELinkConnected ? 2 : 10));
 		}
 	}
 

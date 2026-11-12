@@ -49,7 +49,7 @@ const TInt KRxPost = 8;			// rx buffers posted per destination ring (RAM: our ba
 const TInt KDesc = 16;			// struct ce_desc_64
 
 struct SDesc { TUint32 iAddrLo, iAddrHi; TUint16 iNbytes, iFlags; TUint32 iHash; };
-struct SRing { SDesc* iDesc; TPhysAddr iPhys; TUint32 iMask, iSw, iWr; TUint8* iBuf; TPhysAddr iBufPhys; };
+struct SRing { SDesc* iDesc; TPhysAddr iPhys; TUint32 iMask, iSw, iWr, iSlots; TUint8* iBuf; TPhysAddr iBufPhys; };
 static SRing Src[12], Dst[12];
 
 // The pool is mapped as device memory: only aligned 32-bit accesses (the compiler merged two descriptor fields into an
@@ -134,9 +134,11 @@ static TInt InitRings()
 			SRing& s = Src[c];
 			TUint32 n = Pow2(cfg.iSrcN);
 			s.iDesc = (SDesc*)Carve(n * KDesc, s.iPhys);
-			// tx buffers only where W2 sends: HTC control (CE0) and WMI (CE3); CE4 alone would take 512 KB
-			s.iBuf = c == 0 || c == 3 ? (TUint8*)Carve(n * cfg.iMax, s.iBufPhys) : NULL;
-			if (!s.iDesc || ((c == 0 || c == 3) && !s.iBuf))
+			// tx buffers where we send: HTC control (CE0), WMI (CE3), HTT (CE4, 64 slots: all 2048 would be 512 KB)
+			TBool tx = c == 0 || c == 3 || c == 4;
+			s.iSlots = Min(n, 64u);
+			s.iBuf = tx ? (TUint8*)Carve(s.iSlots * cfg.iMax, s.iBufPhys) : NULL;
+			if (!s.iDesc || (tx && !s.iBuf))
 				return KErrNoMemory;
 			s.iMask = n - 1;
 			s.iSw = R(CeReg(c, ESrri)) & s.iMask;		// adopt the hardware's indices (they survive sessions)
@@ -197,8 +199,9 @@ static TInt Send(TInt aCe, TUint8 aEid, const TUint8* aData, TInt aLen)
 	TUint32 sw = Rri[aCe] & 0xffff & s.iMask;
 	if (((s.iWr + 1) & s.iMask) == sw)
 		return KErrOverflow;									// full: one slot always stays empty
-	ToDev(s.iBuf + s.iWr * KCe[aCe].iMax, aData, aLen);
-	DescWrite(&s.iDesc[s.iWr], s.iBufPhys + s.iWr * KCe[aCe].iMax, (TUint16)aLen, (TUint16)((aEid << 4) & 0xfff0));
+	TUint32 slot = s.iWr % s.iSlots;							// shortcut: CE4 reuses 64 slots (fine while sends are rare)
+	ToDev(s.iBuf + slot * KCe[aCe].iMax, aData, aLen);
+	DescWrite(&s.iDesc[s.iWr], s.iBufPhys + slot * KCe[aCe].iMax, (TUint16)aLen, (TUint16)((aEid << 4) & 0xfff0));
 	__e32_memory_barrier();
 	s.iWr = (s.iWr + 1) & s.iMask;
 	R(Shadow(aCe)) = s.iWr;
@@ -630,7 +633,12 @@ const TInt KNumChans = sizeof(KChans) / sizeof(KChans[0]);
 // shortcut: one fixed locally administered MAC (the WCN3990 stores none); derive it from the phone before release
 static const TUint8 KMac[6] = { 0x02, 0x4e, 0x53, 0x57, 0x46, 0x01 };
 
-static TInt Scan()
+static TBool VdevMade;
+
+static TInt Scan(TBool aActive)
+	{
+	if (VdevMade)
+		goto start;
 	{
 	TUint32 chains = (1u << Min(RfChains, 4u)) - 1;
 	for (TUint32 param = 1; param <= 2; ++param)				// PDEV_SET_PARAM TX / RX_CHAIN_MASK
@@ -684,21 +692,34 @@ static TInt Scan()
 	Cmd32(KMac[4] | KMac[5] << 8);
 	if (CmdSend("vdev create") != KErrNone)
 		return Error;
-	CmdStart(0x3001);											// START_SCAN, passive (nothing transmitted)
+	VdevMade = ETrue;
+	}
+start:
+	CmdStart(0x3001);											// START_SCAN
 	CmdTlv(77, 100);
-	static const TUint32 KScan[25] = { 0xa000, 0xa001, 0, 1, 0x11f, 50, 150, 50, 500, 0, 0, 0, 20000, 5,
-		0x31,			// PASSIVE | CHAN_STAT_EVENT | FILTER_PROBE_REQ (inverted on TLV firmware)
-		0, (TUint32)KNumChans, 1, 0, 0, 3, 0, 0, 0, 0 };
+	TUint32 scan[25] = { 0xa000, 0xa001, 0, 1, 0x11f, 50, 150, 50, 500, 0, 0, 0, 20000, 5,
+		// active 0x30 / passive 0x31: CHAN_STAT_EVENT | FILTER_PROBE_REQ (inverted on TLV firmware) | PASSIVE
+		aActive ? 0x30u : 0x31u, 0, (TUint32)KNumChans, 1, aActive ? 1u : 0u, aActive ? 16u : 0u, 3, 0, 0, 0, 0 };
 	for (TInt i = 0; i < 25; ++i)
-		Cmd32(KScan[i]);
+		Cmd32(scan[i]);
 	CmdTlv(16, KNumChans * 4);									// the channels, MHz
 	for (TInt i = 0; i < KNumChans; ++i)
 		Cmd32(KChans[i].iMhz);
-	CmdTlv(19, 0);												// no SSIDs: passive
+	CmdTlv(19, aActive ? 36 : 0);								// SSIDs: the wildcard (length 0) for an active scan
+	for (TInt i = 0; aActive && i < 9; ++i)
+		Cmd32(0);
 	CmdTlv(19, 8);												// BSSIDs: the broadcast address
 	Cmd32(0xffffffff);
 	Cmd32(0x0000ffff);
-	CmdTlv(17, 0);												// no probe request IEs
+	CmdTlv(17, aActive ? 16 : 0);								// probe request IEs: supported + extended rates
+	if (aActive)
+		{
+		Cmd32(0x84820801);										// 01 08 82 84 8b 96 0c 12 18 24 32 04 30 48 60 6c
+		Cmd32(0x120c968b);
+		Cmd32(0x04322418);
+		Cmd32(0x6c604830);
+		}
+	Kern::Printf("[wifi] %s scan", aActive ? "active" : "passive");
 	NumBss = Beacons = ChanInfos = OtherFrames = 0;
 	ScanDone = EFalse;
 	if (CmdSend("start scan") != KErrNone)
@@ -772,7 +793,14 @@ static TInt Run()
 	Step = 5;
 	if (!WaitFor(6, 5000))
 		return Fail(KErrTimedOut, "WMI ready");
-	return Scan();
+	TUint8 ver[4] = { 0, 0, 0, 0 };								// HTT_H2T VERSION_REQ (ath10k htt_tx.c), the reply on CE1
+	r = HtcSend(HttEid, ver, sizeof(ver));
+	Kern::Printf("[wifi] HTT version request -> %d", r);
+	for (TInt t = 0; t < 300; ++t)
+		Poll(), NKern::Sleep(NKern::TimerTicks(1));
+	if ((r = Scan(EFalse)) != KErrNone)
+		return r;
+	return Scan(ETrue);
 	}
 
 static TDynamicDfcQue* Queue;

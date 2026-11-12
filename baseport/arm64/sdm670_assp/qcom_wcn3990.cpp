@@ -449,14 +449,23 @@ static void AddBss(const TUint8* aHdr, const TUint8* aBody, TInt aBodyLen, TInt 
 	SBss& b = Bss[NumBss++];
 	memcpy(b.iBssid, bssid, 6);
 	b.iSsidLen = 0;
+	// the AP's channel comes from its beacon: the firmware's header gives the channel it was tuned to, which can be a
+	// neighbour (a 5 GHz network showed on 2.4 GHz)
+	TInt own = 0;
+	TInt tuned = aChannel;
+	aChannel = 0;
 	for (TInt ie = 12; ie + 2 <= aBodyLen && ie + 2 + aBody[ie + 1] <= aBodyLen; ie += 2 + aBody[ie + 1])
 		if (aBody[ie] == 0 && aBody[ie + 1] <= 32 && !b.iSsidLen)
 			{
 			b.iSsidLen = aBody[ie + 1];
 			memcpy(b.iSsid, aBody + ie + 2, b.iSsidLen);
 			}
-		else if (aBody[ie] == 3 && aBody[ie + 1] == 1 && !aChannel)
-			aChannel = aBody[ie + 2];							// DS parameter set: the channel (HTT frames carry none)
+		else if (aBody[ie] == 3 && aBody[ie + 1] == 1)
+			aChannel = aBody[ie + 2];							// DS parameter set: the AP's own channel (2.4 GHz)
+		else if (aBody[ie] == 61 && aBody[ie + 1] >= 1 && !own)
+			own = aBody[ie + 2];								// HT operation: the primary channel (5 GHz has no DS IE)
+	if (!aChannel)
+		aChannel = own ? own : tuned;
 	b.iChannel = (TUint8)aChannel;
 	b.iDbm = (TInt8)aDbm;
 	b.iSecured = (aBody[10] & 0x10) ? 1 : 0;

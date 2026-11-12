@@ -1193,8 +1193,8 @@ void Wcn3990_Monitor(TInt aOp, TInt aArg)
 		4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
 	if (aOp == 0)
 		{
-		A64Mon_Say("wifi: step %d error %d; link %d aid %d status %d reason %d; rx data %d ip %d; eapol queued %d", Step,
-			Error, Link, LinkAid, LinkStatus, LinkReason, RxData, RxIp, EapolCount);
+		A64Mon_Say("wifi: step %d error %d; link %d aid %d status %d reason %d; rx data %d ip %d; eapol queued %d; "
+			"wmi credits %d", Step, Error, Link, LinkAid, LinkStatus, LinkReason, RxData, RxIp, EapolCount, Credits);
 		for (TInt i = 0; i < NumResults; ++i)
 			A64Mon_Say("  %d: %02x:%02x:%02x:%02x:%02x:%02x ch %d %d dBm%s", i, Results[i].iBssid[0],
 				Results[i].iBssid[1], Results[i].iBssid[2], Results[i].iBssid[3], Results[i].iBssid[4],
@@ -1215,6 +1215,20 @@ void Wcn3990_Monitor(TInt aOp, TInt aArg)
 	}
 
 // ---- W4: sending frames and joining (private/wifi/w4-join-spec.md)
+// a link command: like CmdSend, but a credit that is slow to come back fails only this operation, never the driver
+// (phone 2026-11-12: a teardown found no credit within 1 s and CmdSend's Fail left every later join failing)
+static TInt LinkCmd(const char* aWhat)
+	{
+	for (TInt t = 0; t < 3000 && !Credits && !Error; ++t)
+		Poll(), NKern::Sleep(NKern::TimerTicks(1));
+	if (!Credits)
+		{
+		Kern::Printf("[wifi] %s: no WMI credit in 3 s", aWhat);
+		return KErrTimedOut;
+		}
+	return HtcSend(WmiEid, Cmd, CmdLen);
+	}
+
 static void CmdMac(const TUint8* aMac)							// wmi_mac_addr: 6 bytes + 2 pad
 	{
 	Cmd32(aMac[0] | aMac[1] << 8 | aMac[2] << 16 | (TUint32)aMac[3] << 24);
@@ -1298,7 +1312,12 @@ static TInt MgmtTx(const TUint8* aFrame, TInt aLen)
 	ToDev(TxBuf + id * KTxSlot, aFrame, aLen);
 	__e32_memory_barrier();
 	if (!Svc76())
-		return HttTx(id, 0x61, 17, TxBufPhys + id * KTxSlot, aLen);
+		{
+		TInt r = HttTx(id, 0x61, 17, TxBufPhys + id * KTxSlot, aLen);
+		if (r != KErrNone)
+			TxBusy[id] = EFalse;
+		return r;
+		}
 	TInt head = Min(aLen, 64);
 	CmdStart(0x7008);											// MGMT_TX_SEND
 	CmdTlv(422, 28);
@@ -1311,7 +1330,10 @@ static TInt MgmtTx(const TUint8* aFrame, TInt aLen)
 	Cmd32((head + 3) & ~3);
 	CmdTlv(17, (head + 3) & ~3);
 	CmdBytes(aFrame, head);
-	return CmdSend("mgmt tx");
+	TInt r = LinkCmd("mgmt tx");
+	if (r != KErrNone)
+		TxBusy[id] = EFalse;									// never sent: no completion will free it
+	return r;
 	}
 
 // a data frame (native wifi, aFrame word aligned): its ext descriptor in the bank, then TX_FRM; aNoEncrypt before the
@@ -1403,7 +1425,7 @@ static void Teardown(TInt aState, TUint16 aStatus, TUint16 aReason, TBool aDeaut
 		CmdTlv(98, 12);
 		Cmd32(0);
 		CmdMac(Target.iBssid);
-		if (CmdSend("peer delete") == KErrNone)
+		if (LinkCmd("peer delete") == KErrNone)
 			WaitFlag(PeerUnmapped, 1000, EFalse);
 		PeerUp = PeerMapped = EFalse;
 		}
@@ -1412,7 +1434,7 @@ static void Teardown(TInt aState, TUint16 aStatus, TUint16 aReason, TBool aDeaut
 		CmdStart(0x5007);										// VDEV_DOWN
 		CmdTlv(94, 4);
 		Cmd32(0);
-		CmdSend("vdev down");
+		LinkCmd("vdev down");
 		VdevUp = EFalse;
 		}
 	if (VdevStarted)
@@ -1421,7 +1443,7 @@ static void Teardown(TInt aState, TUint16 aStatus, TUint16 aReason, TBool aDeaut
 		CmdStart(0x5006);										// VDEV_STOP
 		CmdTlv(93, 4);
 		Cmd32(0);
-		if (CmdSend("vdev stop") == KErrNone)
+		if (LinkCmd("vdev stop") == KErrNone)
 			WaitFlag(VdevStoppedGot, 2000, EFalse);
 		VdevStarted = EFalse;
 		}
@@ -1489,7 +1511,7 @@ static void Join()
 	Cmd32(g ? 0x00282800 : 0x003c3c00);
 	Cmd32(g ? 0x00002800 : 0x00003c00);
 	CmdTlv(18, 0);
-	if (CmdSend("vdev start") != KErrNone)
+	if (LinkCmd("vdev start") != KErrNone)
 		return JoinFail(0, EJoinStart);
 	VdevStarted = ETrue;
 	if (!WaitFlag(StartRespGot, 5000, ETrue) || StartStatus)
@@ -1501,7 +1523,7 @@ static void Join()
 	Cmd32(0);
 	CmdMac(Target.iBssid);
 	Cmd32(0);
-	if (CmdSend("peer create") != KErrNone)
+	if (LinkCmd("peer create") != KErrNone)
 		return JoinFail(0, EJoinPeer);
 	PeerUp = ETrue;
 	if (!WaitFlag(PeerMapped, 3000, ETrue))
@@ -1572,7 +1594,7 @@ static void Join()
 	CmdTlv(102, 16);											// VHT rate set: none
 	for (TInt i = 0; i < 4; ++i)
 		Cmd32(0);
-	if (CmdSend("peer assoc") != KErrNone)
+	if (LinkCmd("peer assoc") != KErrNone)
 		return JoinFail(0, EJoinAssoc);
 
 	CmdStart(0x5005);											// VDEV_UP {vdev, aid, bssid}
@@ -1580,7 +1602,7 @@ static void Join()
 	Cmd32(0);
 	Cmd32(AssocAid);
 	CmdMac(Target.iBssid);
-	if (CmdSend("vdev up") != KErrNone)
+	if (LinkCmd("vdev up") != KErrNone)
 		return JoinFail(0, EJoinAssoc);
 	VdevUp = ETrue;
 	LinkAid = AssocAid;
@@ -1664,7 +1686,7 @@ static TInt DoReq(TInt aOp, const TUint8* aData, TInt aLen)
 		Cmd32(0);
 		CmdTlv(17, 16);
 		CmdBytes(aData + 2, 16);
-		TInt r = CmdSend("install key");
+		TInt r = LinkCmd("install key");
 		memclr(Cmd, CmdLen);									// no key stays in the command buffer
 		if (r != KErrNone)
 			return r;
@@ -1687,7 +1709,7 @@ static TInt DoReq(TInt aOp, const TUint8* aData, TInt aLen)
 		CmdMac(Target.iBssid);
 		Cmd32(3);
 		Cmd32(1);
-		TInt r = CmdSend("authorize");
+		TInt r = LinkCmd("authorize");
 		if (r == KErrNone)
 			SetLink(ELinkConnected, 0, 0);
 		return r;

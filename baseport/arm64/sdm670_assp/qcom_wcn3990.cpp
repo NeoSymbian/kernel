@@ -1315,10 +1315,10 @@ static TInt MgmtTx(const TUint8* aFrame, TInt aLen)
 	}
 
 // a data frame (native wifi, aFrame word aligned): its ext descriptor in the bank, then TX_FRM; aNoEncrypt before the
-// pairwise key is installed. Returns the slot, which the caller waits on and frees.
+// pairwise key is installed. The slot is freed when the chip reports the frame sent (or discarded).
 static TInt DataTx(const TUint8* aFrame, TInt aLen, TBool aNoEncrypt)
 	{
-	TInt id = TxAlloc(EFalse);
+	TInt id = TxAlloc(ETrue);
 	if (id < 0 || aLen > KTxSlot)
 		return KErrOverflow;
 	ToDev(TxBuf + id * KTxSlot, aFrame, aLen);
@@ -1638,15 +1638,11 @@ static TInt DoReq(TInt aOp, const TUint8* aData, TInt aLen)
 		TInt id = DataTx(Frame, 32 + aLen, !PtkInstalled);
 		if (id < 0)
 			return id;
-		// wait for the chip to report it sent (msg4 before the PTK goes in). NO_ENCRYPT was fixed when it was queued, so a
-		// late report is logged, not fatal: on the phone msg4's report did not come within 1 s (msg2's did)
-		TInt t = 0;
-		for (; t < 2000 && TxStat[id] < 0 && !Error; ++t)
-			Poll(), NKern::Sleep(NKern::TimerTicks(1));
-		TInt st = TxStat[id];
-		TxBusy[id] = EFalse;
-		Kern::Printf("[wifi] EAPOL out, %d bytes, msdu %d: tx status %d after %d ms", aLen, id, st, t);
-		return KErrNone;										// not acked still counts: the AP resends if it missed it
+		// queued, not waited for: the firmware holds msg4 until the PTK is installed (phone, 2026-11-12: no report in
+		// 2 s, the AP resending msg3, then DISCARD at teardown), as Linux's supplicant installs it right after msg4.
+		// NO_ENCRYPT was fixed at queue time, so msg4 still goes out in the clear.
+		Kern::Printf("[wifi] EAPOL out, %d bytes, msdu %d", aLen, id);
+		return KErrNone;
 		}
 	case EReqKey:
 		{

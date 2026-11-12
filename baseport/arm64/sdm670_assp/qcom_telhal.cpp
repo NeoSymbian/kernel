@@ -26,6 +26,8 @@
 //   0x4e1c WlanMsa     a1 = SIo { op 1 assign, 0 release; phys; size; secure }: a region of the Wi-Fi firmware's MSA
 //                      carve-out (DTB wlan-msa 0x94d00000 + 1 MB) handed from HLOS to MSS_MSA + WLAN (+ WLAN_CE unless
 //                      secure) and back, as Linux ath10k_qmi_map_msa_permission (docs wifi.md W1)
+//   0x4e1d WlanStart   after WLAN cfg + mission mode: the copy engines, HTC and WMI up to READY on the driver's own
+//                      thread (qcom_wcn3990.cpp, docs wifi.md W2); KErrInUse while it runs
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
@@ -41,13 +43,14 @@
 #include "qcom_ipa.h"
 #include "qcom_adsp.h"
 #include "qcom_telhal.h"
+#include "qcom_wcn3990.h"
 
 TInt A64BlkDev_Probe();										// qcom_sdhci.cpp (the monitor's "blk init")
 // the board's codecs (bonito a64_audio.cpp); a board without call audio has none
 __attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupported; }
 
 enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
-	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa };
+	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa, EWlanStart };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -452,6 +455,8 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 		kumemget32(&io, a1, sizeof(io));
 		return FwRead(io, a2);
 		}
+	case EWlanStart:
+		return Wcn3990_Start();
 	case EWlanMsa:
 		{
 		SIo io;

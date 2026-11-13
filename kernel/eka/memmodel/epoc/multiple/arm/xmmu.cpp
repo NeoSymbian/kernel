@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): user stacks up to 1 MB, as in the flexible model.
 // Description:
 // e32\memmodel\epoc\multiple\arm\xmmu.cpp
 // 
@@ -822,7 +822,7 @@ void ArmMmu::Init1()
 	// ArmMmu data
 
 	// other
-	PP::MaxUserThreadStack=0x14000;			// 80K - STDLIB asks for 64K for PosixServer!!!!
+	PP::MaxUserThreadStack=0x100000;		// NeoSymbian: 1MB as in the flexible model (Rust EXEs ask for 128K)
 	PP::UserThreadStackGuard=0x2000;		// 8K
 	PP::MaxStackSpacePerProcess=0x200000;	// 2Mb
 	K::SupervisorThreadStackSize=0x1000;	// 4K

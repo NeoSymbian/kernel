@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): MarkCleanupStack/UnMarkCleanupStack moved to us_trp.cpp (old binaries' TRAPs).
 // Description:
 // e32\euser\us_exec.cpp
 // 
@@ -5876,36 +5876,7 @@ implemented as a derived class.
 	}
 
 #ifndef __LEAVE_EQUALS_THROW__
-EXPORT_C TTrapHandler* User::MarkCleanupStack()
-/**
-If there's a TTrapHandler installed marks the cleanup stack and returns 
-the TTrapHandler for subsequent use in UnMarkCleanupStack. 
-
-Only intended for use in the defintion of TRAP and TRAPD and only when 
-User::Leave is defined in terms of THROW.
-
-@return A pointer to the current thread's pre-existing trap handler, if any. 
-        NULL, if no pre-existing trap handler is set.
-
-@see TRAP
-@see TRAPD
-*/
-	{ 
-	return (TTrapHandler*)0; 
-	}
-
-
-EXPORT_C void User::UnMarkCleanupStack(TTrapHandler* /*aHandler*/)
-/**
-If passed a non-null TTrapHandler unmarks the cleanup stack.
-
-Only intended for use in the defintion of TRAP and TRAPD and only when 
-User::Leave is defined in terms of THROW.
-
-@see TRAP
-@see TRAPD
-*/
-	{}
+// NeoSymbian: User::MarkCleanupStack and UnMarkCleanupStack are in us_trp.cpp (old binaries' TRAPs)
 
 #else
 

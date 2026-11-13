@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): User::Leave's frame restore is NeoTrapLongjmp; User::Leave is in us_trp.cpp.
 // Description:
 // e32\euser\epoc\arm\uc_trp.cia
 // 
@@ -65,25 +65,11 @@ extern void PanicNoTrapFrame();
 
 
 
-EXPORT_C __NAKED__ void User::Leave(TInt /*aReason*/)
-/**
-Leaves the currently executing function, unwinds the call stack, and returns
-from the most recently entered trap harness.
-
-@param aReason The value returned from the most recent call to TRAP or TRAPD.
-               This is known as the reason code and, typically, it gives the
-               reason for the environment or user error causing this leave
-               to occur.
-              
-@see TRAP
-@see TRAPD              
-*/
+// NeoSymbian: the second half of the 2010 User::Leave -- User::Leave (us_trp.cpp) has popped aFrame, which is a
+// TTrap::Trap frame: call its handler's Leave and return 1 from that TTrap::Trap
+__NAKED__ void NeoTrapLongjmp(TTrap* /*aFrame*/, TInt /*aReason*/)
 	{
-
-	asm("mov r4, r0 ");						// Save aReason
-	asm("bl  " CSM_ZN4Exec12PopTrapFrameEv);			// Returns the current TTrap
-    asm("cmp r0, #0 ");
-    asm("bleq  " CSM_Z16PanicNoTrapFramev);
+	asm("mov r4, r1 ");						// Save aReason
 	asm("ldr r1, [r0, #%a0]" : : "i" _FOFF(TTrap,iResult));
 	asm("mov r5, r0 ");						// Save it for later
 	asm("ldr r0, [r0, #%a0]" : : "i" _FOFF(TTrap,iHandler));

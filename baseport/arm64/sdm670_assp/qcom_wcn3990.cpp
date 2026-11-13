@@ -8,7 +8,7 @@
 // wmi-tlv.c/h, wmi.c/h); private/wifi/w2-spec.md cites each one. This file is a new implementation.
 // W3a: after READY, a first passive scan (PDEV_SET_PARAM chain masks, SCAN_CHAN_LIST, VDEV_CREATE, START_SCAN; beacons
 // from MGMT_RX logged), facts in private/wifi/w3a-scan-spec.md.
-// shortcut: polled for a fixed window, a few rx buffers per ring, no HTT; IRQs and the WHA PDD come with W3.
+// W7: after bring-up the destination copy engines interrupt (docs wifi.md W7); the bring-up and a join stay polled.
 #include <kernel/kern_priv.h>
 #include <platform.h>
 #include "board.h"
@@ -16,6 +16,7 @@
 #include "qcom_smmu.h"
 #include "qcom_smem.h"
 #include "a64_dbgmon.h"
+#include "a64_platform.h"
 #include "qcom_wcn3990.h"
 
 const TUint32 KWlan = 0x18800000;
@@ -98,6 +99,33 @@ static TUint8 HostMac[6] = { 0x02, 0x4e, 0x53, 0x57, 0x46, 0x01 };	// our statio
 static volatile TBool ModemDown;									// the modem stopped (Wcn3990_ModemDown)
 static TUint32 Svc[32];			// the service bitmap: word id / 4, bit id % 4 (ath10k WMI_SERVICE_IS_ENABLED)
 static TBool Svc174, Svc179;
+
+// ---- W7: what wakes Serve() (docs wifi.md W7). A CE interrupt: the ISR masks its line (level-triggered, and the GIC
+// EOI came before the ISR) and adds an IDFC; the IDFC signals Serve's semaphore. A timer and the HAL requests too.
+const TBool KUseIrqs = ETrue;								// EFalse: the old polled loop (1/2/10 ms sleeps)
+const TUint32 KCeIntId0 = 32 + 0x19e;						// CE0's line (DTB: SPI 414), then one per copy engine
+const TInt KCeIrqs[] = { 1, 2, 5, 9, 10, 11 };				// the destination rings that carry traffic
+const TInt KCeIrqN = sizeof(KCeIrqs) / sizeof(KCeIrqs[0]);
+static NFastSemaphore WakeSem;
+static volatile TBool IrqOn;									// lines bound and HOST_IE set; EFalse = polled
+static volatile TUint32 Irqs;
+static volatile TInt ModeWanted;								// the monitor's "wifi polled" (1) / "wifi irq" (2)
+static TUint32 Wakes;
+static void WakeIdfcFn(TAny*) { WakeSem.Signal(); }			// IDFC: the kernel is locked
+static TDfc WakeIdfc(WakeIdfcFn, NULL);
+static void WakeTimerFn(TAny*) { WakeIdfc.Add(); }
+static NTimer WakeTimer(WakeTimerFn, NULL);
+static void CeIsr(TAny* aCe)
+	{
+	A64_MaskSpi(KCeIntId0 + (TInt)(TLinAddr)aCe, ETrue);	// Serve unmasks it once it has reaped the ring
+	++Irqs;
+	WakeIdfc.Add();
+	}
+static void Wake()												// thread context (the HAL, MODEMD's stop)
+	{
+	if (IrqOn)
+		NKern::FSSignal(&WakeSem);
+	}
 
 static TInt Fail(TInt aErr, const char* aWhat)
 	{
@@ -472,6 +500,11 @@ static TUint8 RxQ[KRxFrames][KEthMax], TxQ[KTxFrames][KEthMax];
 static TUint16 RxQLen[KRxFrames], TxQLen[KTxFrames];
 static TInt RxQHead, RxQCount, TxQHead, TxQCount;
 static TUint32 RxQDropped, TxQSent, TxQFailed;
+// W7: the one waiting WlanLink op 10 request (NEONET's), under LinkLock; Notify() completes it once something is due
+static DThread* NotifyThread;
+static TRequestStatus* NotifyStatus;
+static TBool NotifyDue;											// a frame was queued or the link changed
+static TUint32 HandshakeAt;										// tick count when the handshake began
 // set by the rx handlers (this thread), read by Join/Teardown
 static TBool StartRespGot, VdevStoppedGot, PeerMapped, PeerUnmapped, AuthDone, AssocDone, LostWanted, AbortWanted;
 static TInt StartStatus;
@@ -503,6 +536,9 @@ static void SetLink(TInt aState, TUint16 aStatus, TUint16 aReason)
 		EapolCount = 0;
 	if (aState != ELinkConnected)
 		RxQCount = TxQCount = 0;									// no IP traffic outlives the link
+	NotifyDue = ETrue;
+	if (aState == ELinkHandshake)
+		HandshakeAt = NKern::TickCount();
 	NKern::FMSignal(&LinkLock);
 	static const char* const KNames[] = { "idle", "joining", "handshake", "connected", "lost", "error" };
 	Kern::Printf("[wifi] link %s (status %d, reason %d)", KNames[aState], aStatus, aReason);
@@ -706,6 +742,7 @@ static void DataIn(const TUint8* f, TInt aLen, TBool aBad)
 		memcpy(e + 6, f + 16, 6);									// SA = addr3 (FromDS)
 		memcpy(e + 12, f + 30, aLen - 30);							// the ethertype, then the payload
 		RxQLen[slot] = (TUint16)n;
+		NotifyDue = ETrue;
 		}
 	else
 		++RxQDropped;
@@ -897,9 +934,10 @@ static void HtcRx(const TUint8* f, TInt n)
 		HttRx(p, len);
 	}
 
-// reap every destination ring once: frames whose length the hardware filled in
-static void Poll()
+// reap every destination ring once: frames whose length the hardware filled in; how many
+static TInt Poll()
 	{
+	TInt reaped = 0;
 	for (TInt c = 0; c < 12; ++c)
 		{
 		SRing& d = Dst[c];
@@ -924,8 +962,10 @@ static void Poll()
 					HtcRx((const TUint8*)rx, nbytes);
 				}
 			PostRx(c, phys);									// the same buffer goes back
+			++reaped;
 			}
 		}
+	return reaped;
 	}
 
 static TBool WaitFor(TInt aStep, TInt aMs)
@@ -1126,6 +1166,7 @@ static TInt PostReq(TInt aOp, const TUint8* aData, TInt aLen)
 	Req.iOp = aOp;
 	TUint32 seq = ++Req.iSeq;
 	NKern::FMSignal(&LinkLock);
+	Wake();
 	TInt r = KErrTimedOut;
 	for (TInt ms = 0; ms < 3000; ms += 10)
 		{
@@ -1145,6 +1186,64 @@ static TInt PostReq(TInt aOp, const TUint8* aData, TInt aLen)
 	return r;
 	}
 
+// complete a taken op 10 request and drop our hold on its thread
+static void NotifyComplete(DThread* aThread, TRequestStatus* aStatus, TInt aReason)
+	{
+	Kern::RequestComplete(aThread, aStatus, aReason);
+	NKern::ThreadEnterCS();
+	aThread->Close(NULL);
+	NKern::ThreadLeaveCS();
+	}
+
+// Serve: complete the op 10 request if something is due (or with aReason when the driver stops)
+static void Notify(TInt aReason)
+	{
+	NKern::FMWait(&LinkLock);
+	DThread* t = NotifyDue || aReason != KErrNone ? NotifyThread : NULL;
+	TRequestStatus* s = NotifyStatus;
+	if (t)
+		NotifyThread = NULL, NotifyStatus = NULL, NotifyDue = EFalse;
+	NKern::FMSignal(&LinkLock);
+	if (t)
+		NotifyComplete(t, s, aReason);
+	}
+
+// op 10 (aArm): keep the caller's request for Notify; op 11: complete the caller's own with KErrCancel
+static TInt Notice(TBool aArm, DThread* aThread, TRequestStatus* aStatus)
+	{
+	if (aArm)
+		{
+		if (!aStatus)
+			return KErrArgument;
+		NKern::ThreadEnterCS();
+		aThread->Open();
+		NKern::ThreadLeaveCS();
+		NKern::FMWait(&LinkLock);
+		TBool busy = NotifyThread != NULL;
+		if (!busy)
+			NotifyThread = aThread, NotifyStatus = aStatus, NotifyDue |= RxQCount != 0;
+		NKern::FMSignal(&LinkLock);
+		if (busy)
+			{
+			NKern::ThreadEnterCS();
+			aThread->Close(NULL);
+			NKern::ThreadLeaveCS();
+			return KErrInUse;
+			}
+		Wake();
+		return KErrNone;
+		}
+	NKern::FMWait(&LinkLock);
+	TBool mine = NotifyThread == aThread;
+	TRequestStatus* s = NotifyStatus;
+	if (mine)
+		NotifyThread = NULL, NotifyStatus = NULL;
+	NKern::FMSignal(&LinkLock);
+	if (mine)
+		NotifyComplete(aThread, s, KErrCancel);
+	return KErrNone;
+	}
+
 // HAL WlanLink (0x4e1f): a1 = the op, a2 = TDes8*. Ops 1 join {bssid 6, our RSN element}, 2 leave, 5 send EAPOL
 // {frame}, 6 install key {0 pairwise / 1 group, key index, 16-byte CCMP key}, 7 authorize: carried out by the driver
 // thread, the caller waits (3 s at most). 3 status -> {version 1, state, aid, status, reason (le16), bssid, our MAC,
@@ -1152,12 +1251,16 @@ static TInt PostReq(TInt aOp, const TUint8* aData, TInt aLen)
 // W5, for the IP stack, never waiting on the driver thread: 8 the next received Ethernet II frame (KErrNotReady if none);
 // 9 queue one Ethernet II frame to send, 14..1514 bytes from our MAC (KErrNotReady unless connected, KErrOverflow if the
 // queue is full).
+// W7: 10 a2 = TRequestStatus*, completed (KErrNone) once a received frame is queued or the link state changes, at once
+// if a frame is waiting (one request at a time: KErrInUse); 11 completes the caller's op 10 request with KErrCancel.
 TInt Wcn3990_LinkHal(TAny* a1, TAny* a2)
 	{
 	TInt op = (TInt)(TLinAddr)a1;
 	DThread* t = &Kern::CurrentThread();
 	if (Step < 7)
 		return KErrNotReady;									// not up (or not on this board)
+	if (op == 10 || op == 11)
+		return Notice(op == 10, t, (TRequestStatus*)a2);
 	if (op != 3 && op != 4 && op != EReqJoin && op != EReqLeave && op != EReqSend && op != EReqKey &&
 		op != EReqAuthorize && op != 8 && op != 9)
 		return KErrArgument;
@@ -1201,6 +1304,8 @@ TInt Wcn3990_LinkHal(TAny* a1, TAny* a2)
 				TxQLen[slot] = (TUint16)n;
 				}
 			NKern::FMSignal(&LinkLock);
+			if (r == KErrNone)
+				Wake();
 			}
 		}
 	else if (op == 3 || op == 4)
@@ -1267,10 +1372,19 @@ void Wcn3990_Monitor(TInt aOp, TInt aArg)
 			"wmi credits %d", Step, Error, Link, LinkAid, LinkStatus, LinkReason, RxData, RxIp, EapolCount, Credits);
 		A64Mon_Say("wifi ip: rx queued %d dropped %d; tx queued %d sent %d failed %d", RxQCount, RxQDropped, TxQCount,
 			TxQSent, TxQFailed);
+		A64Mon_Say("wifi wake: %s, %d interrupts, %d wakes, notify %s", IrqOn ? "interrupts" : "polled", Irqs, Wakes,
+			NotifyThread ? "armed" : "idle");
 		for (TInt i = 0; i < NumResults; ++i)
 			A64Mon_Say("  %d: %02x:%02x:%02x:%02x:%02x:%02x ch %d %d dBm%s", i, Results[i].iBssid[0],
 				Results[i].iBssid[1], Results[i].iBssid[2], Results[i].iBssid[3], Results[i].iBssid[4],
 				Results[i].iBssid[5], Results[i].iChannel, Results[i].iDbm, Results[i].iSecured ? " secured" : "");
+		return;
+		}
+	if (aOp == 3 || aOp == 4)									// W7 A/B: the CE interrupts off or on again
+		{
+		ModeWanted = aOp == 3 ? 1 : 2;
+		NKern::FSSignal(&WakeSem);
+		A64Mon_Say("wifi: %s from the next pass", aOp == 3 ? "polled" : "interrupts");
 		return;
 		}
 	if (Step < 7 || (aOp == 1 && (aArg < 0 || aArg >= NumResults)))
@@ -1854,21 +1968,92 @@ static void DrainTx()
 		}
 	}
 
-// after bring-up: poll for good, scan when asked (polled; shortcut: no IRQs, 10 ms latency when idle and 2 ms while
-// connected; move to the CE interrupts when power matters)
+// W7: the CE lines on (bound, status cleared, copy-complete enabled) or off (masked, polled)
+static void Irqs1(TBool aOn)
+	{
+	TBool ok = aOn;
+	for (TInt i = 0; i < KCeIrqN; ++i)
+		{
+		TInt c = KCeIrqs[i];
+		if (aOn && A64_BindSpi(KCeIntId0 + c, CeIsr, (TAny*)(TLinAddr)c) != KErrNone)
+			ok = EFalse;
+		}
+	for (TInt i = 0; i < KCeIrqN; ++i)
+		{
+		TInt c = KCeIrqs[i];
+		if (ok)
+			{
+			R(CeReg(c, EHostIs)) = 0x1f;							// write-1-to-clear (ath10k ce engine_int_status_clear)
+			R(CeReg(c, EHostIe)) |= 1;							// copy complete (ath10k ce copy_complete_inter_enable)
+			}
+		else
+			{
+			R(CeReg(c, EHostIe)) &= ~0x1fu;
+			A64_MaskSpi(KCeIntId0 + c, ETrue);
+			}
+		}
+	IrqOn = ok;
+	}
+
+// the firmware went with the modem: forget what it held, so a WlanStart after the restart brings it up from scratch
+static void Forget()
+	{
+	PeerUp = PeerMapped = VdevStarted = VdevUp = PtkInstalled = LostWanted = AbortWanted = EFalse;
+	for (TInt i = 0; i < KTxSlots; ++i)
+		TxBusy[i] = EFalse;
+	memclr(Svc, sizeof(Svc));
+	Svc174 = Svc179 = EFalse;
+	ScanDone = EFalse;
+	}
+
+// after bring-up: serve for good, scan when asked. W7: sleeps until a CE interrupt, a HAL request or a timer (1 ms
+// while scanning or joining, else 100 ms connected / 1 s idle); with the lines off (KUseIrqs, or silent ones) it polls
+// as before: 1 ms, 2 ms connected, 10 ms idle.
 static void Serve()
 	{
+	NKern::Lock();
+	WakeSem.SetOwner(NULL);										// this thread (the same one after a restart)
+	NKern::Unlock();
+	if (KUseIrqs)
+		Irqs1(ETrue);
+	Kern::Printf("[wifi] serving: %s", IrqOn ? "CE interrupts" : "polled");
+	TUint32 seenIrqs = Irqs;
+	TInt silent = 0;											// passes that found frames no interrupt announced
 	for (;;)
 		{
 		if (ModemDown)											// the firmware is gone with the modem: hands off the chip
 			{
+			Irqs1(EFalse);
 			if (Link >= ELinkJoining && Link <= ELinkConnected)
 				SetLink(ELinkLost, 0, 0);
+			Notify(KErrNone);
+			Forget();
 			Error = KErrDied;
-			Kern::Printf("[wifi] the modem stopped: Wi-Fi is off until a reboot");
+			Kern::Printf("[wifi] the modem stopped: Wi-Fi waits for WlanStart");
 			return;
 			}
-		Poll();
+		if (ModeWanted)
+			{
+			Irqs1(ModeWanted == 2);
+			ModeWanted = 0;
+			Kern::Printf("[wifi] now %s", IrqOn ? "on CE interrupts" : "polled");
+			}
+		if (IrqOn)
+			for (TInt i = 0; i < KCeIrqN; ++i)					// before reaping: a frame after this raises it again
+				R(CeReg(KCeIrqs[i], EHostIs)) = 0x1f;
+		TInt reaped = Poll();
+		if (IrqOn)
+			{
+			for (TInt i = 0; i < KCeIrqN; ++i)
+				A64_MaskSpi(KCeIntId0 + KCeIrqs[i], EFalse);
+			silent = Irqs != seenIrqs ? 0 : reaped ? silent + 1 : silent;
+			seenIrqs = Irqs;
+			if (silent >= 20)
+				{
+				Irqs1(EFalse);
+				Kern::Printf("[wifi] CE interrupts silent (%d so far): polling", Irqs);
+				}
+			}
 		if (Step == 7 && (ScanDone || NKern::TickCount() - ScanStartedAt > 25000))
 			{
 			PublishResults();
@@ -1878,6 +2063,11 @@ static void Serve()
 		DrainTx();
 		if (LostWanted && Link >= ELinkJoining && Link <= ELinkConnected)
 			Teardown(ELinkLost, 0, LostReason, EFalse);
+		if (Link == ELinkHandshake && NKern::TickCount() - HandshakeAt > 15000)
+			{
+			Kern::Printf("[wifi] no keys after 15 s in the handshake: leaving");	// the supplicant gives up at 10 s
+			Teardown(ELinkError, 0, 15, ETrue);					// reason 15: 4-way handshake timeout
+			}
 		TBool linked = Link >= ELinkJoining && Link <= ELinkConnected;
 		if (ScanWanted && Step == 8 && !Error && !linked)		// shortcut: no scans while joined (off-channel)
 			{
@@ -1886,7 +2076,17 @@ static void Serve()
 			if (ScanStart(EFalse) != KErrNone)					// passive: on this phone active scans missed 2.4 GHz
 				return;
 			}
-		NKern::Sleep(NKern::TimerTicks(Step == 7 || Link == ELinkHandshake ? 1 : Link == ELinkConnected ? 2 : 10));
+		Notify(KErrNone);
+		TBool busy = Step == 7 || Link == ELinkJoining || Link == ELinkHandshake;
+		if (!IrqOn)
+			{
+			NKern::Sleep(NKern::TimerTicks(busy ? 1 : Link == ELinkConnected ? 2 : 10));
+			continue;
+			}
+		WakeTimer.OneShot(NKern::TimerTicks(busy ? 1 : Link == ELinkConnected ? 100 : 1000));
+		NKern::FSWait(&WakeSem);
+		WakeTimer.Cancel();
+		++Wakes;
 		}
 	}
 
@@ -1896,7 +2096,7 @@ static void Serve()
 TInt Wcn3990_ScanHal(TAny* a1, TAny* a2)
 	{
 	if (a2)
-		ScanWanted = ETrue;
+		ScanWanted = ETrue, Wake();
 	NKern::ThreadEnterCS();
 	TUint8* out = (TUint8*)Kern::Alloc(4 + 32 * 42);				// not on the caller's small supervisor stack
 	NKern::ThreadLeaveCS();
@@ -1947,8 +2147,9 @@ static TInt Run()
 		if (r != KErrNone)
 			return Fail(r, "DMA memory");
 		Pool = (TUint8*)c->LinearAddress();
-		memclr(Pool, PoolSize);
 		}
+	memclr(Pool, PoolSize);										// a restart (W7) carves the same layout again
+	HttRing = NULL;
 	PoolUsed = 0;
 	NumChunks = 0;
 	HttEid = WmiEid = 0xff;
@@ -2009,22 +2210,23 @@ static TInt Run()
 	}
 
 static TDynamicDfcQue* Queue;
-static void RunDfcFn(TAny*) { Run(); }
+static volatile TBool Running;									// Run() is on the WlanCe thread
+static void RunDfcFn(TAny*) { Run(); Running = EFalse; }
 static TDfc RunDfc(RunDfcFn, NULL, 1);
 
-// shortcut: after a modem stop Wi-Fi stays off until a reboot: a second bring-up would carve new rings over the
-// HTT/tx memory still in use, and the MSA regions stay with the modem's VMIDs. Upgrade with a full re-init path.
+// W7: the modem stopped. Serve hands off the chip and returns; MODEMD's WlanStart after the restart brings it up again
+// (the same DMA layout, the MSA regions still assigned: the same firmware comes back).
 void Wcn3990_ModemDown()
 	{
 	ModemDown = ETrue;
+	Wake();
 	}
 
 TInt Wcn3990_Start()
 	{
-	if (ModemDown)
-		return KErrNotSupported;
-	if (Step && !Error)
-		return KErrInUse;										// up (or coming up): one bring-up per boot
+	if (Running)
+		return ModemDown ? KErrNotReady : KErrInUse;			// up, coming up, or still letting go
+	ModemDown = EFalse;
 	if (!Queue)
 		{
 		TInt r = Kern::DynamicDfcQCreate(Queue, 24, _L8("WlanCe"));
@@ -2032,6 +2234,7 @@ TInt Wcn3990_Start()
 			return r;
 		RunDfc.SetDfcQ(Queue);
 		}
+	Running = ETrue;
 	RunDfc.Enque();
 	return KErrNone;
 	}

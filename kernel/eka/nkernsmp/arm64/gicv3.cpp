@@ -69,5 +69,10 @@ void Gicv3_EnableSpi(unsigned long aGicd, unsigned int aIntId, unsigned char aPr
 	REG32(aGicd + GICD_ISENABLER + (aIntId / 32) * 4) = 1u << (aIntId % 32);
 	}
 
+void Gicv3_MaskSpi(unsigned long aGicd, unsigned int aIntId, int aMask)
+	{
+	REG32(aGicd + (aMask ? GICD_ICENABLER : GICD_ISENABLER) + (aIntId / 32) * 4) = 1u << (aIntId % 32);
+	}
+
 TGicU32 Gicv3_Ack()					{ return (TGicU32)MRS(S3_0_C12_C12_0) & 0xFFFFFF; }	// ICC_IAR1_EL1
 void Gicv3_Eoi(TGicU32 aIntId)		{ MSR(S3_0_C12_C12_1, aIntId); }					// ICC_EOIR1_EL1

@@ -644,8 +644,9 @@ void A64Mon_Line(const TDesC8& aLine, TMonWrite aWrite)
 		A64TouchDump();
 	else if (Eq(c, "battery"))
 		A64BatteryDump();
-	else if (Eq(c, "wifi"))								// wifi | wifi join <n> | wifi leave (Wi-Fi W4)
-		Wcn3990_Monitor(argc >= 3 && Eq(arg[1], "join") ? 1 : argc >= 2 && Eq(arg[1], "leave") ? 2 : 0,
+	else if (Eq(c, "wifi"))								// wifi | wifi join <n> | wifi leave | wifi polled|irq (W4, W7)
+		Wcn3990_Monitor(argc >= 3 && Eq(arg[1], "join") ? 1 : argc >= 2 && Eq(arg[1], "leave") ? 2 :
+			argc >= 2 && Eq(arg[1], "polled") ? 3 : argc >= 2 && Eq(arg[1], "irq") ? 4 : 0,
 			argc >= 3 ? (TInt)num[2] : 0);
 	else if (Eq(c, "panel") && argc >= 2)				// panel on | off | bright <0..1023>
 		{

@@ -32,6 +32,7 @@ void A64_TickHook(TSubScheduler& aSS, TUint64 aElr);
  * routed to CPU 0 */
 typedef void (*TA64Isr)(TAny* aPtr);
 TInt A64_BindSpi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr);
+void A64_MaskSpi(TUint32 aIntId, TBool aMask);		/* a bound SPI off (ETrue) or back on; any context */
 /* a software doorbell: SGI 5-7 bound to an ISR; A64_RaiseSgi (any context) runs it on CPU 0, in interrupt context */
 TInt A64_BindSgi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr);
 void A64_RaiseSgi(TUint32 aIntId);

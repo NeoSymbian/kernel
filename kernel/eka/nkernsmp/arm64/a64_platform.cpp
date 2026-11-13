@@ -111,16 +111,24 @@ static void TimerIrq(TSubScheduler& aSS, TUint64 aElr)
 
 /* ---- device interrupts --------------------------------------------------------------------------------- */
 struct SSpiBinding { TA64Isr iIsr; TAny* iPtr; };
-static SSpiBinding SpiBindings[256];
+const TUint32 KMaxIntId = 1020;			// 1020-1023 are special INTIDs; GICv3 SPIs end at 1019
+static SSpiBinding SpiBindings[KMaxIntId];
 
 extern "C" TInt A64_BindSpi(TUint32 aIntId, TA64Isr aIsr, TAny* aPtr)
 	{
-	if (aIntId < 32 || aIntId >= 256 || !aIsr)
+	if (aIntId < 32 || aIntId >= KMaxIntId || !aIsr)
 		return KErrArgument;
 	SpiBindings[aIntId].iPtr = aPtr;
 	__e32_atomic_store_rel_ptr(&SpiBindings[aIntId].iIsr, (TAny*)aIsr);
 	Gicv3_EnableSpi(A64_Io(A64_GicdBase), aIntId, 0xA0, A64_CpuMpidr(0));
 	return KErrNone;
+	}
+
+/* a bound SPI off (an ISR keeping a level line quiet until its thread has served the device) or back on; any context */
+extern "C" void A64_MaskSpi(TUint32 aIntId, TBool aMask)
+	{
+	if (aIntId >= 32 && aIntId < KMaxIntId)
+		Gicv3_MaskSpi(A64_Io(A64_GicdBase), aIntId, aMask);
 	}
 
 /* a device's software doorbell: SGI 5-7 (the IPIs use 0-4; every CPU enables 0-7 at priority 0x80). A64_RaiseSgi
@@ -162,7 +170,7 @@ extern "C" void A64_Irq(SThreadExcStack* aF)
 			}
 		else if (id == GENERIC_IPI_VECTOR)
 			generic_ipi_isr(&ss);
-		else if (id >= 5 && id < 256 && SpiBindings[id].iIsr)	// bound SPIs and device SGIs
+		else if (id >= 5 && id < KMaxIntId && SpiBindings[id].iIsr)	// bound SPIs and device SGIs
 			(*SpiBindings[id].iIsr)(SpiBindings[id].iPtr);
 		// TRANSFERRED_IRQ_VECTOR: the tail below runs the events
 		}

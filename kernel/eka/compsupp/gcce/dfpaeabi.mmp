@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// DFPAEABI.DLL -- the RTABI soft-float helpers of RVCT-built Symbian 9 binaries: see dfpaeabi.cpp.
+
+TARGET          dfpaeabi.dll
+TARGETTYPE      dll
+UID             0x1000008d 0x00000000
+SOURCEPATH      .
+SOURCE          dfpaeabi.cpp
+
+#include <platform_paths.hrh>
+OS_LAYER_SYSTEMINCLUDE
+
+LIBRARY         euser.lib

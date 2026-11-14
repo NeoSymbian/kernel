@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+// DRTAEABI.DLL -- the C++ run-time library of RVCT-built Symbian 9 binaries: see drtaeabi.cpp. Exports per
+// ../eabi/drtaeabiu.def (NeoSymbian/build emitter/components.py `def`), most of them from libsupc++ and libgcc.
+
+TARGET          drtaeabi.dll
+TARGETTYPE      dll
+UID             0x1000008d 0x00000000
+SOURCEPATH      .
+SOURCE          drtaeabi.cpp
+EPOCALLOWDLLDATA
+
+#include <platform_paths.hrh>
+OS_LAYER_SYSTEMINCLUDE
+
+LIBRARY         euser.lib

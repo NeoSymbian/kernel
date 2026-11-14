@@ -46,6 +46,7 @@
 #include "qcom_scm.h"
 #include "qcom_smp2p.h"
 #include "qcom_smem.h"
+#include "qcom_smmu.h"
 #include "qcom_glink.h"
 #include "qcom_mss.h"
 #include "qcom_fat16.h"
@@ -422,12 +423,17 @@ static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 
 // One bounded physical region retained for this boot. The daemon owns ASM map/write acknowledgements;
 // a published region cannot be overwritten until its exact ticket is completed or PAS shutdown succeeds.
-const TUint32 KAudioBytes = 0x10000;
+const TUint32 KAudioBytes = 0x40000;					// telephony apr::RING_REGION: a 2 s 48 kHz ringtone (192,000 bytes)
 static TPhysAddr AudioPhys;
 static DPlatChunkHw* AudioChunk;
 static TUint32 AudioTicket, AudioGeneration;
 static TBool AudioBusy;
+static TBool AudioSmmu;
 static DMutex* AudioLock;
+// The ADSP reads the region by DMA through the apps SMMU on stream 0x1801 (DTB q6asm-dais iommus <&apps_smmu 0x1801
+// 0>). Unmapped, that stream faults (sCR0.USFCFG = 1) and the ringtone's first ASM write froze the whole phone
+// (2026-11-14, lastlog: "apr: AsmRun ok", then nothing); mapped like IPA's and WLAN's streams.
+const TUint32 KAudioStream = 0x1801;
 static NFastMutex AudioInit;
 static TInt AudioMem(SIo& aIo)
 	{
@@ -461,6 +467,12 @@ static TInt AudioMem(SIo& aIo)
 			else
 				memclr((TAny*)AudioChunk->LinearAddress(), KAudioBytes);
 			}
+		}
+	if (r == KErrNone && AudioChunk && !AudioSmmu && aIo.iA == 0)
+		{
+		r = Smmu_IdentityMap(KAudioStream, 0);
+		AudioSmmu = r == KErrNone;
+		Kern::Printf("[audio] ADSP stream %x through the apps SMMU -> %d", KAudioStream, r);
 		}
 	if (r == KErrNone && !AudioChunk)
 		r = KErrNotReady;

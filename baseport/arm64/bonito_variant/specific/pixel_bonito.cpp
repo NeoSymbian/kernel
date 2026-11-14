@@ -70,7 +70,7 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x01e04000, 0x0002c000, 1 },		// GSI, IPA's DMA engine (qcom_ipa.cpp; read only once IPA is clocked)
 	{ 0x01e40000, 0x00009000, 1 },		// IPA registers + its shared memory
 	{ 0x00a88000, 0x00004000, 1 },		// GENI serial engine 2 of QUP wrapper 1: I2C10, the call-audio codecs (C6)
-	{ 0x03918000, 0x00001000, 1 },      // TLMM north gpio24: DRV2624 reset
+	{ 0x03518000, 0x00001000, 1 },		// TLMM west tile: gpio24 (DRV2624 reset; Linux pinctrl-sdm670 PINGROUP(24, WEST))
 	{ 0x03937000, 0x00002000, 1 },		// TLMM north tile: gpio55, gpio56 (I2C10)
 	{ 0x03941000, 0x00004000, 1 },		// TLMM north tile: gpio65-68 (the mic's TDM, pri_mi2s)
 	{ 0x0394f000, 0x00002000, 1 },		// TLMM north tile: gpio79, gpio80 (amp IRQs)

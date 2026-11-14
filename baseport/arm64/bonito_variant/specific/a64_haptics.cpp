@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Bonito DRV2624, I2C10 0x5a, reset TLMM gpio24. Facts from the C1 DTB and TI SLOS893D register map:
+// Bonito DRV2624, I2C10 0x5a, reset TLMM gpio24 (west tile). Facts from the C1 DTB and TI SLOS893D register map:
 // https://www.ti.com/lit/ds/symlink/drv2624.pdf (revision D, August 2025, sections 7.6 and 8).
 // DT property encoding verified against Google's dev_init_platform_data (reference only):
 // https://android.googlesource.com/kernel/google-modules/amplifiers/+/aba0cca145df5e55d1c5c4294a90bc382b0d2ec1/drv2624/drv2624.c
@@ -11,6 +11,7 @@
 #include "a64_device.h"
 
 TInt A64Board_I2c10();
+const TUint32 KReset = 0x03518000;							// TLMM west tile, gpio24: DRV2624 reset (cfg, then io at +4)
 static DMutex* Lock; // f2 -> board I2C10 f1 -> GENI fast mutex (strictly descending DMutex order)
 static NFastMutex InitLock;
 static TBool Ready, Running;
@@ -34,8 +35,10 @@ static TInt Probe()
 	TInt r = A64Board_I2c10();
 	if (r != KErrNone)
 		return r;
-	volatile TUint32& ctl = *(volatile TUint32*)A64_Io(0x03918000);
-	volatile TUint32& io = *(volatile TUint32*)A64_Io(0x03918004);
+	// gpio24 is in TLMM's WEST tile (Linux pinctrl-sdm670: PINGROUP(24, WEST, ...)): 0x03500000 + 24 * 0x1000. The north
+	// tile's slot (0x03918000) is no pin: touching it hung the bus and froze the phone on the first vibration (2026-11-14).
+	volatile TUint32& ctl = *(volatile TUint32*)A64_Io(KReset);
+	volatile TUint32& io = *(volatile TUint32*)A64_Io(KReset + 4);
 	io = 0;
 	ctl = 0x200; // GPIO output, no pull, reset active low
 	Kern::NanoWait(1000000);
@@ -71,7 +74,7 @@ static TInt Stop()
 	TInt r = Write(0x0c, 0);
 	if (r != KErrNone)
 		{
-		*(volatile TUint32*)A64_Io(0x03918004) = 0;
+		*(volatile TUint32*)A64_Io(KReset + 4) = 0;
 		Ready = EFalse;
 		}
 	Running = EFalse;

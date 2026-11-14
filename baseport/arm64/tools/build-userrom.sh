@@ -65,6 +65,9 @@ if rofs:
     xip = {v.partition("=")[0].lower(): v.partition("=")[2] for o, v in pairs if o == "--xip"}
     by_file = {z.rsplit("\\", 1)[-1]: z for z in xip}
     core = {z for z in xip if re.search(r"\\(efile\.exe|estart\.exe|e(local|rofs|comp)\.fsy|ekdata\.dll|elocl[^\\]*)$", z)}
+    # ROFS_CORE=REGEX: more of the user side in the core ROM (run in place, never copied to RAM), e.g. '\.dll$'
+    if os.environ.get("ROFS_CORE"):
+        core |= {z for z in xip if re.search(os.environ["ROFS_CORE"], z)}
     todo = list(core)
     while todo:
         z = todo.pop()

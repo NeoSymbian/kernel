@@ -56,7 +56,10 @@ extern void NeoTrapLongjmp(TTrap* aFrame, TInt aReason) __attribute__((noreturn)
 const TUint32 KNeoLegacyTraceBit = 0x80000000u;
 TBool NeoTraceOn()
 	{
-	return (UserSvr::DebugMask(3) & KNeoLegacyTraceBit) && (RProcess().SecureId().iId >> 28) != 0xE;
+	if (!(UserSvr::DebugMask(3) & KNeoLegacyTraceBit))
+		return EFalse;
+	const TUint32 sid = RProcess().SecureId().iId;
+	return (sid >> 28) != 0xE && sid != 0x100039e3u;	// nor the file server's own leaves (F32 traces its replies)
 	}
 void NeoTrace(const char* aWhat, TInt aValue, TAny* aFrom)
 	{

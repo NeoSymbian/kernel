@@ -1195,7 +1195,12 @@ void CFsMessageRequest::Complete(TInt aError)
 		{
 		const TUint32 sid = Message().SecureId().iId;
 		if ((sid >> 28) != 0xE && sid != 0x100039e3u)
-			RDebug::Print(_L("neotrace: %08x fs %d %S -> %d"), sid, FsFunction(), &Src().FullName(), aError);
+			{
+			// the only message request class; Src() faults when the request holds no parsed name
+			const TParse* src = static_cast<CFsClientMessageRequest*>(this)->SrcIfParsed();
+			RDebug::Print(_L("neotrace: %08x fs %d %S -> %d"), sid, FsFunction(), src ? &src->FullName() : &KNullDesC(),
+				aError);
+			}
 		}
 
 	if(aError!=KErrNone)

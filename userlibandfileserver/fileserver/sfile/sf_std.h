@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): CFsClientMessageRequest::SrcIfParsed, for the old-app failure trace.
 // Description:
 // f32\sfile\sf_std.h
 // 
@@ -1365,6 +1365,7 @@ public:
 	virtual TParse& Dest();
 	virtual void Free();
 	TInt AllocParseObjects(const TOperation& aOperation);
+	inline TParse* SrcIfParsed() { return iPoolSrc ? &iPoolSrc->GetObject() : NULL; }	// NeoSymbian: Src() faults without
 public:
 	CFsClientMessageRequest* iNext;
 protected:

@@ -1313,7 +1313,7 @@ TInt E32Image::LoadProcess(const RLdrReq& aReq)
 	
 	if(iStackSize < aReq.iMinStackSize)
 		iStackSize=aReq.iMinStackSize;		// If the process required larger stack than the default.
-	// NeoSymbian: a RAM-loaded EXE (an old .sis app) gets 64 KB of stack at least. RVCT's default is 8 KB, enough for
+	// NeoSymbian: a non-XIP EXE (RAM-loaded: C:, ROFS; every old .sis app) gets 64 KB of stack at least. RVCT's default is 8 KB, enough for
 	// Nokia's RVCT-built Avkon but not for ours (GCC): Frozen Bubble overflowed in CEikStatusPaneLayoutTree.
 	const TInt KNeoMinStackSize = 0x10000;
 	if (!iRomImageHeader && iStackSize < KNeoMinStackSize)

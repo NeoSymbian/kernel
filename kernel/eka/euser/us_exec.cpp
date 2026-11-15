@@ -9,7 +9,7 @@
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): MarkCleanupStack/UnMarkCleanupStack moved to us_trp.cpp (old binaries' TRAPs).
+// The NeoSymbian Authors (2026): MarkCleanupStack/UnMarkCleanupStack moved to us_trp.cpp (old binaries' TRAPs); failed RLibrary::Lookup traced.
 // Description:
 // e32\euser\us_exec.cpp
 // 
@@ -1296,6 +1296,7 @@ the DLL into the descriptor aResult.
 
 
 
+extern TBool NeoTraceOn();	// NeoSymbian: us_trp.cpp, the old-app failure trace
 EXPORT_C TLibraryFunction RLibrary::Lookup(TInt anOrdinal) const
 /**
 Gets a pointer to the function at the specified ordinal within this DLL.
@@ -1310,7 +1311,14 @@ Gets a pointer to the function at the specified ordinal within this DLL.
 */
 	{
 	__ASSERT_ALWAYS(anOrdinal>=0,Panic(EBadLookupOrdinal));
-	return (Exec::LibraryLookup(iHandle,anOrdinal));
+	TLibraryFunction f = Exec::LibraryLookup(iHandle,anOrdinal);
+	if (!f && NeoTraceOn())
+		{
+		TFileName name(FileName());
+		RDebug::Print(_L("neotrace: %08x lookup %S ordinal %d from %08x"), RProcess().SecureId().iId, &name, anOrdinal,
+			__builtin_return_address(0));
+		}
+	return f;
 	}
 
 

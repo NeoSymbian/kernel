@@ -380,6 +380,16 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 		return KErrNone;
 	A64Log_Report();									// the first point where Kern::Printf reaches the log ring
 	Kern::Printf("[neo] %s", NEO_BUILD_KERNEL);			// which kernel this is (HAL ENeoHalBuildInfo too)
+	{													// the RAM the bootstrap found (a64boot.cpp RamMap)
+	TInt n = 0;
+	TUint32 total = 0;
+	for (const SRamBank* bank = (const SRamBank*)TheSuperPage().iRamBootData; bank->iSize; ++bank, ++n)
+		{
+		Kern::Printf("[ram] bank %d: %08x-%08x (%d MB)", n, bank->iBase, bank->iBase + bank->iSize, bank->iSize >> 20);
+		total += bank->iSize;
+		}
+	Kern::Printf("[ram] %d MB in %d banks", total >> 20, n);
+	}
 	A64StartBuses();
 	A64StartCpufreq();									// before the input drivers: their events boost the clocks
 	A64StartDisplay();									// the screen's HAL, for the window server

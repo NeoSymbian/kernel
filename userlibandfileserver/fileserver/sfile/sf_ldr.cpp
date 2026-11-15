@@ -1276,8 +1276,8 @@ void CSessionLoader::ServiceL(const RMessage2& aMessage)
 		}
 	
 	if (r < 0 && (UserSvr::DebugMask(3) & 0x80000000u) && (msg.SecureId().iId >> 28) != 0xE)	// NeoSymbian: us_trp.cpp
-		RDebug::Print(_L("neotrace: %08x loader %d %S -> %d"), msg.SecureId().iId, mid,
-			ldrReq.iFileName ? (const TDesC*)ldrReq.iFileName : &KNullDesC(), r);
+		RDebug::Printf("neotrace: %08x loader %d %S -> %d", msg.SecureId().iId, mid,	// the name is collapsed to 8 bits
+			ldrReq.iFileName ? (const TDesC8*)ldrReq.iFileName : &KNullDesC8(), r);
 	ldrReq.Close();
 	IF_DEBUG(EndRFsFailCheck(r));
 	IF_DEBUG(EndHeapFailCheck(r));

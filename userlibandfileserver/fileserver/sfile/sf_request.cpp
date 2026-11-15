@@ -1191,7 +1191,8 @@ void CFsMessageRequest::Complete(TInt aError)
 	__THRD_PRINT2(_L("----- CFsMessageRequest::Complete() req %08x with %d"), this, aError);
 	// NeoSymbian: the old-app failure trace (debug-mask word 3 bit 31, euser us_trp.cpp); not our processes (SID
 	// 0xE...) nor the file server's own requests (the loader's searches)
-	if (aError < 0 && (UserSvr::DebugMask(3) & 0x80000000u) && !Message().IsNull())
+	if (aError < 0 && (UserSvr::DebugMask(3) & 0x80000000u) && !Message().IsNull() &&
+		Message().Handle() != KLocalMessageHandle)	// not the file server's internal requests
 		{
 		const TUint32 sid = Message().SecureId().iId;
 		if ((sid >> 28) != 0xE && sid != 0x100039e3u)
@@ -2050,6 +2051,7 @@ TInt CFsClientMessageRequest::AllocParseObjects(const TOperation& aOperation)
 		iPoolSrc = TParsePool::Get();
 		if (iPoolSrc == NULL)
 			return KErrNoMemory;
+		new (&iPoolSrc->GetObject()) TParse;	// NeoSymbian: empty, not the last request's name (SrcIfParsed)
 		}
 	if (aOperation.iFlags & EParseDst)
 		{

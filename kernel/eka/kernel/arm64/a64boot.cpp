@@ -462,7 +462,10 @@ extern "C" void A64_BootMain(TUint64 aDtb)
 	rh.iVariantFile = REC_LIN(iVariantEntry);
 	rh.iExtensionFile = REC_LIN(iExtensionEntry);
 	rh.iUserDataAddress = KUserLocalDataEnd;
-	rh.iKernelConfigFlags = 0;
+	// SMP-unsafe compatibility, as Symbian^3 shipped it: a process that loads an image without KImageSMPSafe (an old
+	// .sis app, built for single-core phones) runs its threads one CPU at a time (Frozen Bubble's mixer thread raced
+	// its creator on 8 cores). The build marks every image of ours SMP-safe.
+	rh.iKernelConfigFlags = 1u << 12;		// EKernelConfigSMPUnsafeCompat (u32std.h)
 
 	TRomImageHeader& k = rec.iPrimary;
 	k.iUid1 = 0x1000007Au;  k.iUid2 = 0x1000008Bu;  k.iUid3 = 0x10287037u;	// EXE / kernel / SMP kernel

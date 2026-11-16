@@ -9,7 +9,7 @@
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): ELF-format import words carry an addend in their top half; the import checks use the ordinal.
+// The NeoSymbian Authors (2026): ELF-format import words carry an addend in their top half; the import checks use the ordinal; old apps get a 64 KB stack at least.
 // Description:
 // f32\sfile\sf_lepoc.cpp
 // 
@@ -1313,6 +1313,11 @@ TInt E32Image::LoadProcess(const RLdrReq& aReq)
 	
 	if(iStackSize < aReq.iMinStackSize)
 		iStackSize=aReq.iMinStackSize;		// If the process required larger stack than the default.
+	// NeoSymbian: a non-XIP EXE (RAM-loaded: C:, ROFS; every old .sis app) gets 64 KB of stack at least. RVCT's default is 8 KB, enough for
+	// Nokia's RVCT-built Avkon but not for ours (GCC): Frozen Bubble overflowed in CEikStatusPaneLayoutTree.
+	const TInt KNeoMinStackSize = 0x10000;
+	if (!iRomImageHeader && iStackSize < KNeoMinStackSize)
+		iStackSize = KNeoMinStackSize;
 
 	//initialise to zero
 #ifdef _DEBUG

@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): User::Exit with an error is traced for old apps (us_trp.cpp NeoTrace).
 // Description:
 // e32\euser\us_func.cpp
 // 
@@ -854,6 +854,7 @@ EXPORT_C void User::InitProcess()
 
 
 
+extern void NeoTrace(const char* aWhat, TInt aValue, TAny* aFrom);	// NeoSymbian: us_trp.cpp
 EXPORT_C void User::Exit(TInt aReason)
 /**
 Terminates the current thread, specifying a reason.
@@ -865,6 +866,8 @@ terminated.
 @param aReason The reason code.
 */
 	{
+	if (aReason != KErrNone)
+		NeoTrace("exit", aReason, __builtin_return_address(0));
 	// Notify kernel that thread is exiting
 	TBool lastThread = Exec::UserThreadExiting(aReason);
 	if (lastThread)

@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): failed requests of old apps are traced (euser us_trp.cpp, KNEOLEGACYTRACE).
 // Description:
 // f32\sfile\sf_request.cpp
 // 
@@ -1189,6 +1189,20 @@ void CFsMessageRequest::Complete(TInt aError)
 //
 	{
 	__THRD_PRINT2(_L("----- CFsMessageRequest::Complete() req %08x with %d"), this, aError);
+	// NeoSymbian: the old-app failure trace (debug-mask word 3 bit 31, euser us_trp.cpp); not our processes (SID
+	// 0xE...) nor the file server's own requests (the loader's searches)
+	if (aError < 0 && (UserSvr::DebugMask(3) & 0x80000000u) && !Message().IsNull() &&
+		Message().Handle() != KLocalMessageHandle)	// not the file server's internal requests
+		{
+		const TUint32 sid = Message().SecureId().iId;
+		if ((sid >> 28) != 0xE && sid != 0x100039e3u)
+			{
+			// the only message request class; Src() faults when the request holds no parsed name
+			const TParse* src = static_cast<CFsClientMessageRequest*>(this)->SrcIfParsed();
+			RDebug::Print(_L("neotrace: %08x fs %d %S -> %d"), sid, FsFunction(), src ? &src->FullName() : &KNullDesC(),
+				aError);
+			}
+		}
 
 	if(aError!=KErrNone)
 		{
@@ -2037,6 +2051,7 @@ TInt CFsClientMessageRequest::AllocParseObjects(const TOperation& aOperation)
 		iPoolSrc = TParsePool::Get();
 		if (iPoolSrc == NULL)
 			return KErrNoMemory;
+		new (&iPoolSrc->GetObject()) TParse;	// NeoSymbian: empty, not the last request's name (SrcIfParsed)
 		}
 	if (aOperation.iFlags & EParseDst)
 		{

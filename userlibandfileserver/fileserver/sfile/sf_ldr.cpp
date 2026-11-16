@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): failed loader requests of old apps are traced (euser us_trp.cpp, KNEOLEGACYTRACE).
 // Description:
 // f32\sfile\sf_ldr.cpp
 // 
@@ -1275,6 +1275,9 @@ void CSessionLoader::ServiceL(const RMessage2& aMessage)
 			break;
 		}
 	
+	if (r < 0 && (UserSvr::DebugMask(3) & 0x80000000u) && (msg.SecureId().iId >> 28) != 0xE)	// NeoSymbian: us_trp.cpp
+		RDebug::Printf("neotrace: %08x loader %d %S -> %d", msg.SecureId().iId, mid,	// the name is collapsed to 8 bits
+			ldrReq.iFileName ? (const TDesC8*)ldrReq.iFileName : &KNullDesC8(), r);
 	ldrReq.Close();
 	IF_DEBUG(EndRFsFailCheck(r));
 	IF_DEBUG(EndHeapFailCheck(r));

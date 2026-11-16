@@ -9,7 +9,7 @@
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): TRAPs of RVCT-built Symbian 9 binaries (C++ try/catch) beside ours (setjmp).
+// The NeoSymbian Authors (2026): TRAPs of RVCT-built Symbian 9 binaries (C++ try/catch) beside ours (setjmp); the old-app failure trace.
 // Description:
 // e32\euser\us_trp.cpp
 // 
@@ -49,6 +49,23 @@ static TNeoCppTraps* NeoCppTraps()
 
 extern void PanicNoTrapFrame();
 extern void NeoTrapLongjmp(TTrap* aFrame, TInt aReason) __attribute__((noreturn));	// uc_trp.cia
+
+// NeoSymbian: the old-app failure trace. While debug-mask word 3 bit 31 is set (KNEOLEGACYTRACE; LEGACY.EXE sets it
+// when the old-app runtime starts), leaves, error exits and failed lookups in every process but ours (SID 0xE...) go
+// to the debug log with their caller. F32 (sf_request.cpp, sf_ldr.cpp) adds failed file and loader requests.
+const TUint32 KNeoLegacyTraceBit = 0x80000000u;
+TBool NeoTraceOn()
+	{
+	if (!(UserSvr::DebugMask(3) & KNeoLegacyTraceBit))
+		return EFalse;
+	const TUint32 sid = RProcess().SecureId().iId;
+	return (sid >> 28) != 0xE && sid != 0x100039e3u;	// nor the file server's own leaves (F32 traces its replies)
+	}
+void NeoTrace(const char* aWhat, TInt aValue, TAny* aFrom)
+	{
+	if (NeoTraceOn())
+		RDebug::Printf("neotrace: %08x %s %d from %08x", RProcess().SecureId().iId, aWhat, aValue, aFrom);
+	}
 
 EXPORT_C TTrapHandler* User::MarkCleanupStack()
 	{
@@ -103,6 +120,20 @@ static void NeoCppTrapThrow(TNeoCppTraps& aTraps, TTrap* aFrame, TInt aReason)
 	for (;;) {}
 	}
 
+// User::Leave's body, with the caller to trace (User::LeaveIfError and friends pass theirs)
+static void NeoLeave(TInt aReason, TAny* aFrom) __attribute__((noreturn));
+static void NeoLeave(TInt aReason, TAny* aFrom)
+	{
+	NeoTrace("leave", aReason, aFrom);
+	TTrap* frame = Exec::PopTrapFrame();
+	if (!frame)
+		PanicNoTrapFrame();
+	TNeoCppTraps* t = NeoCppTraps();
+	if (t && frame >= t->iMark && frame < t->iMark + KNeoCppTrapDepth)
+		NeoCppTrapThrow(*t, frame, aReason);
+	NeoTrapLongjmp(frame, aReason);
+	}
+
 EXPORT_C void User::Leave(TInt aReason)
 /**
 Leaves the currently executing function, unwinds the call stack, and returns
@@ -117,13 +148,7 @@ from the most recently entered trap harness.
 @see TRAPD
 */
 	{
-	TTrap* frame = Exec::PopTrapFrame();
-	if (!frame)
-		PanicNoTrapFrame();
-	TNeoCppTraps* t = NeoCppTraps();
-	if (t && frame >= t->iMark && frame < t->iMark + KNeoCppTrapDepth)
-		NeoCppTrapThrow(*t, frame, aReason);
-	NeoTrapLongjmp(frame, aReason);
+	NeoLeave(aReason, __builtin_return_address(0));
 	}
 #endif
 
@@ -177,6 +202,7 @@ from the most recently entered trap harness.
 		pH->Leave(aReason);	// causes things on the cleanup stack to be cleaned up
 	throw XLeaveException(aReason);
 	}
+static inline void NeoLeave(TInt aReason, TAny*) { User::Leave(aReason); }	// NeoSymbian: not traced in this mode
 
 #endif // !__LEAVE_EQUALS_THROW__
 
@@ -210,7 +236,7 @@ Leaves with the specific reason code KErrNoMemory.
 */
 	{
 
-	User::Leave(KErrNoMemory);
+	NeoLeave(KErrNoMemory, __builtin_return_address(0));
 	}
 
 
@@ -233,7 +259,7 @@ reason value.
 	{
 
 	if (aReason<0)
-		User::Leave(aReason);
+		NeoLeave(aReason, __builtin_return_address(0));
 	return(aReason);
 	}
 
@@ -254,7 +280,7 @@ the pointer.
 	{
 
 	if (aPtr==NULL)
-		User::LeaveNoMemory();
+		NeoLeave(KErrNoMemory, __builtin_return_address(0));
 	return(aPtr);
 	}
 

@@ -10,14 +10,14 @@ It follows `bsptemplate/asspandvariant`: the chip (ASSP) is split from the board
 |---|---|
 | `common/` | The variant code every arm64 board shares: static variant and HAL (`a64_variant.cpp`), display HAL, block media and drives (`a64_blk`, `a64_med*`), debug monitor and log ring (`a64_dbgmon.cpp`), the CPU's SHA-256, `estart.txt` |
 | `<soc>_assp/` | One SoC's drivers: `virt_assp` (the QEMU virt machine), `sdm670_assp` (Qualcomm SDM670) |
-| `<board>_variant/` | One board: `variant.conf`, `specific/` (its `board.h` implementation and board-only drivers) |
+| `<board>_variant/` | One board: `variant.conf`, `specific/` (its `board.h` implementation and board-only drivers). `qemu_variant` (QEMU virt), `bonito_variant` (Pixel 3a XL, the main target), `sargo_variant` (Pixel 3a: its board file and OLED panel; every other driver is bonito's, see "Adding a device") |
 | `bonito_variant/probes/` | Standalone bare-metal probe images used to study the Pixel's bootloader (ABL). The kernel build does not use them. |
 | `tools/` | Build, run and phone tools (`build-ekern.sh`, `paths.sh`, `phone.py`, …) |
 
 ## Building
 
 The easy way is [`neo`](https://github.com/NeoSymbian/build), from a `build` checkout next to this one:
-`neo kernel qemu`, `DTB=bonito.dtb neo kernel bonito`, `neo qemu 60`, `neo flash bonito`. It runs the scripts below in
+`neo kernel qemu`, `DTB=bonito.dtb neo kernel bonito` (or `sargo`), `neo qemu 60`, `neo flash bonito` (`phone.py --product` checks the phone in fastboot is that board). It runs the scripts below in
 the pinned build image (`ghcr.io/neosymbian/toolchain`: aarch64 GCC 14, the Arm GNU toolchain, QEMU) with the user
 side's build volume mounted. By hand, inside that image (`KHS` defaults to this checkout):
 
@@ -27,6 +27,7 @@ BOARD=qemu   baseport/arm64/tools/build-ekern.sh       # full kernel + the 2010 
 baseport/arm64/tools/run-qemu.sh 60                    # boot out/kernel-qemu/Image on QEMU virt
 BOARD=bonito DTB=bonito.dtb baseport/arm64/tools/build-ekern.sh   # -> out/ekern-bonito/boot.img
 fastboot boot out/ekern-bonito/boot.img
+BOARD=sargo DTB=sargo.dtb baseport/arm64/tools/build-ekern.sh     # the Pixel 3a: its own DTB (SARGO_DTB), never committed
 ```
 
 ## How a driver plugs in (today)

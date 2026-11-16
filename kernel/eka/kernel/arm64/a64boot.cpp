@@ -42,10 +42,10 @@ extern char __uimage_base[], __uimage_size[];					// ekern.lds: the user-side RO
 }
 #define SYMVAL(s)	((TUint32)(TLinAddr)(s))
 
-// RAM the kernel may use: from above the image to the board's limit
+// RAM the kernel may use: the DTB's map above the image (RamMap below), else from above the image to the board's limit
 // The boot stub runs with the MMU off and may not call into the board: the board's variant.conf passes its
-// constants (BOOT_DEFS): A64_BOOT_RAM_END, and optionally A64_BOOT_PL011 (an early UART) and A64_BOOT_FB,
-// A64_BOOT_FB_W (a boot framebuffer for boards without one).
+// constants (BOOT_DEFS): A64_BOOT_RAM_END (the end of RAM when there is no usable DTB), and optionally A64_BOOT_PL011
+// (an early UART) and A64_BOOT_FB, A64_BOOT_FB_W (a boot framebuffer for boards without one).
 #ifndef A64_BOOT_RAM_END
 #error "the board's variant.conf sets A64_BOOT_RAM_END in BOOT_DEFS"
 #endif
@@ -108,6 +108,172 @@ static TUint32 AllocPages(TUint aCount)
 	}
 
 /******************************************************************************
+ * The RAM map: the DTB's /memory, below 4 GB and above the image, minus its /reserved-memory regions, its /memreserve/
+ * entries and the board's IO regions (A64_IoRegions: RAM the drivers map themselves, e.g. ABL's DSI packet page).
+ * The DTB is read before the first page is allocated: it may lie in the RAM we hand out.
+ ******************************************************************************/
+struct SRange { TUint64 iBase, iEnd; };
+const TInt KMaxRanges = 128, KMaxBanks = 64;		// the CPU page's bank list has room for 224
+// shortcut: TPhysAddr is 32-bit, so RAM above 4 GB is left out; widen it (roadmap M4) to use the rest. The last page
+// stays out too: Mmu::Init2Common rejects a bank whose end wraps to 0.
+const TUint64 KPhysTop = 0xFFFFF000u;
+const TUint64 KMinBank = 0x100000;					// smaller pieces cost more SPageInfo than they give
+static SRange MemRanges[KMaxRanges], Holes[KMaxRanges];
+static TInt MemCount, HoleCount;
+static SRamBank Banks[KMaxBanks];
+static TInt BankCount;
+
+static TUint32 Be32(TUint32 aPhys)
+	{ return __builtin_bswap32(*(const volatile TUint32*)aPhys); }
+static TUint64 Cells(TUint32& aPhys, TUint32 aCells)
+	{ TUint64 v = 0; for (; aCells; --aCells, aPhys += 4) v = (v << 32) | Be32(aPhys); return v; }
+static TUint8 Byte(TUint32 aPhys)
+	{ return *(const volatile TUint8*)aPhys; }
+static TBool StrIs(TUint32 aPhys, const char* aStr)			// a DTB string equals aStr
+	{ for (; *aStr; ++aStr, ++aPhys) if (Byte(aPhys) != (TUint8)*aStr) return EFalse; return Byte(aPhys) == 0; }
+static TBool NodeIs(TUint32 aPhys, const char* aName)		// a node name is aName or aName@unit
+	{ for (; *aName; ++aName, ++aPhys) if (Byte(aPhys) != (TUint8)*aName) return EFalse; return Byte(aPhys) == 0 || Byte(aPhys) == '@'; }
+
+static void AddRange(SRange* aList, TInt& aCount, TUint64 aBase, TUint64 aSize)
+	{
+	if (!aSize)
+		return;
+	if (aCount >= KMaxRanges)
+		Die("too many RAM ranges in the DTB");		// never drop a hole: its RAM would be handed out
+	aList[aCount].iBase = aBase;
+	aList[aCount++].iEnd = aBase + aSize < aBase ? ~(TUint64)0 : aBase + aSize;
+	}
+
+static void Sort(SRange* aList, TInt aCount)
+	{
+	for (TInt i = 1; i < aCount; ++i)
+		for (TInt j = i; j && aList[j - 1].iBase > aList[j].iBase; --j)
+			{ const SRange t = aList[j]; aList[j] = aList[j - 1]; aList[j - 1] = t; }
+	}
+
+// Fills MemRanges and Holes from a flattened device tree; EFalse if there is none or it is malformed
+static TBool ParseDtb(TUint64 aDtb)
+	{
+	if (!aDtb || aDtb >= KPhysTop || (aDtb & 3) || Be32((TUint32)aDtb) != 0xd00dfeedu)
+		return EFalse;
+	const TUint32 fdt = (TUint32)aDtb, total = Be32(fdt + 4);
+	if (total < 40 || total > 0x400000 || fdt + total < fdt)
+		return EFalse;
+	const TUint32 end = fdt + total, strings = fdt + Be32(fdt + 12);
+	for (TUint32 r = fdt + Be32(fdt + 16); r + 16 <= end; )		// /memreserve/: {address, size} pairs, {0, 0} ends
+		{
+		const TUint64 base = Cells(r, 2), size = Cells(r, 2);
+		if (!base && !size)
+			break;
+		AddRange(Holes, HoleCount, base, size);
+		}
+	TUint32 rootAc = 2, rootSc = 1, resAc = 2, resSc = 1;		// #address-cells, #size-cells (the spec's defaults)
+	TInt depth = 0;
+	TBool inReserved = EFalse;
+	TInt kind = 0;							// the current node: 1 a /memory node, 2 a /reserved-memory child
+	for (TUint32 p = fdt + Be32(fdt + 8); p + 4 <= end; )
+		{
+		const TUint32 token = Be32(p);
+		p += 4;
+		if (token == 1)						// FDT_BEGIN_NODE, then the NUL-terminated name, padded to 4
+			{
+			++depth;
+			kind = 0;
+			if (depth == 2)
+				{
+				inReserved = NodeIs(p, "reserved-memory");
+				kind = NodeIs(p, "memory") ? 1 : 0;
+				}
+			else if (depth == 3 && inReserved)
+				kind = 2;
+			while (p < end && Byte(p))
+				++p;
+			p = (p + 4) & ~3u;
+			}
+		else if (token == 2)				// FDT_END_NODE (properties come before subnodes: none follow here)
+			{
+			if (--depth < 2)
+				inReserved = EFalse;
+			kind = 0;
+			}
+		else if (token == 3)				// FDT_PROP: length, name offset, value padded to 4
+			{
+			if (p + 8 > end)
+				return EFalse;
+			const TUint32 len = Be32(p), name = strings + Be32(p + 4);
+			TUint32 v = p + 8;
+			p = (v + len + 3) & ~3u;
+			if (p > end || p < v)
+				return EFalse;
+			const TBool root = depth == 1, res = depth == 2 && inReserved;
+			if ((root || res) && len == 4 && StrIs(name, "#address-cells"))
+				(root ? rootAc : resAc) = Be32(v);
+			else if ((root || res) && len == 4 && StrIs(name, "#size-cells"))
+				(root ? rootSc : resSc) = Be32(v);
+			else if (kind && StrIs(name, "reg"))
+				{
+				const TUint32 ac = kind == 1 ? rootAc : resAc, sc = kind == 1 ? rootSc : resSc;
+				if (ac < 1 || ac > 2 || sc < 1 || sc > 2)
+					return EFalse;
+				for (const TUint32 e = v + len; v + 4 * (ac + sc) <= e; )
+					{
+					const TUint64 base = Cells(v, ac), size = Cells(v, sc);
+					AddRange(kind == 1 ? MemRanges : Holes, kind == 1 ? MemCount : HoleCount, base, size);
+					}
+				}
+			}
+		else if (token == 9)				// FDT_END
+			break;
+		else if (token != 4)				// FDT_NOP
+			return EFalse;
+		}
+	return MemCount > 0;
+	}
+
+static void AddBank(TUint64 aBase, TUint64 aEnd)
+	{
+	aBase = (aBase + KPageMask) & ~(TUint64)KPageMask;
+	aEnd &= ~(TUint64)KPageMask;
+	if (aEnd <= aBase || aEnd - aBase < KMinBank || BankCount >= KMaxBanks)
+		return;								// leaving RAM out is safe
+	Banks[BankCount].iBase = (TUint32)aBase;
+	Banks[BankCount++].iSize = (TUint32)(aEnd - aBase);
+	}
+
+// The kernel's RAM banks, ascending: the DTB's map, else [aLow, A64_BOOT_RAM_END)
+static TBool RamMap(TUint64 aDtb, TUint32 aLow, const SA64IoRegion* aIo, TInt aIoCount)
+	{
+	const TBool dtb = ParseDtb(aDtb);
+	if (dtb)
+		{
+		for (TInt i = 0; i < aIoCount; ++i)
+			AddRange(Holes, HoleCount, aIo[i].iPhys, aIo[i].iSize);
+		Sort(MemRanges, MemCount);
+		Sort(Holes, HoleCount);
+		for (TInt i = 0; i < MemCount; ++i)
+			{
+			TUint64 cur = MemRanges[i].iBase < aLow ? aLow : MemRanges[i].iBase;
+			if (BankCount && cur < (TUint64)Banks[BankCount - 1].iBase + Banks[BankCount - 1].iSize)
+				cur = (TUint64)Banks[BankCount - 1].iBase + Banks[BankCount - 1].iSize;	// overlapping /memory ranges
+			const TUint64 end = MemRanges[i].iEnd > KPhysTop ? KPhysTop : MemRanges[i].iEnd;
+			for (TInt h = 0; h < HoleCount && cur < end && Holes[h].iBase < end; ++h)
+				if (Holes[h].iEnd > cur)
+					{
+					if (Holes[h].iBase > cur)
+						AddBank(cur, Holes[h].iBase);
+					cur = Holes[h].iEnd;
+					}
+			if (cur < end)
+				AddBank(cur, end);
+			}
+		}
+	if (BankCount)
+		return ETrue;
+	AddBank(aLow, KRamEnd);
+	return EFalse;
+	}
+
+/******************************************************************************
  * Mapping. Leaf entries are what Mmu::BlankPte (mm/xmmu.cpp) composes for the same memory, so a kernel memory
  * object claiming a boot mapping finds the entry it would have written. Everything mapped here is global (nG=0).
  ******************************************************************************/
@@ -163,7 +329,7 @@ const TUint32 KInitStackSize	= 0x4000;
 const TUint32 KHeapSizeMin		= 0x00100000;
 const TUint32 KHeapSizeMax		= 0x01000000;
 
-extern "C" void A64_BootMain(TUint64 /*aDtb*/)
+extern "C" void A64_BootMain(TUint64 aDtb)
 	{
 	Put("\n[a64boot] EKA2 AArch64 bootstrap: flexible memory model, VMSAv8 4K tables\n");
 	const TUint32 romLin	= SYMVAL(__rom_lin);
@@ -173,12 +339,26 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	Trace("ROM phys", romPhys); Trace("ROM size", romSize); Trace("SvData size", svData);
 #define ROM_PHYS(lin)	(romPhys + (SYMVAL(lin) - romLin))
 
-	// ---- RAM: one bank, from the first 2 MB boundary above the ROM image (so no SPageInfo block holds both bank
-	// and ROM pages: Mmu::Init2Common would find ROM pages "in RAM" but in no zone) to the board's limit
-	BankBase = (romPhys + romSize + KChunkMask) & ~(TUint32)KChunkMask;
-	BankEnd = KRamEnd;
+	// ---- RAM: the banks above the first 2 MB boundary over the ROM image (so no SPageInfo block holds both bank
+	// and ROM pages: Mmu::Init2Common would find ROM pages "in RAM" but in no zone)
+	const TUint32 ramLow = (romPhys + romSize + KChunkMask) & ~(TUint32)KChunkMask;
+	const SA64IoRegion* io = (const SA64IoRegion*)ROM_PHYS(A64_IoRegions);
+	const TInt nio = *(const TInt*)ROM_PHYS(&A64_IoRegionCount);
+	const TBool fromDtb = RamMap(aDtb, ramLow, io, nio);
+	TUint32 totalRam = 0;
+	for (TInt b = 0; b < BankCount; ++b)
+		{
+		totalRam += Banks[b].iSize;
+		Trace("RAM bank base", Banks[b].iBase); Trace("RAM bank size", Banks[b].iSize);
+		}
+	Put(fromDtb ? "[a64boot] RAM map from the DTB\n" : "[a64boot] no usable DTB: RAM up to A64_BOOT_RAM_END\n");
+	// the boot's own pages: the first bank big enough for the SPageInfo array (32 bytes a page) and the rest
+	TInt allocBank = 0;
+	while (allocBank < BankCount - 1 && Banks[allocBank].iSize < (totalRam >> 6) + 0x800000)
+		++allocBank;
+	BankBase = Banks[allocBank].iBase;
+	BankEnd = BankBase + Banks[allocBank].iSize;
 	AllocNext = BankBase;
-	Trace("RAM bank base", BankBase); Trace("RAM bank end", BankEnd);
 
 	// ---- the page directory, PT0 self-mapping the page-table window, the directory mapped
 	KernPd = (TEntry*)AllocPages(KPageDirectorySize >> KPageShift);
@@ -200,8 +380,6 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	AllocAndMap(KPageArraySegmentBase, KPageSize, KPermKernel);
 
 	// ---- the board's devices, back to back in the IO window (board.h; console_io.cpp A64_Io computes the same)
-	const SA64IoRegion* io = (const SA64IoRegion*)ROM_PHYS(A64_IoRegions);
-	const TInt nio = *(const TInt*)ROM_PHYS(&A64_IoRegionCount);
 	TLinAddr ioLin = KPrimaryIOBase;
 	for (TInt i = 0; i < nio; ++i)
 		{
@@ -214,7 +392,7 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 		}
 
 	// ---- kernel .data/.bss + initial thread stack + initial heap, contiguous at iKernDataAddress
-	TUint32 heap = ((BankEnd - BankBase) >> (KPageShift - 1)) + 24 * 1024;		// ~2 bytes per RAM page + 24K
+	TUint32 heap = (totalRam >> (KPageShift - 1)) + 24 * 1024;		// ~2 bytes per RAM page + 24K
 	if (heap < KHeapSizeMin)
 		heap = KHeapSizeMin;
 	heap = (heap + KPageMask) & ~KPageMask;
@@ -229,13 +407,21 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	// ---- the RAM bank list (CPU page; [1] = {0,0} ends RAM, [2] = {0,0} ends the reserved banks), then the SPageInfo
 	// array: one page of 32-byte records per 128 RAM pages; bit n of KPageInfoMap set <=> page n of the array exists
 	SRamBank* ram = (SRamBank*)(superPhys + KRamTableOffset);
-	ram[0].iBase = BankBase; ram[0].iSize = BankEnd - BankBase;
+	for (TInt b = 0; b < BankCount; ++b)
+		ram[b] = Banks[b];
+	ram[BankCount].iBase = ram[BankCount].iSize = 0;
+	ram[BankCount + 1].iBase = ram[BankCount + 1].iSize = 0;		// no reserved banks
 	const TUint32 mapPhys = AllocAndMap(KPageInfoMap, KPageSize, KPermKernel);
 	const TUint blockShift = KPageShift + KPageShift - KPageInfoShift;		// RAM covered by one SPageInfo page
-	TUint first = BankBase >> blockShift, last = (BankEnd - 1) >> blockShift;
-	for (TUint n = first; n <= last; ++n)
-		((volatile TUint8*)mapPhys)[n >> 3] |= (TUint8)(1u << (n & 7));
-	AllocAndMap(KPageInfoLinearBase + (first << KPageShift), (last - first + 1) << KPageShift, KPermKernel);
+	for (TInt b = 0; b < BankCount; ++b)
+		for (TUint n = Banks[b].iBase >> blockShift; n <= (Banks[b].iBase + Banks[b].iSize - 1) >> blockShift; ++n)
+			{
+			volatile TUint8& bits = ((volatile TUint8*)mapPhys)[n >> 3];
+			if (bits & (1u << (n & 7)))
+				continue;							// a block shared with the bank before
+			bits |= (TUint8)(1u << (n & 7));
+			AllocAndMap(KPageInfoLinearBase + (n << KPageShift), KPageSize, KPermKernel);
+			}
 
 	// ---- the ROM header + image records, written through the ROM's physical address
 	TRomHeader& rh = *(TRomHeader*)romPhys;
@@ -387,7 +573,7 @@ extern "C" void A64_BootMain(TUint64 /*aDtb*/)
 	// ---- super page
 	SSuperPageBase& sp = *(SSuperPageBase*)superPhys;
 	sp.iTotalRomSize = romSize;
-	sp.iTotalRamSize = BankEnd - BankBase;
+	sp.iTotalRamSize = totalRam;
 	sp.iPageDir = KPageDirectoryBase;
 	sp.iRamBootData = KSuperPageLinAddr + KRamTableOffset;
 	sp.iBootFlags = KBootFlagRunFromRAM;

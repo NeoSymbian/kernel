@@ -3,7 +3,7 @@
 """phone.py -- drive the Pixel running the AArch64 Symbian kernel over its USB debug console (common/specific/a64_usb_acm_monitor.cpp),
 with nothing but the Python standard library and the fastboot tool.
 
-  phone.py run IMG [--cmd C]... [--log F] [--secs N] [--stay] [--no-date]
+  phone.py run IMG [--cmd C]... [--log F] [--secs N] [--stay] [--no-date] [--product P]
       fastboot-boot IMG (RAM only), wait for the console, save its log, run the commands, then send the phone back
       to fastboot (unless --stay) and wait until fastboot answers again
       first it sets the phone's clock to the Mac's (monitor "date"; neoui then keeps it), unless --no-date
@@ -39,7 +39,8 @@ import termios
 import time
 import zlib
 
-import fshell_link
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # neo runs us with python3 -I: no script dir on the path
+import fshell_link  # noqa: E402
 
 END = b"\n.\n"
 
@@ -369,7 +370,7 @@ def _main(argv):
         selftest()
         return 0
     if verb == "run":
-        img, cmds, log, secs, stay, date = args[0], [], None, 5.0, False, True
+        img, cmds, log, secs, stay, date, product = args[0], [], None, 5.0, False, True, "bonito"
         i = 1
         while i < len(args):
             if args[i] == "--cmd":
@@ -384,6 +385,9 @@ def _main(argv):
             elif args[i] == "--stay":
                 stay = True
                 i += 1
+            elif args[i] == "--product":
+                product = args[i + 1]
+                i += 2
             elif args[i] == "--no-date":
                 date = False
                 i += 1
@@ -392,8 +396,8 @@ def _main(argv):
         if not wait_fastboot(60):
             raise SystemExit("no phone in fastboot")
         r = fastboot("getvar", "product")
-        if not r or "bonito" not in (r.stdout + r.stderr):
-            raise SystemExit(f"not the bonito: {r and r.stderr!r}")
+        if not r or f"product: {product}" not in (r.stdout + r.stderr):
+            raise SystemExit(f"not the {product}: {r and r.stderr!r}")
         r = fastboot("boot", img, timeout=60)
         if not r or r.returncode:
             raise SystemExit(f"fastboot boot failed: {r and r.stderr}")

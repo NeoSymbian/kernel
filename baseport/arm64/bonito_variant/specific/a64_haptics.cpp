@@ -11,6 +11,9 @@
 #include "a64_device.h"
 
 TInt A64Board_I2c10();
+#ifndef A64_HAPTIC_ODCLAMP
+#define A64_HAPTIC_ODCLAMP 0x6a
+#endif
 const TUint32 KReset = 0x03518000;							// TLMM west tile, gpio24: DRV2624 reset (cfg, then io at +4)
 static DMutex* Lock; // f2 -> board I2C10 f1 -> GENI fast mutex (strictly descending DMutex order)
 static NFastMutex InitLock;
@@ -50,10 +53,10 @@ static TInt Probe()
 	// SLOS893D table 8-2: CHIPID[7:4]=0 for DRV2624, REV[3:0]=2 or 3.
 	if ((id & 0xf0) != 0 || ((id & 0x0f) != 2 && (id & 0x0f) != 3))
 		return KErrNotSupported;
-	// DT: open loop LRA, 172Hz nominal/155Hz open-loop, rated0x4b/clamp0x6a,
+	// DT: open loop LRA, 172Hz nominal/155Hz open-loop, rated0x4b/clamp0x6a (sargo's dtbo: clamp0x5d, the rest equal),
 	// compensation0x12/BEMF0x96, blanking2/idiss2, no feedback braking, 5ms waveform interval.
 	static const TUint8 init[][2] = {
-		{0x0c,0}, {0x07,0x48}, {0x08,0xd8}, {0x0d,0x20}, {0x1f,0x4b}, {0x20,0x6a},
+		{0x0c,0}, {0x07,0x48}, {0x08,0xd8}, {0x0d,0x20}, {0x1f,0x4b}, {0x20,A64_HAPTIC_ODCLAMP},
 		{0x21,0x12}, {0x22,0x96}, {0x23,0x04}, {0x27,24}, {0x28,0x22}, {0x29,0x0c},
 		{0x2c,0}, {0x2e,1}, {0x2f,6}, {0x0e,0}
 		};

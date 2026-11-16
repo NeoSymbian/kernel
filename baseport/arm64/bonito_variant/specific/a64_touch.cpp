@@ -285,7 +285,6 @@ static TInt RmiSetup()
 // interrupt + multi-touch for neoui gestures
 const TInt KPollMs = 10, KFallbackTicks = 10;			// read anyway every 100 ms in case attention never asserts
 const TBool KFlipX = EFalse, KFlipY = EFalse, KSwapXY = EFalse;	// set from the corner test if an axis is off
-const TInt KScreenW = 1080, KScreenH = 2160;			// the user side owns the whole screen (the dev console only overlays it)
 
 static void PollDfcFn(TAny*);
 static TDfc PollDfc(PollDfcFn, NULL, 1);
@@ -346,10 +345,10 @@ static void PollDfcFn(TAny*)
 				x = mx - x;
 			if (KFlipY)
 				y = my - y;
-			x = x * KScreenW / mx;
-			y = y * KScreenH / my;
-			x = x < 0 ? 0 : x >= KScreenW ? KScreenW - 1 : x;
-			y = y < 0 ? 0 : y >= KScreenH ? KScreenH - 1 : y;
+			x = x * A64_FbWidth / mx;
+			y = y * A64_FbHeight / my;
+			x = x < 0 ? 0 : x >= A64_FbWidth ? A64_FbWidth - 1 : x;
+			y = y < 0 ? 0 : y >= A64_FbHeight ? A64_FbHeight - 1 : y;
 			TBool down = (o[0] == 1 || o[0] == 2 || o[0] == 4);	// finger, stylus, unclassified
 			if (down && !Down)
 				Post(TRawEvent::EButton1Down, x, y);

@@ -25,6 +25,11 @@
 #include "qcom_telhal.h"
 #include "a64_device.h"
 
+extern TInt A64Jack_Poll();
+extern TInt A64Jack_Play(TBool aOn);
+extern TInt A64Jack_Mic(TBool aOn);
+extern void A64Jack_Report(void (*aSay)(const char*, ...));
+
 static volatile TUint32& Reg(TUint32 aPhys) { return *(volatile TUint32*)A64_Io(aPhys); }
 
 // GCC: QUP wrapper 1 SE2 (I2C10): vote bit 24, its branch and RCG (19.2 MHz from XO, as SE1 for touch)
@@ -38,7 +43,7 @@ static volatile TUint32& Io(TUint32 aTile, TInt aPin) { return Reg(aTile + 0x100
 
 const TUint KTop = 0x40, KBottom = 0x41, KRt = 0x57;
 const TUint KPm660l = 3;									// the PM660L's second SPMI SID: its audio codec
-enum { ERoute = 0, ESpeaker = 1, EBottom = 2 };
+enum { ERoute = 0, ESpeaker = 1, EBottom = 2, ENone = 3 };	// ENone: both amps off (headphones), the mic on
 
 static TBool Probed, Running, MicMuted;
 static TInt MicSel;										// 0 DMIC1, 1 DMIC2
@@ -400,6 +405,11 @@ static void Amps()
 		AmpOff(KTop);
 		AmpOn(KBottom, KAnalog);
 		}
+	else if (Route == ENone)
+		{
+		AmpOff(KTop);
+		AmpOff(KBottom);
+		}
 	else
 		{
 		AmpOff(KBottom);
@@ -407,8 +417,11 @@ static void Amps()
 		}
 	}
 
-static TInt RouteOf(TInt aArg) { return aArg == ESpeaker || aArg == EBottom ? aArg : ERoute; }
-static const char* RouteName() { return Route == ESpeaker ? "speaker" : Route == EBottom ? "bottom" : "earpiece"; }
+static TInt RouteOf(TInt aArg) { return aArg == ESpeaker || aArg == EBottom || aArg == ENone ? aArg : ERoute; }
+static const char* RouteName()
+	{
+	return Route == ESpeaker ? "speaker" : Route == EBottom ? "bottom" : Route == ENone ? "no amps" : "earpiece";
+	}
 
 static TInt Start(TInt aRoute)
 	{
@@ -502,9 +515,9 @@ static TInt Control(TInt aOp, TInt aArg)
 		Volume = Max(0, Min(10, aArg));
 		if (Running)
 			{
-			if (Route != EBottom)
+			if (Route == ERoute || Route == ESpeaker)
 				AmpGain(KTop, KAnalog);
-			if (Route != ERoute)
+			if (Route == ESpeaker || Route == EBottom)
 				AmpGain(KBottom, KAnalog);
 			}
 		return KErrNone;
@@ -522,6 +535,12 @@ static TInt Control(TInt aOp, TInt aArg)
 		return KErrNone;
 	case 7:
 		return CheckAmps();
+	case 8:
+		return A64Jack_Poll();
+	case 9:
+		return A64Jack_Play(aArg != 0);
+	case 10:
+		return A64Jack_Mic(aArg != 0);
 		}
 	return KErrArgument;
 	}
@@ -558,6 +577,7 @@ void A64Audio_Report(void (*aSay)(const char*, ...))
 	aSay("audio: bottom PWR_CTRL2 %08x INT1 %08x RX slot %x", b[0], b[1], b[2]);
 	aSay("audio: mic DMIC%d; amp protection events: top %d (%08x), bottom %d (%08x)", MicSel + 1, AmpFaults[0],
 		AmpFaultBits[0], AmpFaults[1], AmpFaultBits[1]);
+	A64Jack_Report(aSay);
 	}
 
 static TA64DevState AudioStatus(TDes8& aDetail)

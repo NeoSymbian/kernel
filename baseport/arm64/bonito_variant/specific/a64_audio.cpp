@@ -12,7 +12,10 @@
 // Register sequences from Linux cs35l36.c, rt5514.c, msm8916-wcd-analog.c and the sdm670 machine driver as the phone
 // ran them under C1 (docs/telephony.md C6); pins from pinctrl-sdm670(-lpass-lpi).c; clocks from gcc-sdm845.c.
 // Thread context (HAL Audio from MODEMD, the monitor's "audio").
-// shortcut: no amp interrupt handling (protection errors are only logged on start); no ACDB calibration.
+// Amp protection (docs/audio.md A7): no GPIO interrupts on this board yet, so op 7 polls the amps' IRQ lines (TLMM 80
+// Top, 79 Bottom, active-high); an asserted line's unmasked INT1 bits are cleared and that amp is switched off until
+// the next start. Mic select (op 6): the RT5514's stereo ADCs from DMIC1 (C1's) or DMIC2.
+// shortcut: polled, not an interrupt (MODEMD polls every 250 ms while audio runs); no ACDB calibration.
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_mutex.h"
@@ -38,6 +41,8 @@ const TUint KPm660l = 3;									// the PM660L's second SPMI SID: its audio code
 enum { ERoute = 0, ESpeaker = 1, EBottom = 2 };
 
 static TBool Probed, Running, MicMuted;
+static TInt MicSel;										// 0 DMIC1, 1 DMIC2
+static TUint32 AmpFaults[2], AmpFaultBits[2];
 static TInt Route = ERoute, Volume = 10;
 static TInt ProbeErr = KErrNotReady;
 static TUint32 AmpId[2], AmpRev[2], Faults;
@@ -270,6 +275,9 @@ static TInt RtProbe()
 	return KErrNone;
 	}
 
+// the stereo ADCs' DMIC mux (Stereo1/Stereo2 DMIC Mux: 0 DMIC1, 1 DMIC2)
+static void RtMicSel() { RtUpd(0x20a4, 0x3, MicSel ? 0x3 : 0); }
+
 static void RtMute()
 	{
 	RtUpd(0x2190, 0x80, MicMuted ? 0x80 : 0);
@@ -420,6 +428,7 @@ static TInt Start(TInt aRoute)
 	RtUpd(0x2264, 0x1, 0x1);
 	RtUpd(0x2104, 0x700, 0x200);
 	MicBias(ETrue);
+	RtMicSel();
 	RtMute();
 	Running = ETrue;
 	Kern::Printf("[audio] on: %s, volume %d%s; i2c faults %d", RouteName(), Volume,
@@ -441,6 +450,36 @@ static void Stop()
 	RtUpd(0x2264, 0x1, 0);
 	Running = EFalse;
 	Kern::Printf("[audio] off");
+	}
+
+// the INT1 bits the driver unmasks (mask 0xf9ba7fff, as Linux): protection errors and warnings
+const TUint32 KAmpIrqBits = ~0xf9ba7fffu;
+
+// Op 7: a running amp whose IRQ line is up has a protection event: clear it, switch that amp off, count it.
+// Bit 0 = Top faulted, bit 1 = Bottom.
+static TInt CheckAmps()
+	{
+	if (!Running)
+		return 0;
+	TInt faulted = 0;
+	const TInt pins[2] = { 80, 79 };
+	const TUint devs[2] = { KTop, KBottom };
+	for (TInt i = 0; i < 2; ++i)
+		{
+		if (!(Io(KTlmmNorth, pins[i]) & 1))
+			continue;
+		TUint32 st = 0;
+		if (R32(devs[i], 0xd00000, st) != KErrNone || !(st & KAmpIrqBits))
+			continue;
+		W32(devs[i], 0xd00000, st & KAmpIrqBits);				// write-1-to-clear
+		AmpOff(devs[i]);
+		++AmpFaults[i];
+		AmpFaultBits[i] |= st & KAmpIrqBits;
+		faulted |= 1 << i;
+		Kern::Printf("[audio] %s amp protection event INT1 %08x: amp off until the next start (%d so far)",
+			i ? "bottom" : "top", st, AmpFaults[i]);
+		}
+	return faulted;
 	}
 
 static TInt Control(TInt aOp, TInt aArg)
@@ -474,6 +513,15 @@ static TInt Control(TInt aOp, TInt aArg)
 		if (Running)
 			RtMute();
 		return KErrNone;
+	case 6:
+		if (aArg < 0 || aArg > 1)
+			return KErrArgument;
+		MicSel = aArg;
+		if (Running)
+			RtMicSel();
+		return KErrNone;
+	case 7:
+		return CheckAmps();
 		}
 	return KErrArgument;
 	}
@@ -508,6 +556,8 @@ void A64Audio_Report(void (*aSay)(const char*, ...))
 		MicMuted ? ", mic muted" : "", AmpId[0], AmpRev[0], AmpRev[1], RtId, Faults);
 	aSay("audio: top PWR_CTRL2 %08x PWR_CTRL3 %08x INT1 %08x; mic DOWNFILTER0 %08x", v[0], v[1], v[2], v[3]);
 	aSay("audio: bottom PWR_CTRL2 %08x INT1 %08x RX slot %x", b[0], b[1], b[2]);
+	aSay("audio: mic DMIC%d; amp protection events: top %d (%08x), bottom %d (%08x)", MicSel + 1, AmpFaults[0],
+		AmpFaultBits[0], AmpFaults[1], AmpFaultBits[1]);
 	}
 
 static TA64DevState AudioStatus(TDes8& aDetail)
@@ -521,6 +571,12 @@ static TA64DevState AudioStatus(TDes8& aDetail)
 		{
 		A64Device_Format(aDetail, "probe failed: %d; I2C faults %d", ProbeErr, Faults);
 		return EA64DevError;
+		}
+	if (AmpFaults[0] || AmpFaults[1])
+		{
+		A64Device_Format(aDetail, "amp protection events: top %d, bottom %d (amp off until the next start)",
+			AmpFaults[0], AmpFaults[1]);
+		return EA64DevPartial;
 		}
 	A64Device_Format(aDetail, "2x CS35L36 amps, RT5514 mic; %s, %s, volume %d%s; I2C faults %d", Running ? "on" : "off",
 		RouteName(), Volume, MicMuted ? ", mic muted" : "", Faults);

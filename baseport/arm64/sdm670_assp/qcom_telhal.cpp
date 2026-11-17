@@ -654,23 +654,45 @@ static TInt QueueStop(TUint32 aMask)
 // available, nothing to configure). Its AHB clock is the modem's proxy "prng" vote (GCC 0x152004 bit 13), which
 // qcom_mss.cpp drops after boot, so it is voted again here. For the Wi-Fi handshake's nonces (W4).
 const TUint32 KPrng = 0x00793000, KPrngClkVote = 0x00152004;
+static TUint32 PrngWord()			// 0 = none within ~1 ms
+	{
+	volatile TUint32* prng = (volatile TUint32*)A64_Io(KPrng);
+	*(volatile TUint32*)A64_Io(KPrngClkVote) |= 1u << 13;
+	TUint32 v = 0;
+	for (TInt t = 0; t < 1000 && !v; ++t)		// a word takes well under 1 ms; 0 counts as "not yet", as Linux
+		{
+		if (prng[1] & 1)
+			v = prng[0];
+		if (!v)
+			Kern::NanoWait(1000);
+		}
+	return v;
+	}
+
+// WB1: seed the kernel's secure RNG (Math::RandomL, TLS) at boot with 512 bits from the PRNG (a64_variant.cpp).
+void A64SeedEntropy()
+	{
+	TInt n = 0;
+	for (TInt i = 0; i < 16; ++i)
+		{
+		TUint32 v = PrngWord();
+		if (v)
+			{
+			Kern::RandomSalt(v, 32);
+			++n;
+			}
+		}
+	Kern::Printf("[rng] seeded from the SoC PRNG: %d bits", n * 32);
+	}
+
 static TInt Prng(TAny* aDes)
 	{
 	TInt len = Kern::ThreadGetDesLength(&Kern::CurrentThread(), aDes);
 	if (len < 1 || len > 256)
 		return KErrArgument;
-	volatile TUint32* prng = (volatile TUint32*)A64_Io(KPrng);
-	*(volatile TUint32*)A64_Io(KPrngClkVote) |= 1u << 13;
 	for (TInt i = 0; i < len; i += 4)
 		{
-		TUint32 v = 0;
-		for (TInt t = 0; t < 1000 && !v; ++t)		// a word takes well under 1 ms; 0 counts as "not yet", as Linux
-			{
-			if (prng[1] & 1)
-				v = prng[0];
-			if (!v)
-				Kern::NanoWait(1000);
-			}
+		TUint32 v = PrngWord();
 		if (!v)
 			return KErrNotReady;
 		TPtrC8 word((const TUint8*)&v, Min(4, len - i));

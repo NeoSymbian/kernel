@@ -626,6 +626,7 @@ extern "C" void A64_BootMain(TUint64 aDtb)
 		"dsb	nsh\n\t"
 		"isb\n\t"
 		"msr	sctlr_el1, %3\n\t"
+		"msr	cpacr_el1, %8\n\t"				// NeoSymbian WB1: FPEN, FP/SIMD for AArch32 EL0 (switched per thread)
 		"isb\n\t"
 		"mov	sp, %4\n\t"
 		"mov	x0, %5\n\t"
@@ -634,7 +635,7 @@ extern "C" void A64_BootMain(TUint64 aDtb)
 		"mov	x30, xzr\n\t"
 		"br		%7"
 		: : "r"(KA64MairValue), "r"(tcr), "r"((TUint64)rootPhys), "r"(sctlr), "r"((TUint64)initSp),
-			"r"((TUint64)romLin), "r"((TUint64)KSuperPageLinAddr), "r"((TUint64)k.iEntryPoint)
+			"r"((TUint64)romLin), "r"((TUint64)KSuperPageLinAddr), "r"((TUint64)k.iEntryPoint), "r"(3ull << 20)
 		: "x0", "x1", "x29", "x30", "memory");
 	Die("kernel entry returned");
 	}

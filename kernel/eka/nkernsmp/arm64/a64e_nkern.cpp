@@ -183,6 +183,29 @@ EXPORT_C void NKern::ThreadGetUserContext(NThread* aThread, TAny* aContext, TUin
 	}
 
 /******************************************************************************
+ * FP/NEON for AArch32 EL0 (WB1, smooth-ui S4): CPACR_EL1.FPEN is on for every CPU (a64boot.cpp, boot.S), so the
+ * user's V registers are live in the CPU; the scheduler's hooks (a64s_ncsched.cpp, weak there for the nanokernel
+ * image) switch them with the thread, eagerly. The kernel never uses V registers (-mgeneral-regs-only), so a thread's
+ * state stays in the CPU from its user code to its next reschedule. A new thread starts from the zero state.
+ * shortcut: eager save/restore on every reschedule (~0.5 KB of loads and stores); trap-on-first-use if it shows.
+ ******************************************************************************/
+// WB1: interrupt timing for the secure RNG (Math::RandomL, TLS), on every board; 1 bit per interrupt, nothing once
+// the RNG is seeded (DSecureRNG idle). The phone also seeds it from the SoC's PRNG (qcom_telhal.cpp). Off until the
+// variant's extension starts (a64_variant.cpp): interrupts come long before K::Init3 creates the RNG and its buffers.
+extern "C" volatile TBool A64_IrqEntropyOn = EFalse;
+extern "C" void A64_IrqEntropy()
+	{
+	if (A64_IrqEntropyOn)
+		Interrupt::AddTimingEntropy();
+	}
+
+extern "C" void A64_FpSave(TUint64* aState);			// a64_ctxsw.S
+extern "C" void A64_FpRestore(const TUint64* aState);
+extern "C" void board_fpu_save(NThreadBase* aThread) { A64_FpSave(((NThread*)aThread)->iCoprocessorState); }
+extern "C" void board_fpu_restore(NThreadBase* aThread)
+	{ A64_FpRestore(aThread ? ((NThread*)aThread)->iCoprocessorState : 0); }
+
+/******************************************************************************
  * Return to user mode (nkernsmp/arm/vectors.cia run_user_mode_callbacks): called with interrupts off at the end of
  * every exception, interrupt or exec call taken from EL0, on the thread that is about to resume user code.
  ******************************************************************************/

@@ -36,10 +36,12 @@ static const TInt DriveNumbers[1] = { 2 };					// the ROFS drive (a64_medrofs.cp
 
 static TInt TableBlocks() { return (__urofs_hash_end - __urofs_hash) / KHash; }
 
-// SHA-256 of one 4 KB block with the ARMv8 instructions (a64_sha256.S), when the CPU has them: FP/SIMD is enabled
-// (CPACR_EL1.FPEN) only around the call, with interrupts off on this CPU -- no thread here owns SIMD state, so nothing
-// needs saving. ~4 us per block on the phone, against ~50 us for the C SHA256.
+// SHA-256 of one 4 KB block with the ARMv8 instructions (a64_sha256.S), when the CPU has them, with interrupts off on
+// this CPU. The V registers hold the current thread's AArch32 user state (WB1: switched with the thread), so it is
+// saved before and put back after. ~4 us per block on the phone, against ~50 us for the C SHA256.
 extern "C" void A64Sha256Blocks(TUint32 aState[8], const TUint8* aData, TInt aBlocks);
+extern "C" void board_fpu_save(NThreadBase* aThread);		// a64e_nkern.cpp
+extern "C" void board_fpu_restore(NThreadBase* aThread);
 static TBool UseCpu;										// set by the boot self-test
 static TBool CpuHasSha2()
 	{
@@ -55,12 +57,11 @@ static void CpuHash4K(const TUint8* aData, TUint8 aOut[KHash])
 	pad[0] = 0x80;
 	pad[62] = 0x80;											// the length, 4096 * 8 bits = 0x8000, big-endian
 	const TInt irq = NKern::DisableAllInterrupts();
-	TUint64 cpacr;
-	__asm__ __volatile__("mrs %0, cpacr_el1" : "=r"(cpacr));
-	__asm__ __volatile__("msr cpacr_el1, %0\n\tisb" :: "r"(cpacr | (3ull << 20)) : "memory");
+	NThreadBase* me = NKern::CurrentThread();
+	board_fpu_save(me);
 	A64Sha256Blocks(st, aData, KBlock / 64);
 	A64Sha256Blocks(st, pad, 1);
-	__asm__ __volatile__("msr cpacr_el1, %0\n\tisb" :: "r"(cpacr) : "memory");
+	board_fpu_restore(me);
 	NKern::RestoreInterrupts(irq);
 	for (TInt i = 0; i < 8; ++i)
 		{

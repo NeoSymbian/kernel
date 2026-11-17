@@ -5,8 +5,9 @@
 // ts_1p8 = PM660 GPIO12 (DTB). ABL leaves all of it off (pins at reset defaults, clocks off, supply low), so:
 //   clocks on -> pins -> supply on, reset released -> the SE's I2C firmware -> the RMI4 function table.
 // Register offsets: Linux gcc-sdm845.c (covers sdm670), pinctrl-sdm670.c, pinctrl-spmi-gpio.c, rmi_driver.c, rmi_f12.c.
-// Then the Synaptics F12 2-D sensor's first object is polled and posted as EButton1Down/EPointerMove/EButton1Up in
-// screen pixels (Kern::AddEvent). Volume Up re-prints the bring-up report (boot-time lines scroll out of the strip).
+// Then the Synaptics F12 2-D sensor's finger objects (up to 5, each its own pointer number) are polled and posted as
+// EButton1Down/EPointerMove/EButton1Up in screen pixels (Kern::AddEvent). Volume Up re-prints the bring-up report
+// (boot-time lines scroll out of the strip).
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "qcom_spmi.h"
@@ -233,6 +234,9 @@ struct SFn { TUint8 iQuery, iCtrl, iData; TBool iFound; };
 static SFn F01, F12;
 static TUint32 MaxX = 1080, MaxY = 2160;				// the sensor's range (F12 control 8)
 static TUint32 Data1Off;								// F12 data register 1 (the finger objects, 8 bytes each) in the packet
+const TInt KMaxFingers = 5;								// pointer numbers 0..4 (neoui: 0 drives gestures, the rest go to apps)
+const TInt KPacket = 128;
+static TInt Fingers = 1;								// the objects read per poll (the sensor's count, at most KMaxFingers)
 
 static TInt RmiSetup()
 	{
@@ -253,11 +257,15 @@ static TInt RmiSetup()
 		return r != KErrNone ? r : KErrNotSupported;
 		}
 	Data1Off = data.Offset(1);
-	if (Data1Off + 8 > 64)
+	if (Data1Off + 8 > (TUint32)KPacket)
 		{
 		Log("F12 data1 at byte %d: too far into the packet", Data1Off);
 		return KErrTooBig;
 		}
+	Fingers = data.iSubpackets[1];
+	Fingers = Fingers < 1 ? 1 : Fingers > KMaxFingers ? KMaxFingers : Fingers;
+	while (Fingers > 1 && Data1Off + 8 * Fingers > (TUint32)KPacket)
+		--Fingers;
 	if (ctrl.Has(8) && (ctrl.iSub0[8] & 1))
 		{
 		TUint8 c8[4];
@@ -276,13 +284,14 @@ static TInt RmiSetup()
 		c[1] |= 0x02;
 		r = RmiWrite(F01.iCtrl, c, 2);
 		}
-	Log("F12 max %d x %d, data1 at byte %d (%d objects); F01 ctrl %02x %02x -> %d", MaxX, MaxY, Data1Off,
-		data.iSubpackets[1], c[0], c[1], r);
+	Log("F12 max %d x %d, data1 at byte %d (%d objects, %d read); F01 ctrl %02x %02x -> %d", MaxX, MaxY, Data1Off,
+		data.iSubpackets[1], Fingers, c[0], c[1], r);
 	return KErrNone;
 	}
 
-// shortcut: one finger, polled at 10 ms off the attention pin (no TLMM interrupt); upgrade to the TLMM summary
-// interrupt + multi-touch for neoui gestures
+// Up to KMaxFingers fingers, each F12 object (a slot the sensor keeps for a finger while it is down) as its own
+// pointer number. shortcut: polled at 10 ms off the attention pin (no TLMM interrupt); upgrade to the TLMM summary
+// interrupt
 const TInt KPollMs = 10, KFallbackTicks = 10;			// read anyway every 100 ms in case attention never asserts
 const TBool KFlipX = EFalse, KFlipY = EFalse, KSwapXY = EFalse;	// set from the corner test if an axis is off
 
@@ -290,14 +299,15 @@ static void PollDfcFn(TAny*);
 static TDfc PollDfc(PollDfcFn, NULL, 1);
 static void PollTimerFn(TAny*) { PollDfc.Add(); }
 static NTimer PollTimer(PollTimerFn, NULL);
-static TBool Down;
-static TInt LastX, LastY, Quiet, Errors, AttnSeen;
+static TBool Down[KMaxFingers];
+static TInt LastX[KMaxFingers], LastY[KMaxFingers];
+static TInt Quiet, Errors, AttnSeen;
 static TBool Polling, BringUpDone;						// the device registry: running, or stopped where CurStep says
 
-static void Post(TRawEvent::TType aType, TInt aX, TInt aY)
+static void Post(TRawEvent::TType aType, TInt aX, TInt aY, TInt aFinger)
 	{
 	TRawEvent e;
-	e.Set(aType, aX, aY);
+	e.Set(aType, aX, aY, 0, (TUint8)aFinger);
 	if (Kern::AddEvent(e) == KErrOverflow)
 		++Dropped;
 	}
@@ -308,9 +318,12 @@ static void PollDfcFn(TAny*)
 	{
 	if (Asleep)												// stop until A64Touch_Sleep(EFalse) restarts the poll
 		{
-		if (Down)
-			Post(TRawEvent::EButton1Up, LastX, LastY);
-		Down = EFalse;
+		for (TInt f = 0; f < KMaxFingers; ++f)
+			{
+			if (Down[f])
+				Post(TRawEvent::EButton1Up, LastX[f], LastY[f], f);
+			Down[f] = EFalse;
+			}
 		return;
 		}
 	TInt next = KPollMs;
@@ -319,11 +332,10 @@ static void PollDfcFn(TAny*)
 	if (attn || ++Quiet >= KFallbackTicks)
 		{
 		Quiet = 0;
-		TUint8 st, pkt[64];
+		TUint8 st, pkt[KPacket];
 		TInt r = RmiRead(F01.iData + 1, &st, 1);			// interrupt status: reading it releases attention
 		if (r == KErrNone)
-			r = RmiRead(F12.iData, pkt, Data1Off + 8);		// the data packet up to the first object
-		const TUint8* o = pkt + Data1Off;
+			r = RmiRead(F12.iData, pkt, Data1Off + 8 * Fingers);	// the data packet up to the last object read
 		if (r != KErrNone)
 			{
 			if (++Errors == 50)
@@ -333,39 +345,43 @@ static void PollDfcFn(TAny*)
 		else
 			{
 			Errors = 0;
-			TInt rx = o[1] | (o[2] << 8), ry = o[3] | (o[4] << 8);
-			TInt x = rx, y = ry;
-			TInt mx = MaxX, my = MaxY;
-			if (KSwapXY)
+			for (TInt f = 0; f < Fingers; ++f)
 				{
-				TInt t = x; x = y; y = t;
-				t = mx; mx = my; my = t;
-				}
-			if (KFlipX)
-				x = mx - x;
-			if (KFlipY)
-				y = my - y;
-			x = x * A64_FbWidth / mx;
-			y = y * A64_FbHeight / my;
-			x = x < 0 ? 0 : x >= A64_FbWidth ? A64_FbWidth - 1 : x;
-			y = y < 0 ? 0 : y >= A64_FbHeight ? A64_FbHeight - 1 : y;
-			TBool down = (o[0] == 1 || o[0] == 2 || o[0] == 4);	// finger, stylus, unclassified
-			if (down && !Down)
-				Post(TRawEvent::EButton1Down, x, y);
-			else if (down && (x != LastX || y != LastY))
-				Post(TRawEvent::EPointerMove, x, y);
-			else if (!down && Down)
-				Post(TRawEvent::EButton1Up, LastX, LastY);
-			// the first presses and releases only (bring-up evidence): Kern::Printf runs with interrupts off, and a
-			// print per tap slows a busy UI (smooth-ui S1); the monitor's `touch` shows the counts
-			if (down != Down && ++Logged <= 10)
-				Kern::Printf("[touch] %d %s %d %d (type %d, attn %d)", Logged, down ? "down" : "up",
-					down ? x : LastX, down ? y : LastY, o[0], AttnSeen);
-			Down = down;
-			if (down)
-				{
-				LastX = x;
-				LastY = y;
+				const TUint8* o = pkt + Data1Off + 8 * f;
+				TInt rx = o[1] | (o[2] << 8), ry = o[3] | (o[4] << 8);
+				TInt x = rx, y = ry;
+				TInt mx = MaxX, my = MaxY;
+				if (KSwapXY)
+					{
+					TInt t = x; x = y; y = t;
+					t = mx; mx = my; my = t;
+					}
+				if (KFlipX)
+					x = mx - x;
+				if (KFlipY)
+					y = my - y;
+				x = x * A64_FbWidth / mx;
+				y = y * A64_FbHeight / my;
+				x = x < 0 ? 0 : x >= A64_FbWidth ? A64_FbWidth - 1 : x;
+				y = y < 0 ? 0 : y >= A64_FbHeight ? A64_FbHeight - 1 : y;
+				TBool down = (o[0] == 1 || o[0] == 2 || o[0] == 4);	// finger, stylus, unclassified
+				if (down && !Down[f])
+					Post(TRawEvent::EButton1Down, x, y, f);
+				else if (down && (x != LastX[f] || y != LastY[f]))
+					Post(TRawEvent::EPointerMove, x, y, f);
+				else if (!down && Down[f])
+					Post(TRawEvent::EButton1Up, LastX[f], LastY[f], f);
+				// the first presses and releases only (bring-up evidence): Kern::Printf runs with interrupts off, and a
+				// print per tap slows a busy UI (smooth-ui S1); the monitor's `touch` shows the counts
+				if (down != Down[f] && ++Logged <= 10)
+					Kern::Printf("[touch] %d finger %d %s %d %d (type %d, attn %d)", Logged, f, down ? "down" : "up",
+						down ? x : LastX[f], down ? y : LastY[f], o[0], AttnSeen);
+				Down[f] = down;
+				if (down)
+					{
+					LastX[f] = x;
+					LastY[f] = y;
+					}
 				}
 			}
 		}
@@ -498,8 +514,8 @@ static TA64DevState TouchStatus(TDes8& aDetail)
 	{
 	if (Polling)
 		{
-		A64Device_Format(aDetail, "%dx%d, one finger, polled %d ms; %d presses+releases, %d errors, %d dropped", MaxX, MaxY,
-			KPollMs, Logged, Errors, Dropped);
+		A64Device_Format(aDetail, "%dx%d, %d fingers, polled %d ms; %d presses+releases, %d errors, %d dropped", MaxX,
+			MaxY, Fingers, KPollMs, Logged, Errors, Dropped);
 		if (Asleep)
 			A64Device_Format(aDetail, "; asleep (screen off)");
 		return EA64DevOk;

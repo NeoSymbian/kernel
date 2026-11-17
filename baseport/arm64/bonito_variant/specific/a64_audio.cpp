@@ -7,7 +7,7 @@
 //     ADSP's SECONDARY_TDM_RX (LPASS LPI pins gpio8-11), their PLLs locked to its 6.144 MHz bit clock;
 //   - the microphone: a DMIC through a Realtek RT5514 (I2C10 0x57) onto PRIMARY_TDM_TX (TLMM gpio65-68), its PLL
 //     from the bit clock too; the DMIC's supply is the PM660L analog codec's MIC BIAS 1 (SPMI SID 3, 0xf000).
-// Routes: earpiece = Top only, speaker = both amps, both at C1's live gain. Volume = the amps'
+// Routes: earpiece = Top only, speaker = both amps, bottom = Bottom only (media, docs/audio.md), all at C1's live gain. Volume = the amps'
 // digital volume, mute = the RT5514's ADC mute (no APR controls exist for these).
 // Register sequences from Linux cs35l36.c, rt5514.c, msm8916-wcd-analog.c and the sdm670 machine driver as the phone
 // ran them under C1 (docs/telephony.md C6); pins from pinctrl-sdm670(-lpass-lpi).c; clocks from gcc-sdm845.c.
@@ -35,7 +35,7 @@ static volatile TUint32& Io(TUint32 aTile, TInt aPin) { return Reg(aTile + 0x100
 
 const TUint KTop = 0x40, KBottom = 0x41, KRt = 0x57;
 const TUint KPm660l = 3;									// the PM660L's second SPMI SID: its audio codec
-enum { ERoute = 0, ESpeaker = 1 };
+enum { ERoute = 0, ESpeaker = 1, EBottom = 2 };
 
 static TBool Probed, Running, MicMuted;
 static TInt Route = ERoute, Volume = 10;
@@ -387,12 +387,20 @@ static void Amps()
 		AmpOn(KTop, KAnalog);
 		AmpOn(KBottom, KAnalog);
 		}
+	else if (Route == EBottom)
+		{
+		AmpOff(KTop);
+		AmpOn(KBottom, KAnalog);
+		}
 	else
 		{
 		AmpOff(KBottom);
 		AmpOn(KTop, KAnalog);
 		}
 	}
+
+static TInt RouteOf(TInt aArg) { return aArg == ESpeaker || aArg == EBottom ? aArg : ERoute; }
+static const char* RouteName() { return Route == ESpeaker ? "speaker" : Route == EBottom ? "bottom" : "earpiece"; }
 
 static TInt Start(TInt aRoute)
 	{
@@ -404,7 +412,7 @@ static TInt Start(TInt aRoute)
 	Reg(KLpi + 0x1000 * 9) = 0xcc;
 	Reg(KLpi + 0x1000 * 10) = 0xd0;
 	Reg(KLpi + 0x1000 * 11) = 0xc8;
-	Route = aRoute == ESpeaker ? ESpeaker : ERoute;
+	Route = RouteOf(aRoute);
 	Amps();
 	// the mic: PLL1 LDO + PLL1, the ADC clocks, PLL1's LDO, DMIC clock = 12.288 MHz / 4, the bias, then unmute
 	RtUpd(0x2008, 0x00050000, 0x00050000);
@@ -414,7 +422,7 @@ static TInt Start(TInt aRoute)
 	MicBias(ETrue);
 	RtMute();
 	Running = ETrue;
-	Kern::Printf("[audio] on: %s, volume %d%s; i2c faults %d", Route == ESpeaker ? "speaker" : "earpiece", Volume,
+	Kern::Printf("[audio] on: %s, volume %d%s; i2c faults %d", RouteName(), Volume,
 		MicMuted ? ", mic muted" : "", Faults);
 	return KErrNone;
 	}
@@ -447,7 +455,7 @@ static TInt Control(TInt aOp, TInt aArg)
 		Stop();
 		return KErrNone;
 	case 3:
-		Route = aArg == ESpeaker ? ESpeaker : ERoute;
+		Route = RouteOf(aArg);
 		if (Running)
 			Amps();
 		return KErrNone;
@@ -455,8 +463,9 @@ static TInt Control(TInt aOp, TInt aArg)
 		Volume = Max(0, Min(10, aArg));
 		if (Running)
 			{
-			AmpGain(KTop, KAnalog);
-			if (Route == ESpeaker)
+			if (Route != EBottom)
+				AmpGain(KTop, KAnalog);
+			if (Route != ERoute)
 				AmpGain(KBottom, KAnalog);
 			}
 		return KErrNone;
@@ -495,7 +504,7 @@ void A64Audio_Report(void (*aSay)(const char*, ...))
 		R32(KBottom, 0x482c, b[2]);
 		}
 	aSay("audio: probe %d, %s, %s, volume %d%s; top %x rev %x, bottom rev %x, mic %08x; i2c faults %d",
-		Probed ? ProbeErr : 1, Running ? "on" : "off", Route == ESpeaker ? "speaker" : "earpiece", Volume,
+		Probed ? ProbeErr : 1, Running ? "on" : "off", RouteName(), Volume,
 		MicMuted ? ", mic muted" : "", AmpId[0], AmpRev[0], AmpRev[1], RtId, Faults);
 	aSay("audio: top PWR_CTRL2 %08x PWR_CTRL3 %08x INT1 %08x; mic DOWNFILTER0 %08x", v[0], v[1], v[2], v[3]);
 	aSay("audio: bottom PWR_CTRL2 %08x INT1 %08x RX slot %x", b[0], b[1], b[2]);
@@ -514,7 +523,7 @@ static TA64DevState AudioStatus(TDes8& aDetail)
 		return EA64DevError;
 		}
 	A64Device_Format(aDetail, "2x CS35L36 amps, RT5514 mic; %s, %s, volume %d%s; I2C faults %d", Running ? "on" : "off",
-		Route == ESpeaker ? "loudspeaker" : "earpiece", Volume, MicMuted ? ", mic muted" : "", Faults);
+		RouteName(), Volume, MicMuted ? ", mic muted" : "", Faults);
 	return Faults ? EA64DevPartial : EA64DevOk;
 	}
 A64_DEVICE("audio", "Audio amps and mic", "a64_audio", AudioStatus);

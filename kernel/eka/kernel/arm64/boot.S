@@ -129,6 +129,8 @@ A64_ApEntry:
 	isb
 	msr	pan, #0
 	msr	sctlr_el1, x4
+	mov	x8, #(3 << 20)			// CPACR_EL1.FPEN: FP/SIMD for AArch32 EL0, as on the boot CPU (a64boot.cpp)
+	msr	cpacr_el1, x8
 	isb
 	mov	sp, x5
 	mov	x0, x7

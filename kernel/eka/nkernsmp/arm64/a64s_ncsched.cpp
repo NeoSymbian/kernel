@@ -557,7 +557,7 @@ TInt NThread::Create(SNThreadCreateInfo& aInfo, TBool aInitial)
     return KErrNone;
     }
 
-void NThread::CompleteContextSave() {}                 /* A64_TODO (lazy VFP flush, full kernel) */
+void NThread::CompleteContextSave() {}                 /* nothing to flush: the VFP state is saved eagerly (a64e_nkern.cpp) */
 void NThread::GetUserContext(TArmRegSet&, TUint32&) {}  /* A64_TODO (full kernel: from SThreadExcStack) */
 void NThread::SetUserContext(const TArmRegSet&, TUint32&) {}
 void NThread::GetSystemContext(TArmRegSet&, TUint32&) {}

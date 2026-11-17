@@ -149,6 +149,8 @@ extern "C" void A64_RaiseSgi(TUint32 aIntId)
 	}
 
 /* ---- IRQ ----------------------------------------------------------------------------------------------- */
+// the full kernel feeds each interrupt's timing to the secure RNG (a64e_nkern.cpp); the nanokernel image has no RNG
+extern "C" __attribute__((weak)) void A64_IrqEntropy() {}
 extern "C" void A64_Irq(SThreadExcStack* aF)
 	{
 	TSubScheduler& ss = SubScheduler();
@@ -174,6 +176,7 @@ extern "C" void A64_Irq(SThreadExcStack* aF)
 			(*SpiBindings[id].iIsr)(SpiBindings[id].iPtr);
 		// TRANSFERRED_IRQ_VECTOR: the tail below runs the events
 		}
+	A64_IrqEntropy();						// still in interrupt context (nest count >= 0)
 	if (--ss.iSSX.iIrqNestCount >= 0)
 		return;
 	if (ss.iEventHandlersPending)

@@ -372,6 +372,9 @@ __attribute__((weak)) void A64StartReboot() {}
 __attribute__((weak)) void A64StartUsbConsole() {}
 // qcom_cpufreq.cpp on the Pixel: CPU and L3 clocks with touch boost (smooth-ui S3c)
 __attribute__((weak)) void A64StartCpufreq() {}
+// qcom_telhal.cpp on the Pixel: the SoC's PRNG seeds the secure RNG (WB1); elsewhere interrupt timing does it alone
+__attribute__((weak)) void A64SeedEntropy() {}
+extern "C" volatile TBool A64_IrqEntropyOn;				// a64e_nkern.cpp
 
 // The one kernel extension the ROM must carry (P::StartExtensions sizes an RArray by the count: zero panics).
 extern "C" TInt A64ExtensionEntry(TInt aReason)
@@ -391,6 +394,8 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	Kern::Printf("[ram] %d MB in %d banks", total >> 20, n);
 	}
 	A64StartBuses();
+	A64_IrqEntropyOn = ETrue;							// the secure RNG exists now (K::Init3): feed it
+	A64SeedEntropy();
 	A64StartCpufreq();									// before the input drivers: their events boost the clocks
 	A64StartDisplay();									// the screen's HAL, for the window server
 	A64StartSerialKeyboard();

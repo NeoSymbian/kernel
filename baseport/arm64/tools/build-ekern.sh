@@ -70,6 +70,10 @@ $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_blk.cpp" -o "$I/a64_blk.o"
 $EKXX $DEFS $INCS $MED $PRE -c "$BSP/common/specific/a64_media.cpp" -o "$I/a64_media.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_display.cpp" -o "$I/a64_display.o"
 $EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_devices.cpp" -o "$I/a64_devices.o"	# HAL 0x4e19
+# Symbian's pipe LDD (RPipe, P.I.P.S. pipe(): browser WB2d), entry points renamed; a64_pipe.cpp installs it
+$EKXX $DEFS $INCS $PRE -I "$EKA/include/drivers" -DInitExtension=InitExtension_pipe -DKernelModuleEntry=KernelModuleEntry_pipe \
+	-DCreateLogicalDevice=CreateLogicalDevice_pipe -c "$EKA/drivers/pipe/dpipe.cpp" -o "$I/dpipe.o"
+$EKXX $DEFS $INCS $PRE -c "$BSP/common/specific/a64_pipe.cpp" -o "$I/a64_pipe.o"
 $EKXX $DEFS $INCS $PRE -Dprivate=public -Dprotected=public \
 	-c "$BSP/common/specific/a64_dbgmon.cpp" -o "$I/a64_dbgmon.o"	# the debug monitor; its thread dump reads scheduler internals
 # the board's own kernel extensions and drivers (its variant.conf: variant_drivers)

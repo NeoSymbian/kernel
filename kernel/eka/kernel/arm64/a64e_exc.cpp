@@ -175,6 +175,7 @@ static void SetUser(TAny* aDest, TUint8 aValue, TInt aLength)
 
 extern "C" {
 EXPORT_C void umemput(TAny* aUserAddr, const TAny* aKernAddr, TInt aLength)	{ CopyToUser(aUserAddr, aKernAddr, aLength); }
+EXPORT_C void umemget(TAny* aKernAddr, const TAny* aUserAddr, TInt aLength)	{ CopyFromUser(aKernAddr, aUserAddr, aLength); }	// the pipe LDD (WB2d)
 
 EXPORT_C void kumemget(TAny* aKernAddr, const TAny* aAddr, TInt aLength)
 	{

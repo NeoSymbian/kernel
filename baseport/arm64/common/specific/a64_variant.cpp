@@ -356,6 +356,7 @@ static TInt ProbeThread(TAny*)
 
 void A64StartMedia();									// a64_media.cpp
 void A64StartDisplay();									// a64_display.cpp
+void A64StartPipe();									// a64_pipe.cpp: the pipe LDD (RPipe, P.I.P.S. pipe())
 // Board/ASSP buses, before any peripheral starts using them (SDM670: SPMI).
 __attribute__((weak)) void A64StartBuses() {}
 // a64_serialkbd.cpp on QEMU virt; boards without a serial keyboard keep this
@@ -400,6 +401,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 	A64StartDisplay();									// the screen's HAL, for the window server
 	A64StartSerialKeyboard();
 	A64StartDebugSerial();
+	A64StartPipe();
 	A64StartKeys();
 	A64StartTouch();
 	A64StartReboot();

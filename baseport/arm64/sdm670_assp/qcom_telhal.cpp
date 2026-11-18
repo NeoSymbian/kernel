@@ -32,9 +32,10 @@
 //   C7 (calls): 0x4e24 RprocStop SIo{a = mask 1 MSS, 2 ADSP}, asynchronous; poll 0x4e25 RprocState
 //                      [phase, error, mss_gen, adsp_gen], phase 0 idle, 1 stopping, 2 stopped, 3 failed (never reload
 //                      after 3 until a later stop succeeds).
-//                      0x4e26 AudioMem SIo: 0 info -> {b = phys, len = 64 KiB, buf = adsp_gen}; 1 copy {b = offset,
-//                      len, buf}; 2 publish -> {b = ticket, len = 64 KiB, buf = adsp_gen}; 3 complete {b = ticket,
-//                      buf = adsp_gen} after the DSP is done.
+//                      0x4e26 AudioMem SIo: 0 info -> {b = phys, len = 256 KiB, buf = adsp_gen}; 1 copy in {b =
+//                      offset, len, buf}; 2 publish {b = offset, len (0 = all)} -> {b = ticket, len, buf = adsp_gen};
+//                      3 complete {b = ticket, buf = adsp_gen} after the DSP is done; 4 copy out {b = offset, len,
+//                      buf}. Up to 16 ranges are published at once; copies refuse a published range (KErrInUse).
 //                      0x4e27 Haptic SIo{a = ms 0..2000, b = amplitude 0..127}; zero stops, a timer bounds each pulse.
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
@@ -422,13 +423,25 @@ static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 	}
 
 // One bounded physical region retained for this boot. The daemon owns ASM map/write acknowledgements;
-// a published region cannot be overwritten until its exact ticket is completed or PAS shutdown succeeds.
+// a published range cannot be overwritten (or read) until its exact ticket is completed or PAS shutdown succeeds.
+// NeoSymbian audio A2 (docs/audio.md): ranges are published separately, so media periods stream while others are
+// the ADSP's; publishing length 0 is the whole region (the ringtone, as before).
 const TUint32 KAudioBytes = 0x40000;					// telephony apr::RING_REGION: a 2 s 48 kHz ringtone (192,000 bytes)
 static TPhysAddr AudioPhys;
 static DPlatChunkHw* AudioChunk;
-static TUint32 AudioTicket, AudioGeneration;
-static TBool AudioBusy;
+static TUint32 AudioTicket;
+struct SAudioPub { TUint32 iOff, iLen, iTicket, iGen; };	// iLen 0 = a free entry
+const TInt KAudioPubs = 16;
+static SAudioPub AudioPubs[KAudioPubs];
 static TBool AudioSmmu;
+// whether [aOff, aOff + aLen) overlaps a published range (AudioLock held)
+static TBool AudioBusyAt(TUint32 aOff, TUint32 aLen)
+	{
+	for (TInt i = 0; i < KAudioPubs; ++i)
+		if (AudioPubs[i].iLen && aOff < AudioPubs[i].iOff + AudioPubs[i].iLen && AudioPubs[i].iOff < aOff + aLen)
+			return ETrue;
+	return EFalse;
+	}
 static DMutex* AudioLock;
 // The ADSP reads the region by DMA through the apps SMMU on stream 0x1801 (DTB q6asm-dais iommus <&apps_smmu 0x1801
 // 0>). Unmapped, that stream faults (sCR0.USFCFG = 1) and the ringtone's first ASM write froze the whole phone
@@ -441,18 +454,20 @@ static TInt AudioMem(SIo& aIo)
 	if (r != KErrNone)
 		return r;
 	// op 1's bytes come from the caller first, outside any critical section or lock: kumemget may fault on a bad
-	// pointer, which must not happen holding AudioLock (the kernel's rule for kumemget)
+	// pointer, which must not happen holding AudioLock (the kernel's rule for kumemget); op 4's go out after it
 	TUint8* copy = NULL;
-	if (aIo.iA == 1)
-		{
+	if (aIo.iA == 1 || aIo.iA == 2 || aIo.iA == 4)
 		if (aIo.iB > KAudioBytes || aIo.iLen > KAudioBytes - aIo.iB)
 			return KErrArgument;
+	if (aIo.iA == 1 || aIo.iA == 4)
+		{
 		NKern::ThreadEnterCS();
 		copy = (TUint8*)Kern::Alloc(aIo.iLen ? aIo.iLen : 1);
 		NKern::ThreadLeaveCS();
 		if (!copy)
 			return KErrNoMemory;
-		kumemget(copy, (const TAny*)aIo.iBuf, aIo.iLen);
+		if (aIo.iA == 1)
+			kumemget(copy, (const TAny*)aIo.iBuf, aIo.iLen);
 		}
 	NKern::ThreadEnterCS();
 	Kern::MutexWait(*AudioLock);
@@ -484,37 +499,65 @@ static TInt AudioMem(SIo& aIo)
 			aIo.iLen = KAudioBytes;
 			aIo.iBuf = Generations[1];
 			break;
-		case 1:
-			if (AudioBusy)
+		case 1:											// copy in: iB offset, iLen bytes from iBuf
+			if (AudioBusyAt(aIo.iB, aIo.iLen))
 				r = KErrInUse;
 			else
 				memcpy((TUint8*)AudioChunk->LinearAddress() + aIo.iB, copy, aIo.iLen);
 			break;
-		case 2:
-			if (AudioBusy)
+		case 2:											// publish iB offset, iLen bytes (0: all) -> ticket, length, generation
+			{
+			TUint32 off = aIo.iLen ? aIo.iB : 0, len = aIo.iLen ? aIo.iLen : KAudioBytes;
+			TInt e = 0;
+			while (e < KAudioPubs && AudioPubs[e].iLen)
+				++e;
+			if (AudioBusyAt(off, len) || e == KAudioPubs)
 				r = KErrInUse;
 			else
 				{
 				__e32_memory_barrier(); // PCM reaches noncached DRAM before the daemon sends ASM WRITE
-				AudioBusy = ETrue;
-				AudioGeneration = Generations[1];
 				if (!++AudioTicket)
 					++AudioTicket;
+				AudioPubs[e].iOff = off;
+				AudioPubs[e].iLen = len;
+				AudioPubs[e].iTicket = AudioTicket;
+				AudioPubs[e].iGen = Generations[1];
 				aIo.iB = AudioTicket;
-				aIo.iLen = KAudioBytes;
-				aIo.iBuf = AudioGeneration;
+				aIo.iLen = len;
+				aIo.iBuf = Generations[1];
 				}
 			break;
-		case 3:
-			if (!AudioBusy || aIo.iB != AudioTicket || aIo.iBuf != AudioGeneration || aIo.iBuf != Generations[1])
-				r = KErrNotReady;
+			}
+		case 3:											// complete: iB ticket, iBuf generation
+			{
+			r = KErrNotReady;
+			for (TInt e = 0; e < KAudioPubs; ++e)
+				if (AudioPubs[e].iLen && AudioPubs[e].iTicket == aIo.iB && AudioPubs[e].iGen == aIo.iBuf
+					&& aIo.iBuf == Generations[1])
+					{
+					AudioPubs[e].iLen = 0;
+					r = KErrNone;
+					break;
+					}
+			break;
+			}
+		case 4:											// copy out (recording): iB offset, iLen bytes to iBuf
+			if (AudioBusyAt(aIo.iB, aIo.iLen))
+				r = KErrInUse;
 			else
-				AudioBusy = EFalse;
+				{
+				__e32_memory_barrier(); // the ADSP's writes to noncached DRAM before reading them
+				memcpy(copy, (TUint8*)AudioChunk->LinearAddress() + aIo.iB, aIo.iLen);
+				}
 			break;
 		default:
 			r = KErrArgument;
 			}
 	Kern::MutexSignal(*AudioLock);
+	NKern::ThreadLeaveCS();
+	if (r == KErrNone && aIo.iA == 4)
+		kumemput((TAny*)aIo.iBuf, copy, aIo.iLen);
+	NKern::ThreadEnterCS();
 	Kern::Free(copy);
 	NKern::ThreadLeaveCS();
 	return r;
@@ -596,7 +639,8 @@ static void StopDfcFn(TAny*)
 				NKern::ThreadEnterCS();
 				Kern::MutexWait(*AudioLock);
 				++Generations[1];
-				AudioBusy = EFalse; // successful PAS shutdown is the DSP ownership boundary
+				for (TInt e = 0; e < KAudioPubs; ++e)
+					AudioPubs[e].iLen = 0; // successful PAS shutdown is the DSP ownership boundary
 				Kern::MutexSignal(*AudioLock);
 				NKern::ThreadLeaveCS();
 				}

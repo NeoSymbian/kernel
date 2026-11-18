@@ -7,12 +7,15 @@
 //     ADSP's SECONDARY_TDM_RX (LPASS LPI pins gpio8-11), their PLLs locked to its 6.144 MHz bit clock;
 //   - the microphone: a DMIC through a Realtek RT5514 (I2C10 0x57) onto PRIMARY_TDM_TX (TLMM gpio65-68), its PLL
 //     from the bit clock too; the DMIC's supply is the PM660L analog codec's MIC BIAS 1 (SPMI SID 3, 0xf000).
-// Routes: earpiece = Top only, speaker = both amps, both at C1's live gain. Volume = the amps'
+// Routes: earpiece = Top only, speaker = both amps, bottom = Bottom only (media, docs/audio.md), all at C1's live gain. Volume = the amps'
 // digital volume, mute = the RT5514's ADC mute (no APR controls exist for these).
 // Register sequences from Linux cs35l36.c, rt5514.c, msm8916-wcd-analog.c and the sdm670 machine driver as the phone
 // ran them under C1 (docs/telephony.md C6); pins from pinctrl-sdm670(-lpass-lpi).c; clocks from gcc-sdm845.c.
 // Thread context (HAL Audio from MODEMD, the monitor's "audio").
-// shortcut: no amp interrupt handling (protection errors are only logged on start); no ACDB calibration.
+// Amp protection (docs/audio.md A7): no GPIO interrupts on this board yet, so op 7 polls the amps' IRQ lines (TLMM 80
+// Top, 79 Bottom, active-high); an asserted line's unmasked INT1 bits are cleared and that amp is switched off until
+// the next start. Mic select (op 6): the RT5514's stereo ADCs from DMIC1 (C1's) or DMIC2.
+// shortcut: polled, not an interrupt (MODEMD polls every 250 ms while audio runs); no ACDB calibration.
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "a64_mutex.h"
@@ -21,6 +24,11 @@
 #include "qcom_geni_i2c.h"
 #include "qcom_telhal.h"
 #include "a64_device.h"
+
+extern TInt A64Jack_Poll();
+extern TInt A64Jack_Play(TBool aOn);
+extern TInt A64Jack_Mic(TBool aOn);
+extern void A64Jack_Report(void (*aSay)(const char*, ...));
 
 static volatile TUint32& Reg(TUint32 aPhys) { return *(volatile TUint32*)A64_Io(aPhys); }
 
@@ -35,9 +43,11 @@ static volatile TUint32& Io(TUint32 aTile, TInt aPin) { return Reg(aTile + 0x100
 
 const TUint KTop = 0x40, KBottom = 0x41, KRt = 0x57;
 const TUint KPm660l = 3;									// the PM660L's second SPMI SID: its audio codec
-enum { ERoute = 0, ESpeaker = 1 };
+enum { ERoute = 0, ESpeaker = 1, EBottom = 2, ENone = 3 };	// ENone: both amps off (headphones), the mic on
 
 static TBool Probed, Running, MicMuted;
+static TInt MicSel;										// 0 DMIC1, 1 DMIC2
+static TUint32 AmpFaults[2], AmpFaultBits[2];
 static TInt Route = ERoute, Volume = 10;
 static TInt ProbeErr = KErrNotReady;
 static TUint32 AmpId[2], AmpRev[2], Faults;
@@ -270,6 +280,9 @@ static TInt RtProbe()
 	return KErrNone;
 	}
 
+// the stereo ADCs' DMIC mux (Stereo1/Stereo2 DMIC Mux: 0 DMIC1, 1 DMIC2)
+static void RtMicSel() { RtUpd(0x20a4, 0x3, MicSel ? 0x3 : 0); }
+
 static void RtMute()
 	{
 	RtUpd(0x2190, 0x80, MicMuted ? 0x80 : 0);
@@ -387,11 +400,27 @@ static void Amps()
 		AmpOn(KTop, KAnalog);
 		AmpOn(KBottom, KAnalog);
 		}
+	else if (Route == EBottom)
+		{
+		AmpOff(KTop);
+		AmpOn(KBottom, KAnalog);
+		}
+	else if (Route == ENone)
+		{
+		AmpOff(KTop);
+		AmpOff(KBottom);
+		}
 	else
 		{
 		AmpOff(KBottom);
 		AmpOn(KTop, KAnalog);
 		}
+	}
+
+static TInt RouteOf(TInt aArg) { return aArg == ESpeaker || aArg == EBottom || aArg == ENone ? aArg : ERoute; }
+static const char* RouteName()
+	{
+	return Route == ESpeaker ? "speaker" : Route == EBottom ? "bottom" : Route == ENone ? "no amps" : "earpiece";
 	}
 
 static TInt Start(TInt aRoute)
@@ -404,7 +433,7 @@ static TInt Start(TInt aRoute)
 	Reg(KLpi + 0x1000 * 9) = 0xcc;
 	Reg(KLpi + 0x1000 * 10) = 0xd0;
 	Reg(KLpi + 0x1000 * 11) = 0xc8;
-	Route = aRoute == ESpeaker ? ESpeaker : ERoute;
+	Route = RouteOf(aRoute);
 	Amps();
 	// the mic: PLL1 LDO + PLL1, the ADC clocks, PLL1's LDO, DMIC clock = 12.288 MHz / 4, the bias, then unmute
 	RtUpd(0x2008, 0x00050000, 0x00050000);
@@ -412,9 +441,10 @@ static TInt Start(TInt aRoute)
 	RtUpd(0x2264, 0x1, 0x1);
 	RtUpd(0x2104, 0x700, 0x200);
 	MicBias(ETrue);
+	RtMicSel();
 	RtMute();
 	Running = ETrue;
-	Kern::Printf("[audio] on: %s, volume %d%s; i2c faults %d", Route == ESpeaker ? "speaker" : "earpiece", Volume,
+	Kern::Printf("[audio] on: %s, volume %d%s; i2c faults %d", RouteName(), Volume,
 		MicMuted ? ", mic muted" : "", Faults);
 	return KErrNone;
 	}
@@ -435,6 +465,36 @@ static void Stop()
 	Kern::Printf("[audio] off");
 	}
 
+// the INT1 bits the driver unmasks (mask 0xf9ba7fff, as Linux): protection errors and warnings
+const TUint32 KAmpIrqBits = ~0xf9ba7fffu;
+
+// Op 7: a running amp whose IRQ line is up has a protection event: clear it, switch that amp off, count it.
+// Bit 0 = Top faulted, bit 1 = Bottom.
+static TInt CheckAmps()
+	{
+	if (!Running)
+		return 0;
+	TInt faulted = 0;
+	const TInt pins[2] = { 80, 79 };
+	const TUint devs[2] = { KTop, KBottom };
+	for (TInt i = 0; i < 2; ++i)
+		{
+		if (!(Io(KTlmmNorth, pins[i]) & 1))
+			continue;
+		TUint32 st = 0;
+		if (R32(devs[i], 0xd00000, st) != KErrNone || !(st & KAmpIrqBits))
+			continue;
+		W32(devs[i], 0xd00000, st & KAmpIrqBits);				// write-1-to-clear
+		AmpOff(devs[i]);
+		++AmpFaults[i];
+		AmpFaultBits[i] |= st & KAmpIrqBits;
+		faulted |= 1 << i;
+		Kern::Printf("[audio] %s amp protection event INT1 %08x: amp off until the next start (%d so far)",
+			i ? "bottom" : "top", st, AmpFaults[i]);
+		}
+	return faulted;
+	}
+
 static TInt Control(TInt aOp, TInt aArg)
 	{
 	switch (aOp)
@@ -447,7 +507,7 @@ static TInt Control(TInt aOp, TInt aArg)
 		Stop();
 		return KErrNone;
 	case 3:
-		Route = aArg == ESpeaker ? ESpeaker : ERoute;
+		Route = RouteOf(aArg);
 		if (Running)
 			Amps();
 		return KErrNone;
@@ -455,8 +515,9 @@ static TInt Control(TInt aOp, TInt aArg)
 		Volume = Max(0, Min(10, aArg));
 		if (Running)
 			{
-			AmpGain(KTop, KAnalog);
-			if (Route == ESpeaker)
+			if (Route == ERoute || Route == ESpeaker)
+				AmpGain(KTop, KAnalog);
+			if (Route == ESpeaker || Route == EBottom)
 				AmpGain(KBottom, KAnalog);
 			}
 		return KErrNone;
@@ -465,6 +526,21 @@ static TInt Control(TInt aOp, TInt aArg)
 		if (Running)
 			RtMute();
 		return KErrNone;
+	case 6:
+		if (aArg < 0 || aArg > 1)
+			return KErrArgument;
+		MicSel = aArg;
+		if (Running)
+			RtMicSel();
+		return KErrNone;
+	case 7:
+		return CheckAmps();
+	case 8:
+		return A64Jack_Poll();
+	case 9:
+		return A64Jack_Play(aArg != 0);
+	case 10:
+		return A64Jack_Mic(aArg != 0);
 		}
 	return KErrArgument;
 	}
@@ -495,10 +571,13 @@ void A64Audio_Report(void (*aSay)(const char*, ...))
 		R32(KBottom, 0x482c, b[2]);
 		}
 	aSay("audio: probe %d, %s, %s, volume %d%s; top %x rev %x, bottom rev %x, mic %08x; i2c faults %d",
-		Probed ? ProbeErr : 1, Running ? "on" : "off", Route == ESpeaker ? "speaker" : "earpiece", Volume,
+		Probed ? ProbeErr : 1, Running ? "on" : "off", RouteName(), Volume,
 		MicMuted ? ", mic muted" : "", AmpId[0], AmpRev[0], AmpRev[1], RtId, Faults);
 	aSay("audio: top PWR_CTRL2 %08x PWR_CTRL3 %08x INT1 %08x; mic DOWNFILTER0 %08x", v[0], v[1], v[2], v[3]);
 	aSay("audio: bottom PWR_CTRL2 %08x INT1 %08x RX slot %x", b[0], b[1], b[2]);
+	aSay("audio: mic DMIC%d; amp protection events: top %d (%08x), bottom %d (%08x)", MicSel + 1, AmpFaults[0],
+		AmpFaultBits[0], AmpFaults[1], AmpFaultBits[1]);
+	A64Jack_Report(aSay);
 	}
 
 static TA64DevState AudioStatus(TDes8& aDetail)
@@ -513,8 +592,14 @@ static TA64DevState AudioStatus(TDes8& aDetail)
 		A64Device_Format(aDetail, "probe failed: %d; I2C faults %d", ProbeErr, Faults);
 		return EA64DevError;
 		}
+	if (AmpFaults[0] || AmpFaults[1])
+		{
+		A64Device_Format(aDetail, "amp protection events: top %d, bottom %d (amp off until the next start)",
+			AmpFaults[0], AmpFaults[1]);
+		return EA64DevPartial;
+		}
 	A64Device_Format(aDetail, "2x CS35L36 amps, RT5514 mic; %s, %s, volume %d%s; I2C faults %d", Running ? "on" : "off",
-		Route == ESpeaker ? "loudspeaker" : "earpiece", Volume, MicMuted ? ", mic muted" : "", Faults);
+		RouteName(), Volume, MicMuted ? ", mic muted" : "", Faults);
 	return Faults ? EA64DevPartial : EA64DevOk;
 	}
 A64_DEVICE("audio", "Audio amps and mic", "a64_audio", AudioStatus);

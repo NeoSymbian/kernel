@@ -507,6 +507,7 @@ static TBool NotifyDue;											// a frame was queued or the link changed
 static TUint32 HandshakeAt;										// tick count when the handshake began
 // set by the rx handlers (this thread), read by Join/Teardown
 static TBool StartRespGot, VdevStoppedGot, PeerMapped, PeerUnmapped, AuthDone, AssocDone, LostWanted, AbortWanted;
+static TBool BmissWanted, ProbeDone;					// a beacon miss to check, the AP's probe response
 static TInt StartStatus;
 static TUint16 AuthStatus, AssocStatus, AssocAid, AssocCap, LostReason, PeerId;
 static TUint32 KeyAcks;
@@ -638,6 +639,8 @@ static void MgmtRx(const TUint8* p, TInt n)
 			AssocCap = G16(body), AssocStatus = G16(body + 2), AssocAid = G16(body + 4) & 0x7ff, AssocDone = ETrue;
 		else if ((frame[0] == 0xc0 || frame[0] == 0xa0) && blen >= 2)	// Deauthentication, Disassociation
 			LostReason = G16(body), LostWanted = ETrue;
+		else if (frame[0] == 0x50)								// Probe Response: the AP is still there
+			ProbeDone = ETrue;
 		if (frame[0] != 0x80 && frame[0] != 0x50)
 			Kern::Printf("[wifi] mgmt %02x from the AP, %d bytes", frame[0], buflen);
 		}
@@ -867,7 +870,7 @@ static void WmiEvent(const TUint8* p, TInt n)
 		{
 		while (NextTlv(p, n, at, tag, v, len))
 			if (tag == 48 && len >= 12 && G32(v + 4) == 2 && Link >= ELinkHandshake)
-				LostReason = 4, LostWanted = ETrue;				// 802.11 reason 4 (inactivity) stands in for it
+				BmissWanted = ETrue;							// Serve() probes the AP before giving up
 		}
 	else if (id == 0x7006)										// MGMT_TX_COMPLETION {desc_id, status, ...}
 		{
@@ -1152,6 +1155,8 @@ static struct { TInt iOp; TUint32 iSeq; TBool iDone; TInt iResult; TInt iLen; TU
 
 static TInt PostReq(TInt aOp, const TUint8* aData, TInt aLen)
 	{
+	if (ModemDown)
+		return KErrNotReady;									// the driver thread let go: nobody would answer
 	NKern::FMWait(&LinkLock);
 	if (Req.iOp != EReqNone)
 		{
@@ -1648,7 +1653,7 @@ static void Teardown(TInt aState, TUint16 aStatus, TUint16 aReason, TBool aDeaut
 			WaitFlag(VdevStoppedGot, 2000, EFalse);
 		VdevStarted = EFalse;
 		}
-	PtkInstalled = LostWanted = AbortWanted = EFalse;
+	PtkInstalled = LostWanted = AbortWanted = BmissWanted = EFalse;
 	for (TInt i = 0; i < KTxSlots; ++i)
 		TxBusy[i] = EFalse;
 	SetLink(aState, aStatus, aReason);
@@ -1671,6 +1676,31 @@ static TBool MgmtExchange(TInt aLen, volatile TBool& aDone)
 		if (MgmtTx(Frame, aLen) == KErrNone)
 			WaitFlag(aDone, 1000, ETrue);
 	return aDone;
+	}
+
+// the firmware missed the AP's beacons (ROAM reason 2): one miss is no proof the AP is gone, so ask it with a unicast
+// probe request, as mac80211 does, and leave only if it never answers
+static void ProbeAp()
+	{
+	BmissWanted = ProbeDone = EFalse;
+	TInt n = MgmtHdr(0x40);
+	Frame[n++] = 0;												// SSID
+	Frame[n++] = Target.iSsidLen;
+	memcpy(Frame + n, Target.iSsid, Target.iSsidLen);
+	n += Target.iSsidLen;
+	TUint8 rates[12];
+	TInt nr = Min(CommonRates(rates), 8);
+	Frame[n++] = 1;												// Supported Rates
+	Frame[n++] = (TUint8)nr;
+	memcpy(Frame + n, rates, nr);
+	n += nr;
+	if (MgmtExchange(n, ProbeDone))
+		Kern::Printf("[wifi] beacon miss: the AP answered");
+	else if (!LostWanted && !AbortWanted && !Error)
+		{
+		Kern::Printf("[wifi] beacon miss: no answer from the AP");
+		LostReason = 4, LostWanted = ETrue;						// 802.11 reason 4 (inactivity) stands in for it
+		}
 	}
 
 // the whole join, on this thread (spec 1): vdev start, peer, auth, assoc, peer assoc, vdev up. A scan finishes first.
@@ -1998,7 +2028,7 @@ static void Irqs1(TBool aOn)
 // the firmware went with the modem: forget what it held, so a WlanStart after the restart brings it up from scratch
 static void Forget()
 	{
-	PeerUp = PeerMapped = VdevStarted = VdevUp = PtkInstalled = LostWanted = AbortWanted = EFalse;
+	PeerUp = PeerMapped = VdevStarted = VdevUp = PtkInstalled = LostWanted = AbortWanted = BmissWanted = EFalse;
 	for (TInt i = 0; i < KTxSlots; ++i)
 		TxBusy[i] = EFalse;
 	memclr(Svc, sizeof(Svc));
@@ -2061,6 +2091,8 @@ static void Serve()
 			}
 		ServeReq();
 		DrainTx();
+		if (BmissWanted && !LostWanted && Link >= ELinkHandshake && Link <= ELinkConnected)
+			ProbeAp();
 		if (LostWanted && Link >= ELinkJoining && Link <= ELinkConnected)
 			Teardown(ELinkLost, 0, LostReason, EFalse);
 		if (Link == ELinkHandshake && NKern::TickCount() - HandshakeAt > 15000)
@@ -2246,11 +2278,9 @@ static TA64DevState WifiStatus(TDes8& aDetail)
 	A64Device_Format(aDetail, "WCN3990 %s", KSteps[Step]);
 	if (Error)
 		A64Device_Format(aDetail, ", error %d", Error);
-	if (Step >= 7)
-		A64Device_Format(aDetail, ", %d scans, %d networks", Scans, NumResults);
-	if (Step == 6)
-		A64Device_Format(aDetail, ", MAC %02x:%02x:%02x:%02x:%02x:%02x", Mac[0], Mac[1], Mac[2], Mac[3], Mac[4],
-			Mac[5]);
+	if (Step >= 7)												// READY's MAC is zero (none stored): ours
+		A64Device_Format(aDetail, ", %d scans, %d networks, MAC %02x:%02x:%02x:%02x:%02x:%02x", Scans, NumResults,
+			HostMac[0], HostMac[1], HostMac[2], HostMac[3], HostMac[4], HostMac[5]);
 	return Error ? EA64DevError : Step >= 6 ? EA64DevPartial : Step ? EA64DevStarting : EA64DevOff;
 	}
 A64_DEVICE("wifi", "WCN3990 Wi-Fi", "qcom_wcn3990", WifiStatus);

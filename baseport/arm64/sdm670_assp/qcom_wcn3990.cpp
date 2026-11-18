@@ -507,7 +507,8 @@ static TBool NotifyDue;											// a frame was queued or the link changed
 static TUint32 HandshakeAt;										// tick count when the handshake began
 // set by the rx handlers (this thread), read by Join/Teardown
 static TBool StartRespGot, VdevStoppedGot, PeerMapped, PeerUnmapped, AuthDone, AssocDone, LostWanted, AbortWanted;
-static TBool BmissWanted, ProbeDone;					// a beacon miss to check, the AP's probe response
+static TBool BmissWanted, ProbeDone;
+static TUint32 LastHttAt;										// tick of the last HTT rx indication (beacon-miss diagnosis)					// a beacon miss to check, the AP's probe response
 static TInt StartStatus;
 static TUint16 AuthStatus, AssocStatus, AssocAid, AssocCap, LostReason, PeerId;
 static TUint32 KeyAcks;
@@ -796,6 +797,7 @@ static void HttRx(const TUint8* p, TInt n)
 		if (phys < HttBufPhys || phys >= HttBufPhys + KHttBufs * KHttBuf || (phys - HttBufPhys) % KHttBuf)
 			continue;											// not one of ours
 		++HttFrames;
+		LastHttAt = NKern::TickCount();
 		static TUint32 bw[KHttBuf / 4];
 		TUint8* b = (TUint8*)bw;
 		FromDev(b, HttBufs + (phys - HttBufPhys), KHttBuf);
@@ -1683,6 +1685,8 @@ static TBool MgmtExchange(TInt aLen, volatile TBool& aDone)
 static void ProbeAp()
 	{
 	BmissWanted = ProbeDone = EFalse;
+	Kern::Printf("[wifi] beacon miss: rx data %d, HTT frames %d, last HTT %d ms ago, %d interrupts", RxData, HttFrames,
+		NKern::TickCount() - LastHttAt, Irqs);
 	TInt n = MgmtHdr(0x40);
 	Frame[n++] = 0;												// SSID
 	Frame[n++] = Target.iSsidLen;

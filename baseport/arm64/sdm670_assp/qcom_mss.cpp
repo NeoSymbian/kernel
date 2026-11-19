@@ -486,7 +486,7 @@ static TInt Boot()
 			break;
 		NKern::Sleep(NKern::TimerTicks(1));
 		}
-	if (!(v & KMssReady))
+	if (!(v & KMssReady) || (v & KMssFatal))
 		{
 		TUint32 len = 0;
 		const char* why = (const char*)Smem_Get(KSmemHostGlobal, 421, &len);	// SMEM_SSR_REASON_MSS0
@@ -513,6 +513,8 @@ static TInt Boot()
 	Kern::Printf("[mss] after %d ms: slave-kernel %08x%s", i, v, v & KMssHandover ? " (handover)" : "");
 	if (v & KMssHandover)
 		ReleaseProxy();
+	if (v & KMssFatal)
+		return Fail(Step, KErrDied, "crashed before handover");
 	return KErrNone;
 	}
 

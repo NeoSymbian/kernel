@@ -507,6 +507,10 @@ static TBool NotifyDue;											// a frame was queued or the link changed
 static TUint32 HandshakeAt;										// tick count when the handshake began
 // set by the rx handlers (this thread), read by Join/Teardown
 static TBool StartRespGot, VdevStoppedGot, PeerMapped, PeerUnmapped, AuthDone, AssocDone, LostWanted, AbortWanted;
+static TBool BmissWanted, ProbeDone;					// a beacon miss to check, the AP's probe response
+static TUint32 LastHttAt;										// tick of the last HTT rx indication
+// beacon-miss diagnosis (docs known-issues): every HTT message by type, the rx records, and buffer ownership
+static TUint32 HttType[32], HttTypeAt[32], IndDeclared, IndRejected, HttPosted, HttReturned;
 static TInt StartStatus;
 static TUint16 AuthStatus, AssocStatus, AssocAid, AssocCap, LostReason, PeerId;
 static TUint32 KeyAcks;
@@ -638,6 +642,8 @@ static void MgmtRx(const TUint8* p, TInt n)
 			AssocCap = G16(body), AssocStatus = G16(body + 2), AssocAid = G16(body + 4) & 0x7ff, AssocDone = ETrue;
 		else if ((frame[0] == 0xc0 || frame[0] == 0xa0) && blen >= 2)	// Deauthentication, Disassociation
 			LostReason = G16(body), LostWanted = ETrue;
+		else if (frame[0] == 0x50)								// Probe Response: the AP is still there
+			ProbeDone = ETrue;
 		if (frame[0] != 0x80 && frame[0] != 0x50)
 			Kern::Printf("[wifi] mgmt %02x from the AP, %d bytes", frame[0], buflen);
 		}
@@ -648,7 +654,10 @@ static void MgmtRx(const TUint8* p, TInt n)
 
 // ---- W3b: the HTT rx ring (private/wifi/w3b-htt-rx-spec.md). The firmware's MAC rx ring is fed from these buffers;
 // without them it receives (CHAN_INFO shows it) but has nowhere to put a frame, beacons included.
-const TInt KHttRing = 2048, KHttBufs = 128, KHttBuf = 2048;
+// 1024 buffers: with 128 the firmware stopped receiving for good after ~150 rx records, whatever the time or traffic,
+// and the link died as a beacon miss ("reason 4", phone 2026-11-19, docs known-issues). ath10k keeps 2047 in this ring.
+// shortcut: 1024 held 3600+ records and floods; move to ath10k's 2047 (6 MB pool) if a stall comes back
+const TInt KHttRing = 2048, KHttBufs = 1024, KHttBuf = 2048;
 static volatile TUint32* HttRing;		// KHttRing x le64 buffer addresses
 static volatile TUint32* HttIdx;		// alloc_idx: the firmware reads it
 static TPhysAddr HttRingPhys, HttIdxPhys, HttBufPhys, BankPhys;
@@ -659,6 +668,7 @@ static void HttPost(TPhysAddr aPhys)
 	{
 	TUint32 i = *HttIdx & (KHttRing - 1);
 	((volatile TUint32*)(HttBufs + (aPhys - HttBufPhys)))[1] = 0;	// the attention word: not done
+	++HttPosted;
 	HttRing[2 * i] = aPhys;
 	HttRing[2 * i + 1] = 0;
 	__e32_memory_barrier();
@@ -752,6 +762,8 @@ static void DataIn(const TUint8* f, TInt aLen, TBool aBad)
 // one HTT message from the target (CE1/9/10 by HTC endpoint, CE5 with its 8-byte header stripped)
 static void HttRx(const TUint8* p, TInt n)
 	{
+	if (n > 0)
+		++HttType[p[0] & 31], HttTypeAt[p[0] & 31] = NKern::TickCount();
 	if (n < 4)
 		return;
 	if (p[0] == 0x03 && n >= 10)								// PEER_MAP {type, vdev, peer_id, addr} (W4)
@@ -786,13 +798,18 @@ static void HttRx(const TUint8* p, TInt n)
 		}
 	TBool offload = p[1] & 0x20;
 	TInt count = G16(p + 6);
+	IndDeclared += count;
 	for (TInt i = 0; i < count && 8 + 12 * i + 12 <= n; ++i)
 		{
 		TPhysAddr phys = G32(p + 8 + 12 * i);
 		TInt len = G16(p + 16 + 12 * i);
 		if (phys < HttBufPhys || phys >= HttBufPhys + KHttBufs * KHttBuf || (phys - HttBufPhys) % KHttBuf)
+			{
+			++IndRejected;
 			continue;											// not one of ours
-		++HttFrames;
+			}
+		++HttFrames, ++HttReturned;
+		LastHttAt = NKern::TickCount();
 		static TUint32 bw[KHttBuf / 4];
 		TUint8* b = (TUint8*)bw;
 		FromDev(b, HttBufs + (phys - HttBufPhys), KHttBuf);
@@ -867,7 +884,7 @@ static void WmiEvent(const TUint8* p, TInt n)
 		{
 		while (NextTlv(p, n, at, tag, v, len))
 			if (tag == 48 && len >= 12 && G32(v + 4) == 2 && Link >= ELinkHandshake)
-				LostReason = 4, LostWanted = ETrue;				// 802.11 reason 4 (inactivity) stands in for it
+				BmissWanted = ETrue;							// Serve() probes the AP before giving up
 		}
 	else if (id == 0x7006)										// MGMT_TX_COMPLETION {desc_id, status, ...}
 		{
@@ -1152,6 +1169,8 @@ static struct { TInt iOp; TUint32 iSeq; TBool iDone; TInt iResult; TInt iLen; TU
 
 static TInt PostReq(TInt aOp, const TUint8* aData, TInt aLen)
 	{
+	if (ModemDown)
+		return KErrNotReady;									// the driver thread let go: nobody would answer
 	NKern::FMWait(&LinkLock);
 	if (Req.iOp != EReqNone)
 		{
@@ -1648,7 +1667,7 @@ static void Teardown(TInt aState, TUint16 aStatus, TUint16 aReason, TBool aDeaut
 			WaitFlag(VdevStoppedGot, 2000, EFalse);
 		VdevStarted = EFalse;
 		}
-	PtkInstalled = LostWanted = AbortWanted = EFalse;
+	PtkInstalled = LostWanted = AbortWanted = BmissWanted = EFalse;
 	for (TInt i = 0; i < KTxSlots; ++i)
 		TxBusy[i] = EFalse;
 	SetLink(aState, aStatus, aReason);
@@ -1671,6 +1690,50 @@ static TBool MgmtExchange(TInt aLen, volatile TBool& aDone)
 		if (MgmtTx(Frame, aLen) == KErrNone)
 			WaitFlag(aDone, 1000, ETrue);
 	return aDone;
+	}
+
+// the firmware missed the AP's beacons (ROAM reason 2): one miss is no proof the AP is gone, so ask it with a unicast
+// probe request, as mac80211 does, and leave only if it never answers
+static void ProbeAp()
+	{
+	BmissWanted = ProbeDone = EFalse;
+	TUint32 now = NKern::TickCount();
+	Kern::Printf("[wifi] beacon miss: rx data %d, HTT frames %d, last HTT %d ms ago, %d interrupts", RxData, HttFrames,
+		now - LastHttAt, Irqs);
+	Kern::Printf("[wifi] miss: rx records declared %d rejected %d; HTT buffers posted %d returned %d (held %d)",
+		IndDeclared, IndRejected, HttPosted, HttReturned, HttPosted - HttReturned);
+	for (TInt t = 0; t < 32; ++t)
+		if (HttType[t])
+			Kern::Printf("[wifi] miss: HTT type %x: %d, last %d ms ago", t, HttType[t], now - HttTypeAt[t]);
+	static const TInt KDataCe[] = { 1, 2, 5, 9, 10, 11 };	// hw fill index ahead of ours = completions we never reaped
+	for (TUint k = 0; k < sizeof(KDataCe) / sizeof(KDataCe[0]); ++k)
+		{
+		TInt c = KDataCe[k];
+		if (Dst[c].iDesc)
+			Kern::Printf("[wifi] miss: CE%d dst hw %d sw %d posted %d, ie %x is %x", c,
+				R(CeReg(c, EDrri)) & Dst[c].iMask, Dst[c].iSw, R(CeReg(c, EDstWrIdx)) & Dst[c].iMask,
+				R(CeReg(c, EHostIe)), R(CeReg(c, EHostIs)));
+		}
+	const TUint8 ver[4] = { 0, 0, 0, 0 };						// is HTT control still alive? (the reply is type 0)
+	Kern::Printf("[wifi] miss: HTT version request -> %d", HtcSend(HttEid, ver, sizeof(ver)));
+	TInt n = MgmtHdr(0x40);
+	Frame[n++] = 0;												// SSID
+	Frame[n++] = Target.iSsidLen;
+	memcpy(Frame + n, Target.iSsid, Target.iSsidLen);
+	n += Target.iSsidLen;
+	TUint8 rates[12];
+	TInt nr = Min(CommonRates(rates), 8);
+	Frame[n++] = 1;												// Supported Rates
+	Frame[n++] = (TUint8)nr;
+	memcpy(Frame + n, rates, nr);
+	n += nr;
+	if (MgmtExchange(n, ProbeDone))
+		Kern::Printf("[wifi] beacon miss: the AP answered");
+	else if (!LostWanted && !AbortWanted && !Error)
+		{
+		Kern::Printf("[wifi] beacon miss: no answer from the AP");
+		LostReason = 4, LostWanted = ETrue;						// 802.11 reason 4 (inactivity) stands in for it
+		}
 	}
 
 // the whole join, on this thread (spec 1): vdev start, peer, auth, assoc, peer assoc, vdev up. A scan finishes first.
@@ -1998,7 +2061,7 @@ static void Irqs1(TBool aOn)
 // the firmware went with the modem: forget what it held, so a WlanStart after the restart brings it up from scratch
 static void Forget()
 	{
-	PeerUp = PeerMapped = VdevStarted = VdevUp = PtkInstalled = LostWanted = AbortWanted = EFalse;
+	PeerUp = PeerMapped = VdevStarted = VdevUp = PtkInstalled = LostWanted = AbortWanted = BmissWanted = EFalse;
 	for (TInt i = 0; i < KTxSlots; ++i)
 		TxBusy[i] = EFalse;
 	memclr(Svc, sizeof(Svc));
@@ -2061,6 +2124,8 @@ static void Serve()
 			}
 		ServeReq();
 		DrainTx();
+		if (BmissWanted && !LostWanted && Link >= ELinkHandshake && Link <= ELinkConnected)
+			ProbeAp();
 		if (LostWanted && Link >= ELinkJoining && Link <= ELinkConnected)
 			Teardown(ELinkLost, 0, LostReason, EFalse);
 		if (Link == ELinkHandshake && NKern::TickCount() - HandshakeAt > 15000)
@@ -2137,7 +2202,7 @@ static TInt Run()
 	Error = KErrNone;
 	if (!Pool)
 		{
-		PoolSize = 0x100000;									// CE rings + buffers ~280 KB, HTT (W3b) ~350 KB
+		PoolSize = 0x400000;									// CE rings + buffers ~280 KB, HTT rx 2 MB + ring/bank ~100 KB
 		NKern::ThreadEnterCS();
 		TInt r = Epoc::AllocPhysicalRam(PoolSize, PoolPhys, 12);
 		DPlatChunkHw* c = NULL;
@@ -2246,11 +2311,9 @@ static TA64DevState WifiStatus(TDes8& aDetail)
 	A64Device_Format(aDetail, "WCN3990 %s", KSteps[Step]);
 	if (Error)
 		A64Device_Format(aDetail, ", error %d", Error);
-	if (Step >= 7)
-		A64Device_Format(aDetail, ", %d scans, %d networks", Scans, NumResults);
-	if (Step == 6)
-		A64Device_Format(aDetail, ", MAC %02x:%02x:%02x:%02x:%02x:%02x", Mac[0], Mac[1], Mac[2], Mac[3], Mac[4],
-			Mac[5]);
+	if (Step >= 7)												// READY's MAC is zero (none stored): ours
+		A64Device_Format(aDetail, ", %d scans, %d networks, MAC %02x:%02x:%02x:%02x:%02x:%02x", Scans, NumResults,
+			HostMac[0], HostMac[1], HostMac[2], HostMac[3], HostMac[4], HostMac[5]);
 	return Error ? EA64DevError : Step >= 6 ? EA64DevPartial : Step ? EA64DevStarting : EA64DevOff;
 	}
 A64_DEVICE("wifi", "WCN3990 Wi-Fi", "qcom_wcn3990", WifiStatus);

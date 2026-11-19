@@ -654,7 +654,10 @@ static void MgmtRx(const TUint8* p, TInt n)
 
 // ---- W3b: the HTT rx ring (private/wifi/w3b-htt-rx-spec.md). The firmware's MAC rx ring is fed from these buffers;
 // without them it receives (CHAN_INFO shows it) but has nowhere to put a frame, beacons included.
-const TInt KHttRing = 2048, KHttBufs = 128, KHttBuf = 2048;
+// 1024 buffers: with 128 the firmware stopped receiving for good after ~150 rx records, whatever the time or traffic,
+// and the link died as a beacon miss ("reason 4", phone 2026-11-19, docs known-issues). ath10k keeps 2047 in this ring.
+// shortcut: 1024 held 3600+ records and floods; move to ath10k's 2047 (6 MB pool) if a stall comes back
+const TInt KHttRing = 2048, KHttBufs = 1024, KHttBuf = 2048;
 static volatile TUint32* HttRing;		// KHttRing x le64 buffer addresses
 static volatile TUint32* HttIdx;		// alloc_idx: the firmware reads it
 static TPhysAddr HttRingPhys, HttIdxPhys, HttBufPhys, BankPhys;
@@ -2199,7 +2202,7 @@ static TInt Run()
 	Error = KErrNone;
 	if (!Pool)
 		{
-		PoolSize = 0x100000;									// CE rings + buffers ~280 KB, HTT (W3b) ~350 KB
+		PoolSize = 0x400000;									// CE rings + buffers ~280 KB, HTT rx 2 MB + ring/bank ~100 KB
 		NKern::ThreadEnterCS();
 		TInt r = Epoc::AllocPhysicalRam(PoolSize, PoolPhys, 12);
 		DPlatChunkHw* c = NULL;

@@ -507,8 +507,10 @@ static TBool NotifyDue;											// a frame was queued or the link changed
 static TUint32 HandshakeAt;										// tick count when the handshake began
 // set by the rx handlers (this thread), read by Join/Teardown
 static TBool StartRespGot, VdevStoppedGot, PeerMapped, PeerUnmapped, AuthDone, AssocDone, LostWanted, AbortWanted;
-static TBool BmissWanted, ProbeDone;
-static TUint32 LastHttAt;										// tick of the last HTT rx indication (beacon-miss diagnosis)					// a beacon miss to check, the AP's probe response
+static TBool BmissWanted, ProbeDone;					// a beacon miss to check, the AP's probe response
+static TUint32 LastHttAt;										// tick of the last HTT rx indication
+// beacon-miss diagnosis (docs known-issues): every HTT message by type, the rx records, and buffer ownership
+static TUint32 HttType[32], HttTypeAt[32], IndDeclared, IndRejected, HttPosted, HttReturned;
 static TInt StartStatus;
 static TUint16 AuthStatus, AssocStatus, AssocAid, AssocCap, LostReason, PeerId;
 static TUint32 KeyAcks;
@@ -663,6 +665,7 @@ static void HttPost(TPhysAddr aPhys)
 	{
 	TUint32 i = *HttIdx & (KHttRing - 1);
 	((volatile TUint32*)(HttBufs + (aPhys - HttBufPhys)))[1] = 0;	// the attention word: not done
+	++HttPosted;
 	HttRing[2 * i] = aPhys;
 	HttRing[2 * i + 1] = 0;
 	__e32_memory_barrier();
@@ -756,6 +759,8 @@ static void DataIn(const TUint8* f, TInt aLen, TBool aBad)
 // one HTT message from the target (CE1/9/10 by HTC endpoint, CE5 with its 8-byte header stripped)
 static void HttRx(const TUint8* p, TInt n)
 	{
+	if (n > 0)
+		++HttType[p[0] & 31], HttTypeAt[p[0] & 31] = NKern::TickCount();
 	if (n < 4)
 		return;
 	if (p[0] == 0x03 && n >= 10)								// PEER_MAP {type, vdev, peer_id, addr} (W4)
@@ -790,13 +795,17 @@ static void HttRx(const TUint8* p, TInt n)
 		}
 	TBool offload = p[1] & 0x20;
 	TInt count = G16(p + 6);
+	IndDeclared += count;
 	for (TInt i = 0; i < count && 8 + 12 * i + 12 <= n; ++i)
 		{
 		TPhysAddr phys = G32(p + 8 + 12 * i);
 		TInt len = G16(p + 16 + 12 * i);
 		if (phys < HttBufPhys || phys >= HttBufPhys + KHttBufs * KHttBuf || (phys - HttBufPhys) % KHttBuf)
+			{
+			++IndRejected;
 			continue;											// not one of ours
-		++HttFrames;
+			}
+		++HttFrames, ++HttReturned;
 		LastHttAt = NKern::TickCount();
 		static TUint32 bw[KHttBuf / 4];
 		TUint8* b = (TUint8*)bw;
@@ -1685,8 +1694,25 @@ static TBool MgmtExchange(TInt aLen, volatile TBool& aDone)
 static void ProbeAp()
 	{
 	BmissWanted = ProbeDone = EFalse;
+	TUint32 now = NKern::TickCount();
 	Kern::Printf("[wifi] beacon miss: rx data %d, HTT frames %d, last HTT %d ms ago, %d interrupts", RxData, HttFrames,
-		NKern::TickCount() - LastHttAt, Irqs);
+		now - LastHttAt, Irqs);
+	Kern::Printf("[wifi] miss: rx records declared %d rejected %d; HTT buffers posted %d returned %d (held %d)",
+		IndDeclared, IndRejected, HttPosted, HttReturned, HttPosted - HttReturned);
+	for (TInt t = 0; t < 32; ++t)
+		if (HttType[t])
+			Kern::Printf("[wifi] miss: HTT type %x: %d, last %d ms ago", t, HttType[t], now - HttTypeAt[t]);
+	static const TInt KDataCe[] = { 1, 2, 5, 9, 10, 11 };	// hw fill index ahead of ours = completions we never reaped
+	for (TUint k = 0; k < sizeof(KDataCe) / sizeof(KDataCe[0]); ++k)
+		{
+		TInt c = KDataCe[k];
+		if (Dst[c].iDesc)
+			Kern::Printf("[wifi] miss: CE%d dst hw %d sw %d posted %d, ie %x is %x", c,
+				R(CeReg(c, EDrri)) & Dst[c].iMask, Dst[c].iSw, R(CeReg(c, EDstWrIdx)) & Dst[c].iMask,
+				R(CeReg(c, EHostIe)), R(CeReg(c, EHostIs)));
+		}
+	const TUint8 ver[4] = { 0, 0, 0, 0 };						// is HTT control still alive? (the reply is type 0)
+	Kern::Printf("[wifi] miss: HTT version request -> %d", HtcSend(HttEid, ver, sizeof(ver)));
 	TInt n = MgmtHdr(0x40);
 	Frame[n++] = 0;												// SSID
 	Frame[n++] = Target.iSsidLen;

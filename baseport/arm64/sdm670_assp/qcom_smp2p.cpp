@@ -32,6 +32,10 @@ struct SEdge
 	SItem* iOut;
 	TBool iNegotiated, iSsrAck, iAckState;
 	TUint32 iGeneration;
+	// the remote's inbound values when it was stopped: they stay in its item until its next boot rewrites them, and
+	// read back as live they made a restarted modem look READY|HANDOVER|FATAL at once (phone, 2026-11-18)
+	TUint32 iStale[KEntries];
+	TUint32 iStaleMask;										// bit i: entry i still holds the stopped boot's value
 	};
 static NFastMutex StateLock; // outbound publication, generation, negotiation and reset (no sleeping calls)
 static SEdge Edges[] = {
@@ -129,6 +133,13 @@ TInt Smp2p_In(TInt aRemote, const char* aEntry, TUint32& aValue)
 		if (NameIs(in->iEntry[i].iName, aEntry))
 			{
 			aValue = in->iEntry[i].iValue;
+			if (e->iStaleMask & (1u << i))
+				{
+				if (aValue == e->iStale[i])
+					aValue = 0;								// not written by this boot yet
+				else
+					e->iStaleMask &= ~(1u << i);
+				}
 			return KErrNone;
 			}
 	return KErrNotReady;
@@ -247,6 +258,13 @@ TInt Smp2p_Reset(TInt aRemote)
 	SEdge* e = Edge(aRemote);
 	if (!e)
 		return KErrArgument;
+	SItem* in = In(*e);										// the remote is stopped: its item no longer changes
+	e->iStaleMask = 0;
+	for (TInt i = 0; in && i < in->iValid && i < KEntries; ++i)
+		{
+		e->iStale[i] = in->iEntry[i].iValue;
+		e->iStaleMask |= 1u << i;
+		}
 	NKern::FMWait(&StateLock);
 	if (e->iOut)
 		{

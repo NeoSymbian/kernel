@@ -10,7 +10,7 @@ targets are QEMU `virt` and the Google Pixel 3a XL (bonito, Qualcomm SDM670).
 - **Builds:** [NeoSymbian/build](https://github.com/NeoSymbian/build) builds it (`neo`) and pins it in `sources.lock`.
   The build scripts expect it in a folder named `oss.FCL.sf.os.kernelhwsrv`.
 - **Docs:** design and plans are in [NeoSymbian/docs](https://github.com/NeoSymbian/docs): `roadmap.md`,
-  `port-map.md`, `ekern-backend.md`, `filesystem.md`, `telephony.md`.
+  `port-map.md`, `ekern-backend.md`, `filesystem.md`, `hardware/modem.md`.
 
 ## Repository map
 

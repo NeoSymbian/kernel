@@ -8,7 +8,7 @@
 //              each side sent OPEN (its id + name) and got OPEN_ACK; a sender needs one of the receiver's INTENTs
 //              (an id + a buffer size) per message: TX_DATA {+ chunk size, bytes left}, continued by
 //              TX_DATA_CONT; RX_DONE gives the intent back. RX_INTENT_REQ asks for a bigger buffer.
-// Polled from its own thread every millisecond (docs/telephony.md C2: GIC lines over 255 come with C12).
+// Polled from its own thread every millisecond (docs/hardware/modem.md C2: GIC lines over 255 come with C12).
 // Written from the protocol as described by Linux drivers/rpmsg/qcom_glink_smem.c and qcom_glink_native.c.
 // Telephony C3: the QRTR channel "IPCRTR" to the modem. C6: the ADSP's "IPCRTR" and "apr_audio_svc".
 // A channel id is edge << 8 | lcid, so the modem's channels keep ids 1..8.

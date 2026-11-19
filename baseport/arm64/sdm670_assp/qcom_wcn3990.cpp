@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// qcom_wcn3990.cpp -- the WCN3990 Wi-Fi data path, bring-up stage W2 (docs wifi.md): the copy engines (CE, polled, no
+// qcom_wcn3990.cpp -- the WCN3990 Wi-Fi data path, bring-up stage W2 (docs hardware/wifi.md): the copy engines (CE, polled, no
 // IRQs yet), HTC (ready, connect HTT + WMI, setup complete) and WMI (service ready -> init -> ready: the MAC).
 // The firmware is already up: MODEMD ran the QMI WLFW handshake, WLAN cfg and mission mode (telephony wlfw.rs), then
 // asks for this with HAL WlanStart (qcom_telhal.cpp 0x4e1d). Everything runs on our own DFC thread.
@@ -8,7 +8,7 @@
 // wmi-tlv.c/h, wmi.c/h); private/wifi/w2-spec.md cites each one. This file is a new implementation.
 // W3a: after READY, a first passive scan (PDEV_SET_PARAM chain masks, SCAN_CHAN_LIST, VDEV_CREATE, START_SCAN; beacons
 // from MGMT_RX logged), facts in private/wifi/w3a-scan-spec.md.
-// W7: after bring-up the destination copy engines interrupt (docs wifi.md W7); the bring-up and a join stay polled.
+// W7: after bring-up the destination copy engines interrupt (docs hardware/wifi.md W7); the bring-up and a join stay polled.
 #include <kernel/kern_priv.h>
 #include <platform.h>
 #include "board.h"
@@ -100,7 +100,7 @@ static volatile TBool ModemDown;									// the modem stopped (Wcn3990_ModemDown
 static TUint32 Svc[32];			// the service bitmap: word id / 4, bit id % 4 (ath10k WMI_SERVICE_IS_ENABLED)
 static TBool Svc174, Svc179;
 
-// ---- W7: what wakes Serve() (docs wifi.md W7). A CE interrupt: the ISR masks its line (level-triggered, and the GIC
+// ---- W7: what wakes Serve() (docs hardware/wifi.md W7). A CE interrupt: the ISR masks its line (level-triggered, and the GIC
 // EOI came before the ISR) and adds an IDFC; the IDFC signals Serve's semaphore. A timer and the HAL requests too.
 const TBool KUseIrqs = ETrue;								// EFalse: the old polled loop (1/2/10 ms sleeps)
 const TUint32 KCeIntId0 = 32 + 0x19e;						// CE0's line (DTB: SPI 414), then one per copy engine
@@ -478,7 +478,7 @@ static const TUint8* FindIe(const TUint8* aIes, TInt aLen, TUint8 aId)
 	return NULL;
 	}
 
-// ---- W4: the link (docs wifi.md W4, private/wifi/w4-join-spec.md). The user side (neoui's supplicant thread) asks
+// ---- W4: the link (docs hardware/wifi.md W4, private/wifi/w4-join-spec.md). The user side (neoui's supplicant thread) asks
 // through HAL WlanLink 0x4e1f; this thread does the 802.11 join and the WMI/HTT work. The WPA2 handshake itself is
 // the user side's: it gets the AP's EAPOL frames from Eapol[], sends its own through a request, and installs keys.
 enum TLink { ELinkIdle, ELinkJoining, ELinkHandshake, ELinkConnected, ELinkLost, ELinkError };

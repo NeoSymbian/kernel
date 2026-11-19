@@ -228,7 +228,7 @@ __attribute__((weak)) void A64UsbStatus(TDes8& aBuf) { aBuf.Append((const TUint8
 __attribute__((weak)) void A64UsbCold(TDes8& aOut, TInt) { aOut.Copy((const TUint8*)"usb cold: not on this board", 27); }
 TInt A64UsbDebugSet(TInt aOn);								// a64_variant.cpp (weak) / qcom_dwc3.cpp
 __attribute__((weak)) void A64RpmhVote(const TDesC8&, TDes8& aOut) { aOut.Copy((const TUint8*)"rpmh: not on this board", 23); }
-// qcom_telmon.cpp on the Pixel: the modem path (docs/telephony.md C2/C3)
+// qcom_telmon.cpp on the Pixel: the modem path (docs/hardware/modem.md C2/C3)
 __attribute__((weak)) void A64Tel_Monitor(TInt, const TPtrC8*, const TUint64*) { Say("telephony: not on this board"); }
 __attribute__((weak)) int Spmi_Read(unsigned, unsigned) { return KErrNotSupported; }
 __attribute__((weak)) int Spmi_Write(unsigned, unsigned, unsigned) { return KErrNotSupported; }

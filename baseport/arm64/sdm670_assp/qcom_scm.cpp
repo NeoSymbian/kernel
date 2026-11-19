@@ -7,7 +7,7 @@
 // context for the paused call); a busy one (x0 = -12) is retried after a sleep. C5b: resuming with x6 = 0 left PAS
 // init_image (long: a signature check) interrupted forever, a hang.
 // Written from the calling convention in Linux drivers/firmware/qcom/qcom_scm-smc.c and qcom_scm.c (assign_mem,
-// is_call_available). Telephony stage C2 (docs/telephony.md): the modem's memory goes to its VMID before it boots.
+// is_call_available). Telephony stage C2 (docs/hardware/modem.md): the modem's memory goes to its VMID before it boots.
 // One call at a time (Lock): the modem loader, IPA's PAS load and the monitor can overlap (C5b: a PAS call during
 // the modem's assign_mem trapped), and the extra-args page is shared.
 #include <kernel/kern_priv.h>

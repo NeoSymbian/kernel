@@ -7,12 +7,12 @@
 //     ADSP's SECONDARY_TDM_RX (LPASS LPI pins gpio8-11), their PLLs locked to its 6.144 MHz bit clock;
 //   - the microphone: a DMIC through a Realtek RT5514 (I2C10 0x57) onto PRIMARY_TDM_TX (TLMM gpio65-68), its PLL
 //     from the bit clock too; the DMIC's supply is the PM660L analog codec's MIC BIAS 1 (SPMI SID 3, 0xf000).
-// Routes: earpiece = Top only, speaker = both amps, bottom = Bottom only (media, docs/audio.md), all at C1's live gain. Volume = the amps'
+// Routes: earpiece = Top only, speaker = both amps, bottom = Bottom only (media, docs/hardware/audio.md), all at C1's live gain. Volume = the amps'
 // digital volume, mute = the RT5514's ADC mute (no APR controls exist for these).
 // Register sequences from Linux cs35l36.c, rt5514.c, msm8916-wcd-analog.c and the sdm670 machine driver as the phone
-// ran them under C1 (docs/telephony.md C6); pins from pinctrl-sdm670(-lpass-lpi).c; clocks from gcc-sdm845.c.
+// ran them under C1 (docs/hardware/modem.md C6); pins from pinctrl-sdm670(-lpass-lpi).c; clocks from gcc-sdm845.c.
 // Thread context (HAL Audio from MODEMD, the monitor's "audio").
-// Amp protection (docs/audio.md A7): no GPIO interrupts on this board yet, so op 7 polls the amps' IRQ lines (TLMM 80
+// Amp protection (docs/hardware/audio.md A7): no GPIO interrupts on this board yet, so op 7 polls the amps' IRQ lines (TLMM 80
 // Top, 79 Bottom, active-high); an asserted line's unmasked INT1 bits are cleared and that amp is switched off until
 // the next start. Mic select (op 6): the RT5514's stereo ADCs from DMIC1 (C1's) or DMIC2.
 // shortcut: polled, not an interrupt (MODEMD polls every 250 ms while audio runs); no ACDB calibration.

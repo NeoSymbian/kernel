@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// qcom_wcn3990.h -- the WCN3990 Wi-Fi data path (qcom_wcn3990.cpp), bring-up stage W2 (docs wifi.md).
+// qcom_wcn3990.h -- the WCN3990 Wi-Fi data path (qcom_wcn3990.cpp), bring-up stage W2 (docs hardware/wifi.md).
 #ifndef QCOM_WCN3990_H
 #define QCOM_WCN3990_H
 // after the QMI WLFW handshake, WLAN cfg and mission mode (MODEMD): the copy engines, HTC and WMI up to READY, on

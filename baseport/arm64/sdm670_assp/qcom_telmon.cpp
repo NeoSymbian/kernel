@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// qcom_telmon.cpp -- the debug monitor's telephony commands (docs/telephony.md C2/C3), so each piece of the modem
+// qcom_telmon.cpp -- the debug monitor's telephony commands (docs/hardware/modem.md C2/C3), so each piece of the modem
 // path can be tried on the phone before the user side exists:
 //   scm [pas <id>]        which TrustZone calls exist (assign_mem, PAS); PAS support for a peripheral
 //   smem [item]           SMEM's version, partitions and their items; an item as text (421 = the modem's crash reason)

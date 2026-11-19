@@ -14,7 +14,7 @@
 // DFC queue: it takes seconds and the debug console's queue must keep the watchdog petted.
 // Written from the sequence in Linux drivers/remoteproc/qcom_q6v5_mss.c (sdm845_mss data, q6v5_mba_load,
 // q6v5_mpss_init_image, q6v5_mpss_load), qcom_q6v5.c and drivers/soc/qcom/mdt_loader.c; registers of the clocks
-// and resets from Linux gcc-sdm845.c, reset-qcom-aoss.c and reset-qcom-pdc.c. Telephony stage C3 (docs/telephony.md).
+// and resets from Linux gcc-sdm845.c, reset-qcom-aoss.c and reset-qcom-pdc.c. Telephony stage C3 (docs/hardware/modem.md).
 // Before all that, the Pixel's board record goes into SMEM item 134 (BoardInfo): the modem's RF task reads it to
 // pick the RF card, and faults without it (C4: ":0:[rf]EX:kernel:0:rf:171" 0.5 s after ready).
 // At handover the proxy votes go, as Linux's qcom_msa_handover: kept at their highest, they pinned the modem's rails
@@ -328,7 +328,7 @@ static TInt Boot()
 	Arc_Vote("mss.lvl", 0xffff);
 	Rpmh_Set("xo.lvl", 0, 3);								// the "xo" proxy clock (Linux clk-rpmh bi_tcxo, on = 3)
 	// the WCN3990's supplies and reference clock, which Linux's ath10k_snoc turns on before the modem's WLAN
-	// domain announces its firmware service (docs wifi.md W0b; DTB wifi@18800000, PM660 = RPMh "a")
+	// domain announces its firmware service (docs hardware/wifi.md W0b; DTB wifi@18800000, PM660 = RPMh "a")
 	Vrm_Vote("ldoa5", 800);									// vdd-0.8-cx-mx
 	Vrm_Vote("ldoa9", 1800);								// vdd-1.8-xo
 	Vrm_Vote("ldoa6", 1304);								// vdd-1.3-rfa (DTB 1248..1304 mV)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // qcom_telhal.cpp -- what the user-side modem daemon (MODEMD.EXE, NeoSymbian/telephony) needs from the kernel,
-// as NeoSymbian EHalGroupVariant functions (docs/telephony.md C4, docs/rust-integration.md HAL table). All need
+// as NeoSymbian EHalGroupVariant functions (docs/hardware/modem.md C4, docs/rust-integration.md HAL table). All need
 // CommDD (ROM EXEs have every capability). SIo = { TUint32 a, b, len, buf } in user memory.
 //   0x4e0d ModemBoot   boot the modem (qcom_mss.cpp; its own thread)
 //   0x4e0e ModemState  a1 = TUint32[4] out: boot step (8 = running), error, SMP2P slave-kernel bits, IPCRTR open
@@ -22,12 +22,12 @@
 //   0x4e18 Audio       a1 = SIo { op; arg; 0; 0 }: the board's codecs and amps (A64Audio_Control, a64_audio.cpp)
 //   0x4e1b FwRead      a1 = SIo { 0; byte offset; len <= 64 KB; buf }, a2 = "IMAGE/NAME.EXT" (8.3, in a 32-byte
 //                      buffer): a file of modem_a's FAT16, read-only, for MODEMD's TFTP reads (the modem's WLAN
-//                      domain loads IMAGE/WLANMDSP.MBN, docs wifi.md W0). len 0 -> its size; else the bytes read
+//                      domain loads IMAGE/WLANMDSP.MBN, docs hardware/wifi.md W0). len 0 -> its size; else the bytes read
 //   0x4e1c WlanMsa     a1 = SIo { op 1 assign, 0 release; phys; size; secure }: a region of the Wi-Fi firmware's MSA
 //                      carve-out (DTB wlan-msa 0x94d00000 + 1 MB) handed from HLOS to MSS_MSA + WLAN (+ WLAN_CE unless
-//                      secure) and back, as Linux ath10k_qmi_map_msa_permission (docs wifi.md W1)
+//                      secure) and back, as Linux ath10k_qmi_map_msa_permission (docs hardware/wifi.md W1)
 //   0x4e1d WlanStart   after WLAN cfg + mission mode: the copy engines, HTC and WMI up to READY on the driver's own
-//                      thread (qcom_wcn3990.cpp, docs wifi.md W2); KErrInUse while it runs
+//                      thread (qcom_wcn3990.cpp, docs hardware/wifi.md W2); KErrInUse while it runs
 //   0x4e23 Prng        a1 = TDes8* (length 1..256 = the bytes wanted): the SoC's hardware PRNG (Wi-Fi W4 nonces)
 //   C7 (calls): 0x4e24 RprocStop SIo{a = mask 1 MSS, 2 ADSP}, asynchronous; poll 0x4e25 RprocState
 //                      [phase, error, mss_gen, adsp_gen], phase 0 idle, 1 stopping, 2 stopped, 3 failed (never reload
@@ -424,7 +424,7 @@ static TInt RmtfsMem(SIo& aIo, TAny* aUserIo)
 
 // One bounded physical region retained for this boot. The daemon owns ASM map/write acknowledgements;
 // a published range cannot be overwritten (or read) until its exact ticket is completed or PAS shutdown succeeds.
-// NeoSymbian audio A2 (docs/audio.md): ranges are published separately, so media periods stream while others are
+// NeoSymbian audio A2 (docs/hardware/audio.md): ranges are published separately, so media periods stream while others are
 // the ADSP's; publishing length 0 is the whole region (the ringtone, as before).
 const TUint32 KAudioBytes = 0x40000;					// telephony apr::RING_REGION: a 2 s 48 kHz ringtone (192,000 bytes)
 static TPhysAddr AudioPhys;

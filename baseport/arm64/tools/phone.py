@@ -11,7 +11,7 @@ with nothing but the Python standard library and the fastboot tool.
   phone.py shot OUT.png      the framebuffer as a PNG
   phone.py put vendor_a|vendor_b FILE   FILE onto the partition (kernel "blk put", EMMC_C=2 builds), verified
   phone.py dump PART OUT     a GPT partition by name (or FIRST:COUNT sectors), read-only, checked against the
-                             kernel's SHA-256; prints the hash (docs telephony.md C0: radio partition backups)
+                             kernel's SHA-256; prints the hash (docs hardware/modem.md C0: radio partition backups)
   phone.py console [--log F] interactive (Ctrl-D ends), optionally capture continuously
   phone.py sh [COMMAND]      fshell (USBDEBUG builds): a terminal, or one command with its real exit status
   phone.py push LOCAL REMOTE [--overwrite]   one file to the phone, checked by length and SHA-256

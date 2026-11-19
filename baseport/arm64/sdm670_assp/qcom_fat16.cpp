@@ -2,7 +2,7 @@
 //
 // qcom_fat16.cpp -- read-only files from a FAT16 partition of the eMMC, found by GPT name. The modem's firmware
 // partition modem_a is FAT16 with 4096-byte sectors and 8.3 names (IMAGE/MBA.MBN, MODEM.MDT, MODEM.B00..B30), so the
-// kernel loads the modem itself, without the file server (docs/telephony.md C3). Device reads only
+// kernel loads the modem itself, without the file server (docs/hardware/modem.md C3). Device reads only
 // (A64BlkDev_Read): nothing here can write the eMMC.
 // shortcut: one cluster per device read and 8.3 names only; enough for 110 MB of firmware at boot.
 #include <kernel/kern_priv.h>

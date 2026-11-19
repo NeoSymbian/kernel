@@ -9,7 +9,7 @@
 //               and cached items down from its end.
 // Items are found by number (SMP2P 435 / 428, GLINK 478..480); allocating one takes the TCSR hardware mutex,
 // because the remote processors allocate too.
-// Written from the layout in Linux drivers/soc/qcom/smem.c. Telephony stage C2 (docs/telephony.md).
+// Written from the layout in Linux drivers/soc/qcom/smem.c. Telephony stage C2 (docs/hardware/modem.md).
 #include <kernel/kern_priv.h>
 #include "board.h"
 #include "qcom_smem.h"

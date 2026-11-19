@@ -8,7 +8,7 @@ unchanged at AArch32 EL0. The maps:
   the known debts with their planned layout.
 
 Read the relevant map before adding files. The workspace `../CLAUDE.md` and NeoSymbian/docs (`roadmap.md`,
-`port-map.md`, `telephony.md`) hold the wider plan.
+`port-map.md`, `hardware/modem.md`) hold the wider plan.
 
 ## Where new code goes
 

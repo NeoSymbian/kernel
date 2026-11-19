@@ -4,7 +4,7 @@
 // through the APCS doorbell after a change. The modem pair (DTB smp2p-mpss): inbound item 435, outbound 428,
 // doorbell bit 14; out entries "master-kernel" (bit 0 = stop) and "ipa"; in "slave-kernel" (fatal, ready, handover,
 // stop-ack, shutdown-ack) and "ipa". The ADSP pair: in 443, out 429, bit 26.
-// Polled: callers read the inbound words (the GIC lines come later, docs/telephony.md C12).
+// Polled: callers read the inbound words (the GIC lines come later, docs/hardware/modem.md C12).
 // Written from the layout and handshake in Linux drivers/soc/qcom/smp2p.c. Telephony stage C2.
 #include <kernel/kern_priv.h>
 #include "board.h"

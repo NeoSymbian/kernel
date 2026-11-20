@@ -5,7 +5,8 @@
 // expects, emulated on the trap. A port of Phorepoc's AArch32 fix-ups (adaptation-a64 ekern_seam.cpp
 // EmulateSwp/EmulateAlign) to an AArch64 EL1 kernel: decoded from ESR_EL1 and the exception frame (r0-r14 = x0-x14,
 // pc = ELR, CPSR = SPSR) instead of the AArch32 TArmExcInfo.
-//   - SWP/SWPB: UNDEFINED in ARMv8 AArch32 (ESR EC 0x00); euser's locks use it. Emulated with an exclusive loop.
+//   - SWP/SWPB: UNDEFINED in ARMv8 AArch32 (ESR EC 0x00); old ARMv5 binaries' locks use it. Emulated with an exclusive
+//     loop between two DMBs: a lock's SWP may be its acquire or its release, so it must order both ways (SMP).
 //   - misaligned LDRD/STRD/LDM/STM: these always need alignment, even with SCTLR_EL1.A=0 (data abort, DFSC 0x21
 //     alignment). Done through the unprivileged user accessors (LDTR/STTR allow unaligned addresses at A=0).
 // Called with interrupts off from A64_ExceptionDispatch; ETrue = handled (pc stepped), EFalse = let the exception
@@ -59,10 +60,10 @@ static TBool EmulateSwp(SThreadExcStack* aF, TUint32 aInsn)
 		if ((!byte && (addr & 3)) || !UserCanAccess(addr, ETrue))
 			return EFalse;								// misaligned word SWP faults, as on ARMv7
 		if (byte)
-			__asm__ __volatile__("1: ldxrb %w0, [%2]\n\tstxrb %w1, %w3, [%2]\n\tcbnz %w1, 1b\n\tdmb ish"
+			__asm__ __volatile__("dmb ish\n1:\tldxrb %w0, [%2]\n\tstxrb %w1, %w3, [%2]\n\tcbnz %w1, 1b\n\tdmb ish"
 				: "=&r"(old), "=&r"(fail) : "r"((TUint64)addr), "r"(val) : "memory");
 		else
-			__asm__ __volatile__("1: ldxr %w0, [%2]\n\tstxr %w1, %w3, [%2]\n\tcbnz %w1, 1b\n\tdmb ish"
+			__asm__ __volatile__("dmb ish\n1:\tldxr %w0, [%2]\n\tstxr %w1, %w3, [%2]\n\tcbnz %w1, 1b\n\tdmb ish"
 				: "=&r"(old), "=&r"(fail) : "r"((TUint64)addr), "r"(val) : "memory");
 		aF->iX[rt] = old;
 		}

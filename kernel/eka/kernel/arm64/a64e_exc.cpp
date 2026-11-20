@@ -316,9 +316,13 @@ static void SyncException(SThreadExcStack* aF, TUint32 aGroup)
 
 	TSubScheduler& ss = SubScheduler();
 	if (!fromUser)											// NeoSymbian: the fault's own registers (the system-exception dump lacks them)
-		Kern::Printf("[exc] kernel abort (EC %02x): pc %08x far %08x esr %08x lr %08x sp %08x in %O%s",
+		{
+		NThreadBase* n = NKern::CurrentThread();				// a far just below the stack base: an overflow into its guard
+		Kern::Printf("[exc] kernel abort (EC %02x): pc %08x far %08x esr %08x lr %08x sp %08x in %O%s; stack %08x+%x",
 			ec, e.iR15, e.iFaultAddress, (TUint32)aF->iEsr, e.iR14Svc, e.iR13Svc, TheCurrentThread,
-			ss.iKernLockCount ? ", kernel locked" : ss.iSSX.iIrqNestCount >= 0 ? ", in an ISR" : "");
+			ss.iKernLockCount ? ", kernel locked" : ss.iSSX.iIrqNestCount >= 0 ? ", in an ISR" : "",
+			n ? (TUint32)n->iStackBase : 0, n ? n->iStackSize : 0);
+		}
 	if (ss.iKernLockCount || ss.iSSX.iIrqNestCount >= 0)
 		Exc::Fault(&e);									// can't run the exception handlers with the kernel locked or in an ISR
 	if (!(aF->iSpsr & 0xC0))

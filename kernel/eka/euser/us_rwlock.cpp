@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): taking the lock is an acquire, releasing or downgrading it a release (they were swapped; matters on SMP).
 // Description:
 // e32\euser\us_rwlock.cpp
 // 
@@ -102,7 +102,7 @@ EXPORT_C void RReadWriteLock::ReadLock()
 			blocked = EFalse;
 			}
 		}
-	while (!__e32_atomic_cas_rel64(&iValues, &initialValues, initialValues + (blocked ? KReaderPendingValue : KReaderValue)));
+	while (!__e32_atomic_cas_acq64(&iValues, &initialValues, initialValues + (blocked ? KReaderPendingValue : KReaderValue)));
 
 	if (blocked)
 		iReaderSem.Wait();
@@ -135,7 +135,7 @@ EXPORT_C void RReadWriteLock::WriteLock()
 			blocked = EFalse;
 			}
 		}
-	while (!__e32_atomic_cas_rel64(&iValues, &initialValues, initialValues + (blocked ? KWriterPendingValue : KWriterValue)));
+	while (!__e32_atomic_cas_acq64(&iValues, &initialValues, initialValues + (blocked ? KWriterPendingValue : KWriterValue)));
 
 	if (blocked)
 		iWriterSem.Wait();
@@ -162,7 +162,7 @@ EXPORT_C TBool RReadWriteLock::TryReadLock()
 
 		__ASSERT_ALWAYS(indexedValues[KReadersIndex] < KMaxTUint16, Panic(EReadWriteLockTooManyClients));
 		}
-	while (!__e32_atomic_cas_rel64(&iValues, &initialValues, initialValues + KReaderValue));
+	while (!__e32_atomic_cas_acq64(&iValues, &initialValues, initialValues + KReaderValue));
 
 	return ETrue;
 	}
@@ -183,7 +183,7 @@ EXPORT_C TBool RReadWriteLock::TryWriteLock()
 		if (initialValues & KReadersOrWritersMask)
 			return EFalse;
 		}
-	while (!__e32_atomic_cas_rel64(&iValues, &initialValues, initialValues + KWriterValue));
+	while (!__e32_atomic_cas_acq64(&iValues, &initialValues, initialValues + KWriterValue));
 
 	return ETrue;
 	}
@@ -256,7 +256,7 @@ EXPORT_C void RReadWriteLock::DowngradeWriteLock()
 			newValues += unlockReaders;
 			}
 		}
-	while (!__e32_atomic_cas_acq64(&iValues, &initialValues, newValues));
+	while (!__e32_atomic_cas_rel64(&iValues, &initialValues, newValues));
 
 	if (unlockReaders > 0)
 		iReaderSem.Signal(unlockReaders);
@@ -342,7 +342,7 @@ TInt RReadWriteLock::UnlockWriter()
 				}
 			}
 		}
-	while (!__e32_atomic_cas_acq64(&iValues, &initialValues, newValues));
+	while (!__e32_atomic_cas_rel64(&iValues, &initialValues, newValues));
 
 	return unlockClients;
 	}
@@ -386,7 +386,7 @@ TInt RReadWriteLock::UnlockAlternate()
 
 			}
 		}
-	while (!__e32_atomic_cas_acq64(&iValues, &initialValues, newValues));
+	while (!__e32_atomic_cas_rel64(&iValues, &initialValues, newValues));
 
 	return unlockClients;
 	}
@@ -419,7 +419,7 @@ TInt RReadWriteLock::UnlockReader()
 				}
 			}
 		}
-	while (!__e32_atomic_cas_acq64(&iValues, &initialValues, newValues));
+	while (!__e32_atomic_cas_rel64(&iValues, &initialValues, newValues));
 
 	return unlockClients;
 	}

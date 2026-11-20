@@ -76,9 +76,10 @@ if rofs:
             if dep and dep not in core:
                 core.add(dep)
                 todo.append(dep)
+    # rofssize: the most the ROFS may hold, 256 MB (the browser's engine alone is 58 MB; system_a is far bigger)
     # a fixed time: the image (its header) depends only on its content, so a core-only build (ROFS=flash) matches the
     # ROFS a ROFS_INSTALL build wrote to system_a (a64_medrofs.cpp compares the headers)
-    keep, lines = [], ["rofsname=" + os.path.join(os.path.dirname(oby), "rofs.img"), "rofssize=0x4000000",
+    keep, lines = [], ["rofsname=" + os.path.join(os.path.dirname(oby), "rofs.img"), "rofssize=0x10000000",
                        "time=01/01/2026 00:00:00"]
     for o, v in pairs:
         z, _, path = v.partition("=")

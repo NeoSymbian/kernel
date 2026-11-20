@@ -276,8 +276,8 @@ void Mmu::Init1()
 	__asm__ __volatile__("mrs %0, ctr_el0" : "=r"(ctr));
 	TRACEB(("CTR_EL0 = %08x (L1Ip %d)", (TUint32)ctr, (TUint32)(ctr>>14)&3));
 
-	// a64 port (as Phorepoc's x86-64 port): 4 KB supervisor stacks overflow with 64-bit frames
-	K::SupervisorThreadStackSize = 0x4000;
+	// a64 port (as Phorepoc's x86-64 port): 4 KB supervisor stacks overflow with 64-bit frames, so 16 KB, set below:
+	// Init1Common sets 4 KB, and until 2026-11-20 it ran after this line (the exc_common faults, docs gnss.md).
 
 #ifdef __SMP__
 	TInt i;
@@ -290,7 +290,7 @@ void Mmu::Init1()
 		}
 #endif
 
-	Init1Common();
+	Init1Common();	K::SupervisorThreadStackSize = 0x4000;		// a64 port: after Init1Common's 4 KB (above)
 	// NeoSymbian WB1 (docs browser.md): Servo's script and style threads ask for 8 MiB stacks (Init1Common: 1 MiB).
 	// Only a ceiling: a stack commits just the size its creator asks for. shortcut: committed in full, not on demand.
 	PP::MaxUserThreadStack = 0x1000000;	// 16 MiB

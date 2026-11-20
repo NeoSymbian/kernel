@@ -502,6 +502,28 @@ class YmodemTests(unittest.TestCase):
         self.assertEqual(len(metadata), 1024)
         self.assertEqual(debug.parse_metadata(metadata), (name, 123))
 
+    def test_progress_line(self):
+        self.assertEqual(
+            debug.progress_line(12_300_000, 58_800_000, 455.0),
+            "  12.3 / 58.8 MB  20%  27 KB/s  ETA 28:40",
+        )
+        self.assertEqual(
+            debug.progress_line(0, 0, 0), "  0.0 / 0.0 MB  100%  0 KB/s  ETA 0:00"
+        )
+
+    def test_meter_draws_on_a_terminal_and_ends_the_line(self):
+        out = io.StringIO()
+        out.isatty = lambda: True
+        with mock.patch.object(debug.sys, "stderr", out):
+            meter = debug.Meter(2048)
+            meter.update(1024)
+            meter.update(1536)  # within half a second: not redrawn
+            meter.end(2048)
+        lines = out.getvalue()
+        self.assertEqual(lines.count("\r"), 2)
+        self.assertTrue(lines.endswith("\n"))
+        self.assertIn("100%", lines)
+
     def test_invalid_metadata_rejected(self):
         for body in (
             b"../x\x000",

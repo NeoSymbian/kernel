@@ -394,10 +394,44 @@ def parse_metadata(body):
     return name, int(size)
 
 
+def progress_line(done, total, secs):
+    rate = done / secs if secs > 0 else 0.0
+    eta = int((total - done) / rate) if rate else 0
+    percent = done * 100 // total if total else 100
+    return (
+        f"  {done / 1e6:.1f} / {total / 1e6:.1f} MB  {percent}%  {rate / 1e3:.0f} KB/s"
+        f"  ETA {eta // 60}:{eta % 60:02d}"
+    )
+
+
+class Meter:
+    """The live transfer line on stderr, redrawn at most twice a second; silent unless stderr is a terminal."""
+
+    def __init__(self, total):
+        self.total, self.started, self.shown = total, time.monotonic(), None
+        self.live = sys.stderr.isatty()
+
+    def update(self, done):
+        now = time.monotonic()
+        if self.live and (self.shown is None or now - self.shown >= 0.5):
+            self.shown = now
+            line = progress_line(done, self.total, now - self.started)
+            print(f"\r{line}\x1b[K", end="", file=sys.stderr, flush=True)
+
+    def end(self, done=None):
+        if done is not None:
+            self.shown = None
+            self.update(done)
+        if self.shown is not None:
+            print(file=sys.stderr, flush=True)
+            self.shown = None
+
+
 class Ymodem:
     def __init__(self, stream, idle=30.0, retries=10):
         self.stream, self.idle, self.retries = stream, idle, retries
         self.last_progress = time.monotonic()
+        self.meter = None
 
     def progress(self):
         self.last_progress = time.monotonic()
@@ -406,6 +440,8 @@ class Ymodem:
         return self.last_progress + self.idle
 
     def cancel(self):
+        if self.meter:
+            self.meter.end()
         try:
             self.stream.write(bytes((CAN, CAN)), time.monotonic() + 0.2)
         except DebugError:
@@ -443,6 +479,7 @@ class Ymodem:
             self.acknowledged(packet(0, metadata(name, size)))
             self.expect(CRC)
             remaining, block = size, 1
+            self.meter = Meter(size)
             while remaining:
                 data = file.read(min(1024, remaining))
                 if not data:
@@ -450,9 +487,11 @@ class Ymodem:
                 self.acknowledged(packet(block, data, 1024))
                 remaining -= len(data)
                 block = (block + 1) & 255
+                self.meter.update(size - remaining)
             self.acknowledged(bytes((EOT,)))
             self.expect(CRC)
             self.acknowledged(packet(0, bytes(128), 128))
+            self.meter.end(size)
         except BaseException:
             self.cancel()
             raise
@@ -541,10 +580,12 @@ class Ymodem:
                                 "only one file per YMODEM operation is supported"
                             )
                         self.stream.write(bytes((ACK,)), self.deadline())
+                        self.meter.end(info[1])
                         return info
                     if entry is None:
                         raise DebugError("YMODEM batch contained no file")
                     info, remaining = entry, entry[1]
+                    self.meter = Meter(remaining)
                     self.stream.write(bytes((ACK, CRC)), self.deadline())
                 else:
                     if not remaining:
@@ -554,6 +595,7 @@ class Ymodem:
                     if written != len(data):
                         raise DebugError("short local file write")
                     remaining -= len(data)
+                    self.meter.update(info[1] - remaining)
                     self.stream.write(bytes((ACK,)), self.deadline())
                 previous, previous_header = received, is_header
                 expected, failures = (expected + 1) & 255, 0

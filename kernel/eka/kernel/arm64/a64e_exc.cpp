@@ -316,9 +316,13 @@ static void SyncException(SThreadExcStack* aF, TUint32 aGroup)
 
 	TSubScheduler& ss = SubScheduler();
 	if (!fromUser)											// NeoSymbian: the fault's own registers (the system-exception dump lacks them)
-		Kern::Printf("[exc] kernel abort (EC %02x): pc %08x far %08x esr %08x lr %08x sp %08x in %O%s",
+		{
+		NThreadBase* n = NKern::CurrentThread();				// a far just below the stack base: an overflow into its guard
+		Kern::Printf("[exc] kernel abort (EC %02x): pc %08x far %08x esr %08x lr %08x sp %08x in %O%s; stack %08x+%x",
 			ec, e.iR15, e.iFaultAddress, (TUint32)aF->iEsr, e.iR14Svc, e.iR13Svc, TheCurrentThread,
-			ss.iKernLockCount ? ", kernel locked" : ss.iSSX.iIrqNestCount >= 0 ? ", in an ISR" : "");
+			ss.iKernLockCount ? ", kernel locked" : ss.iSSX.iIrqNestCount >= 0 ? ", in an ISR" : "",
+			n ? (TUint32)n->iStackBase : 0, n ? n->iStackSize : 0);
+		}
 	if (ss.iKernLockCount || ss.iSSX.iIrqNestCount >= 0)
 		Exc::Fault(&e);									// can't run the exception handlers with the kernel locked or in an ISR
 	if (!(aF->iSpsr & 0xC0))
@@ -346,6 +350,25 @@ extern "C" void A64_ExecGate(SThreadExcStack* aF);		// a64e_exec.cpp
 extern "C" void A64_ReturnToUser();						// a64e_nkern.cpp: user-mode callbacks
 extern "C" TBool A64_A32Fixup(SThreadExcStack* aF);		// a64e_a32fix.cpp: instructions ARMv8 dropped
 
+// NeoSymbian: the kernel-stack low-water mark. An exception taken in kernel mode within 4 KB of its thread's stack
+// base prints where the kernel was, at each new low, so a path that overflows the 16 KB supervisor stack shows itself
+// before the guard page stops it (the exc_common fault, docs hardware/gnss.md and audio.md "Open").
+static TUint32 StackLowWater = 0x1000;
+static void CheckStackDepth(SThreadExcStack* aF)
+	{
+	NThreadBase* t = NKern::CurrentThread();
+	TLinAddr sp = (TLinAddr)aF, base = t ? t->iStackBase : 0;
+	if (!base || sp < base || sp - base >= StackLowWater)
+		return;
+	StackLowWater = (TUint32)(sp - base);					// benign race between CPUs: only a print is at stake
+	A64_DebugPuts("[exc] kernel stack low: "); A64_DebugHex(sp - base);
+	A64_DebugPuts(" bytes left, pc "); A64_DebugHex(aF->iElr);
+	A64_DebugPuts(" lr "); A64_DebugHex(aF->iX[30]);
+	A64_DebugPuts(" stack "); A64_DebugHex(base);
+	A64_DebugPuts(" thread "); A64_DebugHex((TLinAddr)t);
+	A64_DebugPuts("\n");
+	}
+
 extern "C" void A64_ExceptionDispatch(SThreadExcStack* aF, TUint64 aKind)
 	{
 	TUint32 type = (TUint32)aKind & 3, group = (TUint32)aKind >> 2;
@@ -360,6 +383,8 @@ extern "C" void A64_ExceptionDispatch(SThreadExcStack* aF, TUint64 aKind)
 		A64_ReturnToUser();								// interrupts off again here
 		return;
 		}
+	if (group < 2)										// taken in kernel mode
+		CheckStackDepth(aF);
 	if (type == 1)
 		{ A64_Irq(aF); return; }
 	if (type == 0 && group < 2)							// EL1; there is no AArch64 user code

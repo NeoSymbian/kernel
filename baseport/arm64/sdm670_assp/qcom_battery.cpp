@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // PM660 observation only: no PMIC writes, SRAM/profile access or ADC triggers.
 // Register facts: AOSP qpnp-fg-gen3.c (6289dd9905d0, 0f5f44a2e74c), fg-util.c
-// (60e67638d95e), and Linux v6.16 drivers/power/supply/qcom_pmi8998_charger.c.
+// (60e67638d95e), and Linux v6.16 drivers/power/supply/qcom_pmi8998_charger.c; charger watchdog and
+// CHGR_CFG2 from msm-4.9 smb-reg.h (649b0b6508be). Phone 2026-11-20: WD_CFG 0x00 after ABL, so nothing needs a pet.
 // Profile integrity and hardware sample age cannot be proven with these direct reads.
 #include <kernel/kern_priv.h>
 #include "qcom_spmi.h"
@@ -118,6 +119,9 @@ void A64BatteryDump()
 			{
 			A64Mon_Say("battery gauge: ready=0x%x enable=0x%x restart=0x%x reset=0x%x", Byte(0x4010), Byte(0x4046), Byte(0x4048), Byte(0x4109));
 			A64Mon_Say("battery detection: BATIF=0x%x FG missing=0x%x; charger phase=0x%x faults=0x%x", Byte(0x1210), Byte(0x4110), Byte(0x1006), Byte(0x1007));
+			// WD_CFG b0/b1 = watchdog on / on plug-in; WDOG_STATUS b0 bark/bite; MISC RT b1/b0 bark/snarl; CFG2 b2 AUTO_RECHG.
+			A64Mon_Say("battery charger watchdog: cfg=0x%x timeouts=0x%x status=0x%x misc rt=0x%x; CHGR_CFG2=0x%x",
+				Byte(0x1651), Byte(0x1653), Byte(0x160c), Byte(0x1610), Byte(0x1051));
 			}
 		}
 	}

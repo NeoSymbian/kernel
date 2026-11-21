@@ -291,7 +291,7 @@ void Mmu::Init1()
 #endif
 
 	Init1Common();	K::SupervisorThreadStackSize = 0x4000;		// a64 port: after Init1Common's 4 KB (above)
-	// NeoSymbian WB1 (docs browser.md): Servo's script and style threads ask for 8 MiB stacks (Init1Common: 1 MiB).
+	// NeoSymbian WB1 (docs browser/wb1-kernel.md): Servo's script and style threads ask for 8 MiB stacks (Init1Common: 1 MiB).
 	// Only a ceiling: a stack commits just the size its creator asks for. shortcut: committed in full, not on demand.
 	PP::MaxUserThreadStack = 0x1000000;	// 16 MiB
 	}

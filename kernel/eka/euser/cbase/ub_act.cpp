@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): the scheduler's TRAP saves d8-d15 when built with VFP (NeoTrapFp).
 // Description:
 // e32\euser\cbase\ub_act.cpp
 // 
@@ -1021,8 +1021,13 @@ void CActiveScheduler::Run(TLoopOwner* const volatile& aLoop)
 		// explicitly expand the TRAPD macro here to enable single-step debugging
 		// of the scheduler loop
 		TInt r;
+#ifdef NEO_TRAP_FP	// NeoSymbian: built with VFP, d8-d15 must survive a leave from RunL (uc_trp.cia NeoTrapFp)
+		TNeoTrapFp trapfp;
+		if (NeoTrapFp(&trapfp.iTrap,r)==0)
+#else
 		TTrap trap;
 		if (trap.Trap(r)==0)
+#endif
 			{
 #ifdef _DEBUG
 			//We cache the cleanupstack here do avoid repeated exec calls in DoRunL

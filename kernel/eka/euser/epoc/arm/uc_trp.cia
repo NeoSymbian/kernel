@@ -9,7 +9,7 @@
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): User::Leave's frame restore is NeoTrapLongjmp; User::Leave is in us_trp.cpp.
+// The NeoSymbian Authors (2026): User::Leave's frame restore is NeoTrapLongjmp; User::Leave is in us_trp.cpp; TRAP saves and restores d8-d15 for code built with VFP (NeoTrapFp).
 // Description:
 // e32\euser\epoc\arm\uc_trp.cia
 // 
@@ -32,6 +32,40 @@
 
 #ifndef __LEAVE_EQUALS_THROW__
 
+// NeoSymbian (US2, docs user-side-smp.md): code built with VFP (ARMv8 softfp) keeps values in d8-d15, which are
+// callee-saved, so a leave must restore them as it restores r4-r11. TTrap has no room (iState[10..15] are the only
+// spare words), so the TRAP macros of such code (toolchain/overlay/e32cmn.h in NeoSymbian/build) put 64 bytes right
+// after the TTrap and call NeoTrapFp, which saves d8-d15 there and marks iState[KNeoTrapFpMark]; TTrap::Trap clears
+// the mark, NeoTrapLongjmp restores d8-d15 only when it is set. Old RVCT apps leave by C++ exception, not TTrap.
+const TInt KNeoTrapFpMark = 10;
+const TUint32 KNeoTrapFpMagic = 0x4E454F46;		// "NEOF"
+
+extern "C" __NAKED__ TInt NeoTrapFp(TTrap* /*aThis*/, TInt& /*aResult*/)
+	{
+	asm(".fpu vfpv2 ");						// d8-d15 exist on every VFP; the CPU always has one (US2)
+	asm("add r2, r0, #%a0" : : "i" (sizeof(TTrap)));
+	asm("vstmia r2, {d8-d15} ");			// the 64 bytes after the TTrap
+	asm("movw r2, #%a0" : : "i" (KNeoTrapFpMagic & 0xFFFF));
+	asm("movt r2, #%a0" : : "i" (KNeoTrapFpMagic >> 16));
+	asm("str r2, [r0, #%a0]" : : "i" (_FOFF(TTrap,iState) + KNeoTrapFpMark * 4));
+	asm("mov r2, #0 ");						// from here as TTrap::Trap, without clearing the mark
+	asm("str r2, [r1, #0] ");
+	asm("str r1, [r0, #%a0]" : : "i" _FOFF(TTrap,iResult));
+	asm("stmia r0, {r4-r11, sp, lr} ");
+	asm("stmfd sp!, {r4,lr} ");
+	asm("bl  " CSM_ZN4Exec13PushTrapFrameEP5TTrap);
+	asm("cmp r0, #0 ");
+	asm("ldrne r3, [r0, #%a0]" : : "i" (_TTRAPHANDLER_VPTR_OFFSET_));
+	asm("beq neo_trapfp_no_trap_handler ");
+	asm("ldr r3, [r3, #%a0]" : : "i" (_TTRAPHANDLER_TRAP_OFFSET_));
+	asm("adr lr, neo_trapfp_return ");		// iHandler->Trap()
+	asm("bx r3 ");
+	asm("neo_trapfp_return: ");
+	asm("mov r0, #0 ");
+	asm("neo_trapfp_no_trap_handler: ");
+	__POPRET("r4,");
+	}
+
 EXPORT_C __NAKED__ TInt TTrap::Trap(TInt & /*aResult*/)
 //
 // Save the enter frame state and return 0.
@@ -39,6 +73,7 @@ EXPORT_C __NAKED__ TInt TTrap::Trap(TInt & /*aResult*/)
 	{
 
 	asm("mov r2, #0 ");						// aResult==KErrNone
+	asm("str r2, [r0, #%a0]" : : "i" (_FOFF(TTrap,iState) + KNeoTrapFpMark * 4));	// NeoSymbian: no d8-d15 saved
 	asm("str r2, [r1, #0] ");				// iResult=(&aResult)
 	asm("str r1, [r0, #%a0]" : : "i" _FOFF(TTrap,iResult));
 	asm("stmia r0, {r4-r11, sp, lr} ");		// Save the context
@@ -87,6 +122,13 @@ __NAKED__ void NeoTrapLongjmp(TTrap* /*aFrame*/, TInt /*aReason*/)
 	asm("ldr pc, [r2, #%a0]" : : "i" (_TTRAPHANDLER_LEAVE_OFFSET_));
 #endif
 	asm("user_leave_no_trap_handler: ");
+	asm(".fpu vfpv2 ");
+	asm("ldr r2, [r5, #%a0]" : : "i" (_FOFF(TTrap,iState) + KNeoTrapFpMark * 4));	// NeoSymbian: d8-d15 from NeoTrapFp
+	asm("movw r3, #%a0" : : "i" (KNeoTrapFpMagic & 0xFFFF));
+	asm("movt r3, #%a0" : : "i" (KNeoTrapFpMagic >> 16));
+	asm("cmp r2, r3 ");
+	asm("addeq r2, r5, #%a0" : : "i" (sizeof(TTrap)));
+	asm("vldmiaeq r2, {d8-d15} ");
 	asm("ldmia	r5, {r4-r11, sp, lr} ");	// Restore the context
 	asm("mov	r0, #1 ");					// return(1)
 	__JUMP(,lr);							// return

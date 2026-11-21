@@ -53,17 +53,15 @@ static TInt Pil(TUint aCmd, TUint32 aArgInfo, const TUint64* aArgs, TInt aCount,
 // one load at a time (IPA at MODEMD's start, the ADSP later): the program headers and where the image goes
 static struct
 	{
-	TBool iBusy;
+	volatile TUint32 iBusy;								// claimed atomically: IPA (MODEMD) and the ADSP (HWHUB) load on two CPUs
 	TUint32 iPas, iBase, iPhys, iSize, iPhnum;
 	SPhdr iPh[32];
 	} L;
 
-static void Done() { L.iBusy = EFalse; }
+static void Done() { __e32_atomic_store_rel32(&L.iBusy, 0); }
 
-TInt Pas_Begin(TUint32 aPas, const TUint8* aMdt, TUint32 aMdtLen, TUint32 aPhys, TUint32 aSize)
+static TInt Begin(TUint32 aPas, const TUint8* aMdt, TUint32 aMdtLen, TUint32 aPhys, TUint32 aSize)
 	{
-	if (L.iBusy)
-		return KErrInUse;
 	if (aMdtLen < 0x34 || memcompare(aMdt, 4, (const TUint8*)"\x7f" "ELF", 4) != 0)
 		return KErrCorrupt;
 	TUint32 phoff = *(const TUint32*)(aMdt + 28), phnum = *(const TUint16*)(aMdt + 44);
@@ -123,13 +121,23 @@ TInt Pas_Begin(TUint32 aPas, const TUint8* aMdt, TUint32 aMdtLen, TUint32 aPhys,
 		if ((r = Pil(EMemSetup, Args(3), args, 3, "mem_setup")) != KErrNone)
 			return r;
 		}
-	L.iBusy = ETrue;
-	L.iPas = aPas;
 	L.iBase = reloc ? minAddr : aPhys;
 	L.iPhys = aPhys;
 	L.iSize = aSize;
 	L.iPhnum = phnum;
 	return KErrNone;
+	}
+
+TInt Pas_Begin(TUint32 aPas, const TUint8* aMdt, TUint32 aMdtLen, TUint32 aPhys, TUint32 aSize)
+	{
+	TUint32 idle = 0;
+	if (!__e32_atomic_cas_ord32(&L.iBusy, &idle, 1))
+		return KErrInUse;
+	L.iPas = aPas;
+	TInt r = Begin(aPas, aMdt, aMdtLen, aPhys, aSize);
+	if (r != KErrNone)
+		Done();
+	return r;
 	}
 
 // a window over [aPhys, aPhys + aLen) in the carve-out, mapped for this one copy
@@ -191,6 +199,8 @@ TInt Pas_Load(TUint32 aPas, const TUint8* aImage, TUint32 aLen, TUint32 aMdtLen,
 	if (aMdtLen > aLen)
 		return KErrCorrupt;
 	TInt r = Pas_Begin(aPas, aImage, aMdtLen, aPhys, aSize);
+	if (r != KErrNone)
+		return r;											// another load owns the loader: never abort it
 	for (TUint32 i = 0; r == KErrNone && i < L.iPhnum; ++i)
 		{
 		const SPhdr& h = L.iPh[i];
@@ -200,8 +210,7 @@ TInt Pas_Load(TUint32 aPas, const TUint8* aImage, TUint32 aLen, TUint32 aMdtLen,
 		}
 	if (r == KErrNone)
 		return Pas_End();
-	if (L.iBusy)
-		Pas_Abort();
+	Pas_Abort();
 	return r;
 	}
 

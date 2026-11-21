@@ -33,6 +33,56 @@ static TInt Fail(TInt aErr, const char* aWhat)
 	return aErr;
 	}
 
+// GLINK SSR (Linux drivers/rpmsg/qcom_glink_ssr.c): when the modem stops, the ADSP is told to drop its GLINK channels
+// to it ("do_cleanup" for "mpss", answered by "cleanup_done" with the same sequence number; Linux waits 1 s). Without
+// it the ADSP went FATAL after modem restarts (docs/hardware/modem.md C7, "Modem restart and the ADSP").
+struct SSsrCleanup { TUint32 iVersion, iCommand, iSeq, iNameLen; char iName[32]; };
+struct SSsrDone { TUint32 iVersion, iResponse, iSeq; };
+enum { ESsrDoCleanup = 0, ESsrCleanupDone = 1 };
+static TInt SsrChannel;
+static TUint32 SsrSeq;
+static volatile TUint32 SsrDoneSeq;
+
+static void SsrRx(TAny*, const TUint8* aData, TInt aLen)		// the GLINK thread
+	{
+	SSsrDone d;
+	if (aLen < (TInt)sizeof(d))
+		return;
+	memcpy(&d, aData, sizeof(d));
+	if (d.iResponse == ESsrCleanupDone)
+		{
+		SsrDoneSeq = d.iSeq;
+		__e32_memory_barrier();
+		}
+	}
+
+TInt Adsp_SsrCleanup(const char* aName)
+	{
+	if (SsrChannel <= 0)
+		return KErrNotReady;
+	SSsrCleanup m;
+	memclr(&m, sizeof(m));
+	m.iCommand = ESsrDoCleanup;
+	m.iSeq = ++SsrSeq;
+	TInt n = 0;
+	while (aName[n] && n < (TInt)sizeof(m.iName))
+		{
+		m.iName[n] = aName[n];
+		++n;
+		}
+	m.iNameLen = n;
+	TInt r = Glink_Send(SsrChannel, &m, sizeof(m));
+	if (r != KErrNone)
+		return r;
+	for (TInt i = 0; i < 1000; ++i)							// Linux: 1 s
+		{
+		if (SsrDoneSeq == m.iSeq)
+			return KErrNone;
+		NKern::Sleep(NKern::TimerTicks(1));
+		}
+	return KErrTimedOut;
+	}
+
 static void Up()
 	{
 	TUint32 v = 0;
@@ -60,7 +110,9 @@ static void Up()
 		Tel_SetChannel(1, qrtr);
 	if (apr > 0)
 		Tel_SetChannel(2, apr);
-	Kern::Printf("[adsp] running after %d ms (slave-kernel %08x); glink %d, IPCRTR %x, apr %x", i, v, r, qrtr, apr);
+	SsrChannel = r == KErrNone ? Glink_Open(KSmemHostAdsp, "glink_ssr", SsrRx, NULL) : 0;
+	Kern::Printf("[adsp] running after %d ms (slave-kernel %08x); glink %d, IPCRTR %x, apr %x, glink_ssr %x", i, v, r,
+		qrtr, apr, SsrChannel);
 	for (i = 0; !(v & (KMssHandover | KMssFatal)) && i < 10000; ++i)
 		{
 		NKern::Sleep(NKern::TimerTicks(1));
@@ -158,6 +210,7 @@ TInt Adsp_Stop()
 		return KErrInUse;
 	// each call that can block is logged: an ADSP stop once never returned and froze the phone (2026-11-12)
 	Kern::Printf("[adsp] stop: glink");
+	SsrChannel = 0;
 	Glink_Stop(KSmemHostAdsp);
 	Kern::Printf("[adsp] stop: PAS shutdown (step %d)", Step);
 	TInt r = Step ? Pas_Shutdown(KPasAdsp) : KErrNone;

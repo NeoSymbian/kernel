@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): flush cached walks before a page table is freed (arm64).
 // Description:
 //
 
@@ -699,6 +699,12 @@ void DFineMapping::FreePageTable(TPde* aPdeAddress)
 			TRACE2(("!PDE %x=%x",aPdeAddress,pde));
 			*aPdeAddress = pde;
 			SinglePdeUpdated(aPdeAddress);
+#ifdef __CPU_ARM64
+			// NeoSymbian: drop cached walks through the PDE before the table can be reused (the callers' TLB
+			// maintenance comes after the free); one TLBI by VA in its 2 MB covers the cached level-2 entry
+			TLinAddr va = ((TLinAddr)aPdeAddress & KPageDirectoryMask) / sizeof(TPde) << KChunkShift;
+			InvalidateTLBForPage(va | OsAsid());
+#endif
 			}
 		}
 

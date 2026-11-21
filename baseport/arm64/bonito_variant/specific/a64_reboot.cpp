@@ -42,6 +42,8 @@ void A64_RebootToFastboot()								// thread context (the SPMI write maps its ch
 	Kern::Printf("[reboot] SYSTEM_RESET returned");		// never: PSCI doesn't come back from a reset
 	}
 
+static volatile TBool CrashBiteArmed;					// a crash armed the final bite: nothing pets it again
+
 #ifdef A64_AUTOFASTBOOT
 // debug builds: from boot, the reason says "bootloader" and the watchdog runs, petted every second -- if anything
 // freezes the whole SoC (a register access the bus never answers stalls every CPU), the bite brings the phone back
@@ -52,6 +54,8 @@ static void PetTimerFn(TAny*) { PetDfc.Add(); }
 static NTimer PetTimer(PetTimerFn, NULL);
 static void PetDfcFn(TAny*)
 	{
+	if (CrashBiteArmed)
+		return;
 	((volatile TUint32*)A64_Io(KWdt))[EWdtRst / 4] = 1;
 	PetTimer.OneShot(NKern::TimerTicks(1000));
 	}
@@ -91,9 +95,9 @@ TInt A64_PowerOff()
 
 // a kernel fault (NotifyCrash, interrupts off): register writes only. The bite restarts the phone 10 s later -- time
 // to read the FAULT on screen -- and ABL then boots the active slot normally (an install image cleared the reason at
-// boot), counting a failed try on a slot not yet marked successful: the FS5b rollback. Test images keep petting the
-// watchdog from the other CPUs and stay on the screen until AUTOFASTBOOT.
-static volatile TBool CrashBiteArmed;
+// boot), counting a failed try on a slot not yet marked successful: the FS5b rollback. Test images stop petting it
+// too, so a crash lands in fastboot 10 s later (their reason says "bootloader") instead of a black screen until
+// AUTOFASTBOOT (an ESock system-critical panic, 2026-11-21).
 extern "C" void A64_CrashReset()
 	{
 	CrashBiteArmed = ETrue;

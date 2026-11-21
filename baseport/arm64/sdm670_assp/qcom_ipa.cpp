@@ -409,8 +409,12 @@ static void PollFn(TAny*)
 		Dsb();
 		G(EChDoorbell + 8 * KLanCh) = RingAddr(LanRing, LanRing.iNext);
 		}
-	TUint32 generation = Smp2p_Generation(KSmemHostModem), in = 0;
-	if (generation != ClockReplyGeneration && Smp2p_In(KSmemHostModem, "ipa", in) == KErrNone && (in & 1))
+	// The modem's clock query: its "ipa" bit 0. After a modem restart the new boot sets it to 1 again, the value the
+	// old one left, which SMP2P's stale filter hides (no answer, and the modem asserted "ipa_hwp_init ... didnt rx
+	// any ind frm HWP" 2 s after every restart, 2026-11-21): read it unfiltered once this boot reported ready.
+	TUint32 generation = Smp2p_Generation(KSmemHostModem), in = 0, sk = 0;
+	TBool up = Smp2p_In(KSmemHostModem, "slave-kernel", sk) == KErrNone && (sk & KMssReady) && !(sk & KMssFatal);
+	if (generation != ClockReplyGeneration && up && Smp2p_InRaw(KSmemHostModem, "ipa", in) == KErrNone && (in & 1))
 		{
 		// Enabled before valid, as Linux. Every write checks generation under SMP2P's state lock.
 		// A reset between either write and this DFC's acknowledgement leaves the new generation pending.

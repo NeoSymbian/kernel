@@ -145,6 +145,23 @@ TInt Smp2p_In(TInt aRemote, const char* aEntry, TUint32& aValue)
 	return KErrNotReady;
 	}
 
+// as Smp2p_In without the stale-value filter: for an entry whose new boot writes the same value as the old one
+// (the modem's "ipa" clock query is 1 in both lives), checked by the caller against a fresh signal
+TInt Smp2p_InRaw(TInt aRemote, const char* aEntry, TUint32& aValue)
+	{
+	SEdge* e = Edge(aRemote);
+	SItem* in = e ? In(*e) : NULL;
+	if (!in)
+		return KErrNotReady;
+	for (TInt i = 0; i < in->iValid && i < KEntries; ++i)
+		if (NameIs(in->iEntry[i].iName, aEntry))
+			{
+			aValue = in->iEntry[i].iValue;
+			return KErrNone;
+			}
+	return KErrNotReady;
+	}
+
 TUint32 Smp2p_Generation(TInt aRemote)
 	{
 	SEdge* e = Edge(aRemote);

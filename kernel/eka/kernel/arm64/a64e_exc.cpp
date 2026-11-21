@@ -330,9 +330,9 @@ static void SyncException(SThreadExcStack* aF, TUint32 aGroup)
 
 	if (fromUser && e.iExcCode != EArmExceptionUndefinedOpcode)	// bring-up aid: where a user fault really was
 		{
-		Kern::Printf("[exc] user %s abort: pc %08x far %08x esr %08x",
-			e.iExcCode == EArmExceptionDataAbort ? "data" : "prefetch", e.iR15, e.iFaultAddress, (TUint32)aF->iEsr);
-		// which module pc and lr are in: a RAM-loaded DLL sits at a different address on every boot
+		Kern::Printf("[exc] user %s abort: pc %08x lr %08x far %08x esr %08x",
+			e.iExcCode == EArmExceptionDataAbort ? "data" : "prefetch", e.iR15, e.iR14, e.iFaultAddress, (TUint32)aF->iEsr);
+		// which module pc and lr are in (RAM-loaded code: it moves every boot; ROM code: look it up in romsect.bin.map)
 		NKern::ThreadEnterCS();
 		Kern::AccessCode();
 		DCodeSeg* pc = Kern::CodeSegFromAddress(e.iR15, TheCurrentThread->iOwningProcess);

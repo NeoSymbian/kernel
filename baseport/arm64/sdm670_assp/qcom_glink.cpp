@@ -557,7 +557,9 @@ static TInt OpenLocked(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr
 	return Id(E, *c);
 	}
 
-static TInt SendLocked(TInt aChannel, const TAny* aData, TInt aLen)
+// aAskIntent: with no free remote intent, send an RX_INTENT_REQ (Glink_Send asks once per 50 tries, not on every one:
+// a flood of requests while the modem is slow made it grant more intents than our 16 slots hold)
+static TInt SendLocked(TInt aChannel, const TAny* aData, TInt aLen, TBool aAskIntent)
 	{
 	if (aChannel <= 0 || (aChannel >> 8) >= KEdges)
 		return KErrNotReady;
@@ -568,28 +570,25 @@ static TInt SendLocked(TInt aChannel, const TAny* aData, TInt aLen)
 	TUint32 id = 0;
 	TInt k = 0;
 	TBool found = EFalse;
-	for (TInt tries = 0; !found && tries < 1; ++tries)		// none free: ask for one, the GLINK thread files it
-		{
-		NKern::FMWait(&TxLock);
-		for (k = 0; k < KRemoteIntents; ++k)
-			if (c->iRemote[k].iState == EAvailable && c->iRemote[k].iSize >= (TUint32)aLen)
-				{
-				id = c->iRemote[k].iId;
-				c->iRemote[k].iState = EInUse;			// until RX_DONE gives it back (or not)
-				found = ETrue;
-				break;
-				}
-		NKern::FMSignal(&TxLock);
-		if (found)
-			break;
-		if (tries % 50 == 0)								// RX_INTENT_REQ: our id, the size we need (lost: asked again)
+	NKern::FMWait(&TxLock);
+	for (k = 0; k < KRemoteIntents; ++k)
+		if (c->iRemote[k].iState == EAvailable && c->iRemote[k].iSize >= (TUint32)aLen)
 			{
+			id = c->iRemote[k].iId;
+			c->iRemote[k].iState = EInUse;				// until RX_DONE gives it back (or not)
+			found = ETrue;
+			break;
+			}
+	NKern::FMSignal(&TxLock);
+	if (!found)
+		{
+		if (aAskIntent)									// RX_INTENT_REQ: our id, the size we need (lost: asked again)
+			{												// the GLINK thread files the grant
 			SMsg req = { EIntentReq, c->iLcid, (TUint32)aLen };
 			Tx(E, &req, sizeof(req));
 			}
-		}
-	if (!found)
 		return KErrNotReady;
+		}
 	struct { SMsg iM; TUint32 iChunk, iLeft; } h = { { ETxData, c->iLcid, id }, (TUint32)aLen, 0 };
 	TInt r = Tx(E, &h, sizeof(h), aData, aLen);
 	if (r != KErrNone)
@@ -645,7 +644,7 @@ TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
 		NKern::ThreadEnterCS();
 		Kern::MutexWait(*LifeLock);
 		TBool stale = generation != Generations[aChannel >> 8];
-		TInt r = stale ? KErrDied : SendLocked(aChannel, aData, aLen);
+		TInt r = stale ? KErrDied : SendLocked(aChannel, aData, aLen, i % 50 == 0);
 		Kern::MutexSignal(*LifeLock);
 		NKern::ThreadLeaveCS();
 		if (r != KErrNotReady)

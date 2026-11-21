@@ -40,16 +40,31 @@ FORCE_INLINE TUint64 A64TlbiOperand(TLinAddr aLinAddrAndAsid)
 	return ((TUint64)(aLinAddrAndAsid >> KPageShift)) | ((TUint64)(aLinAddrAndAsid & KMmuAsidMask) << 48);
 	}
 
+// Global memory (kernel, ROM, global chunks) is walked from every address space's own TTBR0 root (mpdalloc.cpp), so
+// the walk cache can hold its table entries under any ASID: those pages are invalidated for all ASIDs (VAAE1, as
+// Linux's __flush_tlb_kernel_pgtable). An ASID-0 VAE1 left HWHUB's cached level-2 entry pointing at a freed page table
+// (the PAS loader's L3 fault under load, 2026-11-21).
+FORCE_INLINE TBool A64TlbiAllAsids(TLinAddr aLinAddrAndAsid)
+	{
+	return (aLinAddrAndAsid & ~KPageMask) >= KGlobalMemoryBase;
+	}
+
 /** Invalidate the TLB entries for one page (VA | ASID) on this CPU only. */
 FORCE_INLINE void LocalInvalidateTLBForPage(TLinAddr aLinAddrAndAsid)
 	{
-	__asm__ __volatile__("dsb ishst\n\ttlbi vae1, %0\n\tdsb nsh\n\tisb" :: "r"(A64TlbiOperand(aLinAddrAndAsid)) : "memory");
+	if (A64TlbiAllAsids(aLinAddrAndAsid))
+		__asm__ __volatile__("dsb ishst\n\ttlbi vaae1, %0\n\tdsb nsh\n\tisb" :: "r"((TUint64)(aLinAddrAndAsid >> KPageShift)) : "memory");
+	else
+		__asm__ __volatile__("dsb ishst\n\ttlbi vae1, %0\n\tdsb nsh\n\tisb" :: "r"(A64TlbiOperand(aLinAddrAndAsid)) : "memory");
 	}
 
 /** Invalidate the TLB entries for one page (VA | ASID) on all CPUs. */
 FORCE_INLINE void InvalidateTLBForPage(TLinAddr aLinAddrAndAsid)
 	{
-	__asm__ __volatile__("dsb ishst\n\ttlbi vae1is, %0\n\tdsb ish\n\tisb" :: "r"(A64TlbiOperand(aLinAddrAndAsid)) : "memory");
+	if (A64TlbiAllAsids(aLinAddrAndAsid))
+		__asm__ __volatile__("dsb ishst\n\ttlbi vaae1is, %0\n\tdsb ish\n\tisb" :: "r"((TUint64)(aLinAddrAndAsid >> KPageShift)) : "memory");
+	else
+		__asm__ __volatile__("dsb ishst\n\ttlbi vae1is, %0\n\tdsb ish\n\tisb" :: "r"(A64TlbiOperand(aLinAddrAndAsid)) : "memory");
 	}
 
 /** Invalidate the entire TLB on this CPU only. */

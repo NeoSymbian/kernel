@@ -49,6 +49,9 @@ struct SChannel
 	SRemoteIntent iRemote[KRemoteIntents];	// the remote's receive buffers we may send into
 	TInt iRxCount, iTxCount;
 	TInt iRefused;					// the remote's intent requests we could not grant
+	TUint32 iAskTick;				// the last RX_INTENT_REQ of a try-send (at most one per 50 ms)
+	TUint32 iMissTick;				// the last "no intent" log line (at most one per second)
+	TInt iMisses;					// sends with no fitting remote intent since that line
 	};
 struct SOut { TUint32 iLen; TUint8 iData[KOutMsg]; };
 
@@ -135,16 +138,18 @@ static TUint32 TxWriteOne(SEdge& E, TUint32 aHead, const TAny* aData, TUint32 aC
 
 static NFastMutex TxLock;										// the GLINK thread and user threads (QrtrSend) both send
 
-static TInt Tx(SEdge& E, const TAny* aHdr, TUint32 aHlen, const TAny* aData = NULL, TUint32 aDlen = 0)
+// aWait: wait up to ~100 ms for FIFO space (a try-send doesn't wait: HWHUB's loop must not stall)
+static TInt Tx(SEdge& E, const TAny* aHdr, TUint32 aHlen, const TAny* aData = NULL, TUint32 aDlen = 0,
+	TBool aWait = ETrue)
 	{
 	TUint32 need = (aHlen + aDlen + 7) & ~7u;
-	for (TInt i = 0; ; ++i)									// the modem drains it; wait up to ~100 ms
+	for (TInt i = 0; ; ++i)									// the modem drains it
 		{
 		NKern::FMWait(&TxLock);
 		if (TxAvail(E) >= need)
 			break;											// keep the lock for the write
 		NKern::FMSignal(&TxLock);
-		if (i >= 100)
+		if (!aWait || i >= 100)
 			return KErrOverflow;
 		NKern::Sleep(NKern::TimerTicks(1));
 		}
@@ -357,6 +362,9 @@ static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all th
 				c->iRemote[slot].iSize = pair[0];
 				c->iRemote[slot].iState = EAvailable;
 				}
+			if (pair[0] > KIntentSize || slot < 0)			// the big grants an RX_INTENT_REQ asked for, and losses
+				Kern::Printf("[glink %d] lcid %d: remote intent %d of %d bytes %s", E.iRemote, c->iLcid, pair[1],
+					pair[0], slot < 0 ? "DROPPED (no slot)" : "kept");
 			}
 		NKern::FMSignal(&TxLock);
 		RxAdvance(E, len);
@@ -459,10 +467,14 @@ static TBool RxOne(SEdge& E)										// one command; EFalse if it is not all th
 		NKern::FMSignal(&TxLock);
 		return ETrue;
 		}
+	case EIntentReqAck:										// param2: 1 granted (an INTENT follows), 0 denied
+		RxAdvance(E, sizeof(m));
+		if (!m.iParam2)
+			Kern::Printf("[glink %d] rcid %d: intent request DENIED", E.iRemote, m.iParam1);
+		return ETrue;
 	case ECloseAck:
 	case EReadNotif:
 	case ESignals:
-	case EIntentReqAck:
 		RxAdvance(E, sizeof(m));
 		return ETrue;
 	default:
@@ -559,7 +571,8 @@ static TInt OpenLocked(TInt aRemote, const char* aName, TGlinkRx aRx, TAny* aPtr
 
 // aAskIntent: with no free remote intent, send an RX_INTENT_REQ (Glink_Send asks once per 50 tries, not on every one:
 // a flood of requests while the modem is slow made it grant more intents than our 16 slots hold)
-static TInt SendLocked(TInt aChannel, const TAny* aData, TInt aLen, TBool aAskIntent)
+// aWait 0 (a try-send): no FIFO wait, and at most one RX_INTENT_REQ per 50 ms per channel
+static TInt SendLocked(TInt aChannel, const TAny* aData, TInt aLen, TBool aAskIntent, TBool aWait = ETrue)
 	{
 	if (aChannel <= 0 || (aChannel >> 8) >= KEdges)
 		return KErrNotReady;
@@ -568,29 +581,44 @@ static TInt SendLocked(TInt aChannel, const TAny* aData, TInt aLen, TBool aAskIn
 	if (!E.iUp || !c || !c->iRcid || !c->iOpenAcked)
 		return KErrNotReady;
 	TUint32 id = 0;
-	TInt k = 0;
-	TBool found = EFalse;
+	TInt k = -1, avail = 0;
+	TUint32 biggest = 0;
 	NKern::FMWait(&TxLock);
-	for (k = 0; k < KRemoteIntents; ++k)
-		if (c->iRemote[k].iState == EAvailable && c->iRemote[k].iSize >= (TUint32)aLen)
+	for (TInt n = 0; n < KRemoteIntents; ++n)			// the smallest that fits: a small packet keeps big grants free
+		if (c->iRemote[n].iState == EAvailable)
 			{
-			id = c->iRemote[k].iId;
-			c->iRemote[k].iState = EInUse;				// until RX_DONE gives it back (or not)
-			found = ETrue;
-			break;
+			++avail;
+			biggest = Max(biggest, c->iRemote[n].iSize);
+			if (c->iRemote[n].iSize >= (TUint32)aLen && (k < 0 || c->iRemote[n].iSize < c->iRemote[k].iSize))
+				k = n;
 			}
-	NKern::FMSignal(&TxLock);
-	if (!found)
+	if (k >= 0)
 		{
-		if (aAskIntent)									// RX_INTENT_REQ: our id, the size we need (lost: asked again)
-			{												// the GLINK thread files the grant
-			SMsg req = { EIntentReq, c->iLcid, (TUint32)aLen };
-			Tx(E, &req, sizeof(req));
+		id = c->iRemote[k].iId;
+		c->iRemote[k].iState = EInUse;					// until RX_DONE gives it back (or not)
+		}
+	NKern::FMSignal(&TxLock);
+	if (k < 0)
+		{
+		TUint32 now = NKern::TickCount();
+		++c->iMisses;
+		if (now - c->iMissTick >= (TUint32)NKern::TimerTicks(1000))
+			{
+			Kern::Printf("[glink %d] lcid %d: no remote intent for %d bytes (%d sends; %d free, biggest %d)", E.iRemote,
+				c->iLcid, aLen, c->iMisses, avail, biggest);
+			c->iMissTick = now;
+			c->iMisses = 0;
+			}
+		if (aAskIntent && (aWait || now - c->iAskTick >= (TUint32)NKern::TimerTicks(50)))
+			{												// RX_INTENT_REQ: our id, the size we need (lost: asked again)
+			SMsg req = { EIntentReq, c->iLcid, (TUint32)aLen };	// the GLINK thread files the grant
+			if (Tx(E, &req, sizeof(req), NULL, 0, aWait) == KErrNone)
+				c->iAskTick = now;
 			}
 		return KErrNotReady;
 		}
 	struct { SMsg iM; TUint32 iChunk, iLeft; } h = { { ETxData, c->iLcid, id }, (TUint32)aLen, 0 };
-	TInt r = Tx(E, &h, sizeof(h), aData, aLen);
+	TInt r = Tx(E, &h, sizeof(h), aData, aLen, aWait);
 	if (r != KErrNone)
 		{
 		// never sent, so no RX_DONE will come for it: the intent is still ours to use (2026-11-09 review F03)
@@ -652,6 +680,20 @@ TInt Glink_Send(TInt aChannel, const TAny* aData, TInt aLen)
 		NKern::Sleep(NKern::TimerTicks(1)); // let polling publish an intent; no lifecycle lock held
 		}
 	return KErrNotReady;
+	}
+
+// one attempt, no waiting (HWHUB's QRTR pump): KErrNotReady with no fitting remote intent (one is asked for),
+// KErrOverflow with no FIFO space; the caller keeps the packet and tries again on its next loop
+TInt Glink_TrySend(TInt aChannel, const TAny* aData, TInt aLen)
+	{
+	if (!LifeLock || aChannel <= 0 || (aChannel >> 8) >= KEdges || aLen <= 0 || aLen > 0x2000)
+		return KErrNotReady;
+	NKern::ThreadEnterCS();
+	Kern::MutexWait(*LifeLock);
+	TInt r = SendLocked(aChannel, aData, aLen, ETrue, EFalse);
+	Kern::MutexSignal(*LifeLock);
+	NKern::ThreadLeaveCS();
+	return r;
 	}
 
 TInt Glink_Stop(TInt aRemote)

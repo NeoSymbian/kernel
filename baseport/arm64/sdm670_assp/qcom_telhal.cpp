@@ -37,6 +37,8 @@
 //                      3 complete {b = ticket, buf = adsp_gen} after the DSP is done; 4 copy out {b = offset, len,
 //                      buf}. Up to 16 ranges are published at once; copies refuse a published range (KErrInUse).
 //                      0x4e27 Haptic SIo{a = ms 0..2000, b = amplitude 0..127}; zero stops, a timer bounds each pulse.
+//   0x4e28 QrtrTrySend  as 0x4e0f QrtrSend, one attempt and no waiting: KErrNotReady (no fitting modem intent, one is
+//                      asked for) or KErrOverflow (FIFO full) leave the packet with the caller (HWHUB's TFTP window)
 // The receive paths are polled by the daemon; messages wait in a 64 KB ring per channel filled by the GLINK thread.
 // shortcut: HAL polling, not an LDD with async notification; that comes with power management (C12).
 #include <kernel/kern_priv.h>
@@ -63,7 +65,7 @@ __attribute__((weak)) TInt A64Audio_Control(TInt, TInt) { return KErrNotSupporte
 
 enum { EBoot = 0x4e0d, EState, EQrtrSend, EQrtrRecv, EPartRead, ERmtfsMem, EIpaStart, EAdspLoad, EAdspState, EChanSend,
 	EChanRecv, EAudio, EFwRead = 0x4e1b, EWlanMsa, EWlanStart, EPrng = 0x4e23, ERprocStop, ERprocState, EAudioMem,
-	EHaptic };
+	EHaptic, EQrtrTrySend };
 struct SIo { TUint32 iA, iB, iLen, iBuf; };
 const TInt KMaxMsg = 0x2000, KChunk = 0x10000;
 const TUint32 KRmtfsPhys = 0xfc201000, KRmtfsSize = 0x200000;
@@ -227,7 +229,7 @@ static TInt RingPop(SRing& aR, TUint8* aBuf)				// aBuf holds KMaxMsg; the lengt
 	}
 
 // a send or a receive between user memory and ring/channel aRing, through a kernel buffer
-static TInt ChanIo(TBool aSend, TInt aRing, TAny* aBuf, TInt aLen)
+static TInt ChanIo(TBool aSend, TInt aRing, TAny* aBuf, TInt aLen, TBool aTry = EFalse)
 	{
 	SRing* ring = (SRing*)Tel_Ring(aRing);
 	if (!ring || aLen <= 0 || (aSend && aLen > KMaxMsg))
@@ -241,7 +243,8 @@ static TInt ChanIo(TBool aSend, TInt aRing, TAny* aBuf, TInt aLen)
 	if (aSend)
 		{
 		kumemget(k, aBuf, aLen);
-		r = ring->iChannel >= 0 ? Glink_Send(ring->iChannel, k, aLen) : KErrNotReady;
+		r = ring->iChannel < 0 ? KErrNotReady : aTry ? Glink_TrySend(ring->iChannel, k, aLen)
+			: Glink_Send(ring->iChannel, k, aLen);
 		}
 	else if ((r = RingPop(*ring, k)) > 0)
 		{
@@ -809,6 +812,8 @@ TInt A64Tel_Hal(TInt aFunction, TAny* a1, TAny* a2)
 	case EQrtrSend:
 	case EQrtrRecv:
 		return ChanIo(aFunction == EQrtrSend, 0, a1, (TInt)a2);
+	case EQrtrTrySend:
+		return ChanIo(ETrue, 0, a1, (TInt)a2, ETrue);
 	case EPartRead:
 	case ERmtfsMem:
 		{

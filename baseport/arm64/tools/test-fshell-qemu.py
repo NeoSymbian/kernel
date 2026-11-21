@@ -6,8 +6,15 @@ Boots out/ekern-qemu (neo kernel qemu: a ROM with fshell, NeoSymbian/build) with
 into eshell the command that starts fshell on it (vt100busdevcons over ECOMM unit 1). Then, through fshell_link.py:
 `ls`, a SHA-256 `hash`, `ps`, a failing command's exit status, and a YMODEM round trip (push, pull) of a file holding
 every byte value, checked by SHA-256 on both ends. Prints "test-fshell-qemu: PASS" and exits 0 iff all pass.
-Usage: test-fshell-qemu.py [SECS] (default 240).
+Then, for the user-side tests on virt (docs user-side-smp.md US6a), it can put the build's drive=c EXEs on C: and run
+programs: each run prints "test-fshell-qemu: run <command> -> <exit status>" and its fshell output; the caller checks
+the statuses and the serial log (the programs' RDebug lines and the kernel's "Thread ... Killed/Panic" lines).
+Usage: test-fshell-qemu.py [SECS] [--cdrive VOLUME] [--run COMMAND]...  (SECS default 240)
+  --cdrive VOLUME  push the files VOLUME/emitter/rust_cdrive.args lists ("Sys/Bin/X.EXE=emitter/x.exe") to C:
+  --run COMMAND    run COMMAND in fshell after the checks (RUN_TIMEOUT seconds each, default 300)
 """
+
+import argparse
 
 import hashlib
 import os
@@ -21,7 +28,12 @@ from pathlib import Path
 
 import fshell_link as fl
 
-secs = int(sys.argv[1]) if len(sys.argv) > 1 else 240
+opts = argparse.ArgumentParser()
+opts.add_argument("secs", nargs="?", type=int, default=240)
+opts.add_argument("--cdrive")
+opts.add_argument("--run", action="append", default=[])
+args = opts.parse_args()
+secs = args.secs
 tools = os.path.dirname(os.path.abspath(__file__))
 out = os.environ.get("OUT", os.path.join(tools, "../../../out/ekern-qemu"))
 tmp = tempfile.mkdtemp(
@@ -90,6 +102,20 @@ try:
         sent == want == got and Path(back).read_bytes() == data,
         f"YMODEM round trip of {len(data)} bytes, SHA-256 {want}",
     )
+    if args.cdrive:
+        shell.execute("mkdir C:\\sys")  # a fresh C: has no \sys\bin; an existing one only fails these
+        shell.execute("mkdir C:\\sys\\bin")
+        for line in Path(args.cdrive, "emitter", "rust_cdrive.args").read_text().split():
+            remote, _, local = line.partition("=")
+            remote = "C:\\" + remote.replace("/", "\\")
+            digest = shell.push(os.path.join(args.cdrive, local), remote, overwrite=True)
+            check(True, f"pushed {remote} (SHA-256 {digest})")
+    shell.timeout = float(os.environ.get("RUN_TIMEOUT", "300"))
+    for command in args.run:
+        r = shell.execute(command)
+        print(f"test-fshell-qemu: run {command} -> {r.status}", flush=True)
+        for line in r.output.decode(errors="replace").splitlines():
+            print(f"  | {line}", flush=True)
 except fl.DebugError as error:
     check(False, f"{type(error).__name__}: {error}")
 finally:

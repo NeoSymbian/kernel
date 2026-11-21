@@ -1,4 +1,4 @@
-// Copied unchanged from Phorepoc core os/toolchain/x32/x64smp/x64s_atomics.cpp: the __e32_atomic_* family on GCC
+// From Phorepoc core os/toolchain/x32/x64smp/x64s_atomics.cpp (NeoSymbian: a DSB completion barrier): the __e32_atomic_* family on GCC
 // __atomic builtins is ABI-independent, so the AArch64 ILP32 port uses it as is (it compiles to LDAXR/STLXR or LSE).
 // Copyright The Phorepoc Authors
 // SPDX-License-Identifier: Apache-2.0
@@ -135,6 +135,8 @@ EXPORT_C TInt __e32_bit_count_64(TUint64 v)
 
 /* ---- barriers -------------------------------------------------------------- */
 EXPORT_C void __e32_memory_barrier(void)         { __sync_synchronize(); }
-EXPORT_C void __e32_io_completion_barrier(void)  { __sync_synchronize(); }
+// NeoSymbian: completion, not just ordering (its contract, e32atomics.h): page-table writes must reach the table
+// walker before a TLBI or a new access (__sync_synchronize is only DMB ISH)
+EXPORT_C void __e32_io_completion_barrier(void)  { __asm__ __volatile__("dsb sy" ::: "memory"); }
 
 } // extern "C"

@@ -491,8 +491,13 @@ static TInt Boot()
 		{
 		TUint32 len = 0;
 		const char* why = (const char*)Smem_Get(KSmemHostGlobal, 421, &len);	// SMEM_SSR_REASON_MSS0
+		char reason[161];												// bounded: monitor lines stay < 256
+		TUint32 n = 0;
+		for (; why && n < len && n < sizeof(reason) - 1 && why[n]; ++n)
+			reason[n] = why[n] >= ' ' && why[n] < 0x7f ? why[n] : '.';
+		reason[n] = 0;
 		Kern::Printf("[mss] slave-kernel %08x (SMP2P generation %d); crash reason: %s", v,
-			Smp2p_Generation(KSmemHostModem), why && len && why[0] ? why : "(none from this boot)");
+			Smp2p_Generation(KSmemHostModem), n ? reason : "(none from this boot)");
 		return Fail(Step, v & KMssFatal ? KErrDied : KErrTimedOut, "ready");
 		}
 	// GLINK right away, as Linux starts the rproc's glink subdevice at "up"; handover comes after (~1 s there)
@@ -583,13 +588,14 @@ TInt Mss_Stop()
 	Kern::Printf("[mss] stop: step %d, slave-kernel %08x (%s)", Step, in, crashed ? "crashed"
 		: in & KMssShutdownAck ? "shutdown acknowledged" : "running");
 	Glink_Stop(KSmemHostModem);
-	// as Linux's glink subdevice stop: the ADSP drops its channels to the modem (qcom_glink_ssr do_cleanup)
-	Kern::Printf("[mss] stop: ADSP glink_ssr cleanup -> %d", Adsp_SsrCleanup("mpss"));
 	if (Step >= 7 && !crashed && !(in & KMssShutdownAck))
 		RequestStop();
 	TInt r = Step ? Stop() : KErrNone;
 	if (r != KErrNone)
 		return Error = r;
+	// the modem is halted: the ADSP drops its channels to it (Linux: qcom_glink_ssr do_cleanup from the glink
+	// subdevice's unprepare, which rproc_stop runs after ops->stop)
+	Kern::Printf("[mss] stop: ADSP glink_ssr cleanup -> %d", Adsp_SsrCleanup("mpss"));
 	r = Smp2p_Reset(KSmemHostModem); // invalidates generation-checked IPA replies
 	if (r != KErrNone)
 		return Error = r;

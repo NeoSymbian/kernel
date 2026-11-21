@@ -29,6 +29,7 @@
 #include "qcom_rpmh.h"
 #include "qcom_fat16.h"
 #include "qcom_glink.h"
+#include "qcom_adsp.h"
 #include "qcom_llcc.h"
 #include "qcom_telhal.h"
 #include "qcom_mss.h"
@@ -490,7 +491,13 @@ static TInt Boot()
 		{
 		TUint32 len = 0;
 		const char* why = (const char*)Smem_Get(KSmemHostGlobal, 421, &len);	// SMEM_SSR_REASON_MSS0
-		Kern::Printf("[mss] slave-kernel %08x; crash reason: %s", v, why && len ? why : "(none)");
+		char reason[161];												// bounded: monitor lines stay < 256
+		TUint32 n = 0;
+		for (; why && n < len && n < sizeof(reason) - 1 && why[n]; ++n)
+			reason[n] = why[n] >= ' ' && why[n] < 0x7f ? why[n] : '.';
+		reason[n] = 0;
+		Kern::Printf("[mss] slave-kernel %08x (SMP2P generation %d); crash reason: %s", v,
+			Smp2p_Generation(KSmemHostModem), n ? reason : "(none from this boot)");
 		return Fail(Step, v & KMssFatal ? KErrDied : KErrTimedOut, "ready");
 		}
 	// GLINK right away, as Linux starts the rproc's glink subdevice at "up"; handover comes after (~1 s there)
@@ -510,7 +517,7 @@ static TInt Boot()
 		Smp2p_Poll(KSmemHostModem);
 		Smp2p_In(KSmemHostModem, "slave-kernel", v);
 		}
-	Kern::Printf("[mss] after %d ms: slave-kernel %08x%s", i, v, v & KMssHandover ? " (handover)" : "");
+	Kern::Printf("[mss] after %d polls: slave-kernel %08x%s", i, v, v & KMssHandover ? " (handover)" : "");
 	if (v & KMssHandover)
 		ReleaseProxy();
 	if (v & KMssFatal)
@@ -550,20 +557,55 @@ void Mss_State(TInt& aStep, TInt& aError, TUint32 aRmb[4])
 	aRmb[3] = Reg(KRmb + ERmbCodeLength);
 	}
 
+// Linux qcom_q6v5_request_stop: our stop bit, then up to 5 s for the modem's stop-ack, then the bit cleared again.
+// Skipped for a crashed modem and after an SSCTL shutdown it acknowledged (HWHUB asks first, as Linux sysmon).
+static void RequestStop()
+	{
+	Smp2p_Set(KSmemHostModem, "master-kernel", KMssStop, KMssStop);
+	TUint32 v = 0;
+	TInt i;
+	for (i = 0; i < 5000; ++i)
+		{
+		Smp2p_Poll(KSmemHostModem);
+		if (Smp2p_In(KSmemHostModem, "slave-kernel", v) == KErrNone && (v & (KMssStopAck | KMssFatal)))
+			break;
+		NKern::Sleep(NKern::TimerTicks(1));
+		}
+	Smp2p_Set(KSmemHostModem, "master-kernel", KMssStop, 0);
+	if (v & KMssStopAck)
+		Kern::Printf("[mss] stop: stop-ack in %d ms", i);
+	else
+		Kern::Printf("[mss] stop: no stop-ack in %d ms (slave-kernel %08x): forcing", i, v);
+	}
+
 TInt Mss_Stop()
 	{
 	if (BootBusy)
 		return KErrInUse;
+	TUint32 in = 0;
+	Smp2p_Poll(KSmemHostModem);
+	TBool crashed = Smp2p_In(KSmemHostModem, "slave-kernel", in) != KErrNone || (in & KMssFatal);
+	Kern::Printf("[mss] stop: step %d, slave-kernel %08x (%s)", Step, in, crashed ? "crashed"
+		: in & KMssShutdownAck ? "shutdown acknowledged" : "running");
 	Glink_Stop(KSmemHostModem);
+	if (Step >= 7 && !crashed && !(in & KMssShutdownAck))
+		RequestStop();
 	TInt r = Step ? Stop() : KErrNone;
 	if (r != KErrNone)
 		return Error = r;
+	// the modem is halted: the ADSP drops its channels to it (Linux: qcom_glink_ssr do_cleanup from the glink
+	// subdevice's unprepare, which rproc_stop runs after ops->stop)
+	Kern::Printf("[mss] stop: ADSP glink_ssr cleanup -> %d", Adsp_SsrCleanup("mpss"));
 	r = Smp2p_Reset(KSmemHostModem); // invalidates generation-checked IPA replies
 	if (r != KErrNone)
 		return Error = r;
 	// the AOP's view goes with it, as Linux's qcom_q6v5_unprepare: boot sends "on" again, and an AOP still at "on"
 	// timed out that second "on" (phone 2026-11-12: qmp load_state -33, the modem never came back after a FATAL)
 	Kern::Printf("[mss] load_state off -> %d", Qmp_Send("{class: image, res: load_state, name: modem, val: off}"));
+	TUint32 len = 0;											// the last run's crash reason is spent: a new boot's
+	char* why = (char*)Smem_Get(KSmemHostGlobal, 421, &len);	// failure prints its own, or none
+	if (why && len)
+		why[0] = 0;
 	Step = 0;
 	Error = 0;
 	return KErrNone;

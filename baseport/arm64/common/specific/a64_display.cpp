@@ -182,6 +182,10 @@ TLinAddr A64_FbLinear()								// a64_dbgmon.cpp "shot"
 	return TheFbChunk ? TheFbChunk->LinearAddress() : 0;
 	}
 
+// a board whose display hardware must be told where the framebuffer is (QEMU virt: a64_ramfb.cpp); the panel boards
+// scan out from a fixed address already
+__attribute__((weak)) void A64Display_Scanout(TPhysAddr, TInt, TInt, TInt) {}
+
 void A64StartDisplay()
 	{
 	TInt size = A64_FbStride * A64_FbHeight;
@@ -206,6 +210,7 @@ void A64StartDisplay()
 	Kern::Printf("[display] %dx%d 32 bpp, framebuffer phys %08x size %x, user linear %08x, HAL -> %d",
 		A64_FbWidth, A64_FbHeight, TheFbPhys, size, TheFbChunk->LinearAddress(), r);
 	A64_ConsoleReserveTop(A64_FbHeight);
+	A64Display_Scanout(TheFbPhys, A64_FbWidth, A64_FbHeight, A64_FbStride);
 	}
 
 static TA64DevState DisplayStatus(TDes8& aDetail)

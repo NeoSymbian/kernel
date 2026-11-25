@@ -13,7 +13,8 @@ Environment:
                  wait N        sleep N seconds
                  abs X Y       move the tablet to X, Y in QEMU's absolute range 0..0x7fff (QMP input-send-event;
                                virt_assp/virtio_input.cpp maps v to v * size / 0x8000 pixels)
-                 anything else: an HMP command (mouse_button 1, sendkey a), after MON_GAP seconds (default 0.3)
+                 anything else: an HMP command (mouse_button 1, sendkey a)
+               every abs and HMP step comes MON_GAP seconds after the previous one (default 0.1, as the Syborg job)
   READY        regex in the serial log that means "ready for input" (default: neoui: boot OK), READY_SETTLE seconds more
                (default 3)
   FB           the screen as a PNG at the end and when the run fails (default $OUT/fb.png; empty: none)
@@ -191,7 +192,7 @@ def main():
                 raise TimeoutError(f"READY ({ready}) not seen")
             time.sleep(float(env("READY_SETTLE", "3")))
             print(f"ui-qemu: ready after {time.time() - start:.1f} s", flush=True)
-            gap = float(env("MON_GAP", "0.3"))
+            gap = float(env("MON_GAP", "0.1"))
             for kind, arg in steps:
                 if re.search(fault, serial.text):
                     break
@@ -209,6 +210,7 @@ def main():
                 elif kind == "wait":
                     time.sleep(arg)
                 elif kind == "abs":
+                    time.sleep(gap)  # paced like Syborg's mouse_move lines: swipes keep their speed
                     qmp.cmd(
                         "input-send-event",
                         events=[

@@ -67,9 +67,9 @@ static const char* Scanout(TPhysAddr aFb, TInt aWidth, TInt aHeight, TInt aStrid
 	TPhysAddr phys;
 	DPlatChunkHw* chunk = NULL;
 	NKern::ThreadEnterCS();
-	TInt r = Epoc::AllocPhysicalRam(KPageSize, phys);
+	TInt r = Epoc::AllocPhysicalRam(4096, phys);
 	if (r == KErrNone)
-		r = DPlatChunkHw::New(chunk, phys, KPageSize, EMapAttrSupRw | EMapAttrBufferedNC);
+		r = DPlatChunkHw::New(chunk, phys, 4096, EMapAttrSupRw | EMapAttrBufferedNC);
 	NKern::ThreadLeaveCS();
 	if (r != KErrNone)
 		return "no DMA page";

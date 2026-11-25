@@ -15,10 +15,10 @@ Usage: test-fshell-qemu.py [SECS] [--cdrive VOLUME] [--run COMMAND]...  (SECS de
 """
 
 import argparse
-
 import hashlib
 import os
 import random
+import shutil
 import socket
 import subprocess
 import sys
@@ -27,6 +27,9 @@ import time
 from pathlib import Path
 
 import fshell_link as fl
+
+# NeoSymbian/neoqemu's run-qemu.sh, on the toolchain image's PATH (/opt/neoqemu/bin)
+RUN_QEMU = shutil.which("run-qemu.sh") or sys.exit("run-qemu.sh (NeoSymbian/neoqemu) is not on PATH: run inside the toolchain image")
 
 opts = argparse.ArgumentParser()
 opts.add_argument("secs", nargs="?", type=int, default=240)
@@ -49,7 +52,7 @@ env = dict(
     INPUT_DELAY=os.environ.get("INPUT_DELAY", "25"),
 )
 qemu = subprocess.Popen(
-    ["sh", os.path.join(tools, "run-qemu.sh"), str(secs)],
+    ["sh", RUN_QEMU, str(secs)],
     env=env,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.STDOUT,

@@ -25,9 +25,9 @@ side's build volume mounted. By hand, inside that image (`KHS` defaults to this 
 ```sh
 BOARD=qemu   baseport/arm64/tools/build-kernel.sh      # nanokernel test image (nkernsa)
 BOARD=qemu   baseport/arm64/tools/build-ekern.sh       # full kernel + the 2010 user side (needs the NeoSymbian/build volume at S2010)
-baseport/arm64/tools/run-qemu.sh 60                    # boot out/kernel-qemu/Image on QEMU virt
-VNC=:0 baseport/arm64/tools/run-qemu.sh 3600          # the same with its 539x1079 screen, touch and keys on VNC :5900
-MONITOR="..." baseport/arm64/tools/ui-qemu.py 300     # a UI ROM driven by script (neoui symbian/taps.sh; the UI CI)
+OUT=out/kernel-qemu run-qemu.sh 60                     # boot it on QEMU virt (NeoSymbian/neoqemu's tools, on the image's PATH)
+VNC=:0 OUT=out/ekern-qemu run-qemu.sh 3600             # the same with its 539x1079 screen, touch and keys on VNC :5900
+MONITOR="..." OUT=out/ekern-qemu ui-qemu.py 300        # a UI ROM driven by script (neoui symbian/taps.sh; the UI CI)
 BOARD=bonito DTB=bonito.dtb baseport/arm64/tools/build-ekern.sh   # -> out/ekern-bonito/boot.img
 fastboot boot out/ekern-bonito/boot.img
 BOARD=sargo DTB=sargo.dtb baseport/arm64/tools/build-ekern.sh     # the Pixel 3a: its own DTB (SARGO_DTB), never committed

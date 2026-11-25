@@ -48,12 +48,14 @@ static void SetSteps(TBool aTop)
 
 // The boost's end: one absolute deadline (NKern::TickCount), only ever moved later while boosted, so touches (3 s) and
 // a video's asks don't shorten each other. Boosted, Deadline, the timer and the steps change only under BoostLock; NTimer
-// takes its own queue lock (EOrderNTimerQ) inside it. The drop lowers the steps only once the deadline has passed (an ask
+// takes its own queue lock (EOrderNTimerQ, 0x10) inside it, so BoostLock ranks above it (nested locks go down in order),
+// and the expiry takes BoostLock only after the timer code has let go of NTimerQ. The drop lowers the steps only once the deadline has passed (an ask
 // that came while it was due wins), and an ask always raises them (review of kernel#44: an expiry on another CPU, or a
 // 1 ms ask's, could leave the steps low while Boosted said otherwise).
 // shortcut: no thermal limit on a long boost (TSENS is read for telemetry only; LMh caps clocks in hardware at 95 C);
 // a governor with a thermal policy comes with power (H3).
-static TSpinLock BoostLock(TSpinLock::EOrderGenericIrqLow2);
+static TSpinLock BoostLock(TSpinLock::EOrderGenericIrqHigh0);
+// the first tick at which the boost may end: an ask's tick + its ticks + 1, the earliest tick its expiry can see
 static TUint32 Deadline;
 static void DropFn(TAny*);
 static NTimer DropTimer(DropFn, NULL);
@@ -63,7 +65,7 @@ static void DropFn(TAny*)
 	TInt irq = BoostLock.LockIrqSave();
 	TInt left = (TInt)(Deadline - NKern::TickCount());
 	if (left > 0)
-		DropTimer.OneShot(left);						// a later ask moved the end (KErrInUse: it re-armed already)
+		DropTimer.OneShot(left - 1 > 0 ? left - 1 : 1);	// a later ask moved the end (KErrInUse: it re-armed already)
 	else
 		{
 		__e32_atomic_store_rel32(&Boosted, 0);
@@ -79,7 +81,7 @@ TInt A64CpuBoostFor(TInt aMs)
 		return KErrNotSupported;
 	TInt ticks = NKern::TimerTicks(aMs);
 	TInt irq = BoostLock.LockIrqSave();
-	TUint32 until = NKern::TickCount() + (TUint32)ticks;
+	TUint32 until = NKern::TickCount() + (TUint32)ticks + 1;
 	if (!Boosted || (TInt)(until - Deadline) > 0)
 		{
 		Deadline = until;

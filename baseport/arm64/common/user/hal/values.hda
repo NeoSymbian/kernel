@@ -26,8 +26,8 @@ ESystemTickPeriod=15625
 EMemoryPageSize=0x1000
 EPowerGood=1
 EPowerExternal=1
-// a touch screen, no mouse (the input drivers post pointer events in screen pixels)
-EPen=1
+// no mouse (the input drivers post pointer events in screen pixels). No EPen either: its size (EPenX/EPenY) would
+// need a digitiser HAL in the kernel, and only the window server's tests read it
 EMouse=0
 ECaseSwitch=0
 EIntegratedPhone=0

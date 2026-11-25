@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # build-userrom.sh -- the user side of the AArch64 kernel image, from the NeoSymbian/build build (READ-ONLY:
 # its Docker volume, mounted at S2010; run its ./build.sh first):
-#   - romsect.bin: the ROM SECTION -- the same user-side images and data files as that build's Syborg minigui ROM
-#     (its own .ekern-build/rombuild.args, so the content can't drift: euser, F32, estart, the window server stack,
+#   - romsect.bin: the ROM SECTION -- the user-side images and data files that build selected (its
+#     .ekern-build/rombuild.args, so the content can't drift: euser, F32, estart, the window server stack,
 #     eshell, the Rust EXEs) plus the font, with our estart.txt; prelinked as XIP E32 images with a Z: tree by
 #     tools/rombuild.py --section (from Phorepoc's pdk) for the ARM flexible memory model. The kernel image .incbin's it; a64boot.cpp reads it.
+#   - user/e32-manifest.txt: sha256, size, Z: path and core/rofs of every E32 image in it, as built.
 # Env: S2010 = the volume's mount, OUT = output dir, BASE = the section's linear address,
 #      USERROM_SKIP = comma-separated Z: names to leave out (default none: estart starts SYSSTART.EXE = neoui, the
 #      Rust UI server; USERROM_SKIP='Sys\Bin\SYSSTART.EXE' gives the window server -> eshell console instead),
@@ -32,7 +33,7 @@ TXT
 	ESTART=$OUT/user/estart.txt
 fi
 python3 -I - "$SRCARGS" "$S2010" "$ESTART" "$ARGS" "${USERROM_SKIP-}" "$ROFS" "$HERE/tools" "$OUT/user/rofs.oby" <<'PY'
-import os, re, sys
+import hashlib, os, re, sys
 src, root, estart, out = sys.argv[1:5]
 rofs, tools, oby = sys.argv[6] != "0", sys.argv[7], sys.argv[8]
 words = [w.rstrip("\n") for w in open(src) if w.strip()]
@@ -90,11 +91,23 @@ if rofs:
             # executables get every capability, as the XIP ROM's (rombuild.py --xinfo cap1/cap2): the images' own
             # headers say none, and servers like !Windowserver need ProtServ
             lines.append("file=%s %s capability=All" % (path, z) if o == "--xip" else "data=%s %s" % (path, z))
+    selected = list(zip(res[0::2], res[1::2]))
     res = keep
     open(oby, "w").write("\n".join(lines) + "\n")
     print("ROFS split: %d in the core ROM, %d in the ROFS" % (len(keep) // 2, len(lines) - 3))
 open(out, "w").write("\n".join(res) + "\n")
 print("user side: %d files from %s" % (n, src))
+# e32-manifest.txt: every E32 image this board's Z: gets ("EPOC" at byte 16), as built (before rombuild relocates the
+# core's), with where it went -- the bytes to compare between boards and builds (docs user-side-smp.md US5)
+in_core = {v for o, v in zip(res[0::2], res[1::2])}
+rows = []
+for o, v in (selected if rofs else list(zip(res[0::2], res[1::2]))):
+    z, _, path = v.partition("=")
+    data = open(path, "rb").read()
+    if data[16:20] == b"EPOC":
+        rows.append("%s %d Z:\\%s %s" % (hashlib.sha256(data).hexdigest(), len(data), z, "core" if v in in_core else "rofs"))
+open(os.path.join(os.path.dirname(out), "e32-manifest.txt"), "w").write("".join(r + "\n" for r in sorted(rows, key=lambda r: r.split()[2].lower())))
+print("e32-manifest.txt: %d E32 images" % len(rows))
 PY
 if [ "$ROFS" != 0 ]; then
 	command -v rofsbuild >/dev/null || { echo "ROFS=1 needs rofsbuild (the toolchain image's host tools)"; exit 1; }

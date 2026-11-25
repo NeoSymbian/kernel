@@ -1,7 +1,9 @@
 #
-# QEMU SYBORG ESTART.TXT
+# estart.txt -- the drive map ESTART reads on NeoSymbian (Z:\Sys\Data\estart.txt; build's scripts/build-user-manifest.sh).
+# From Syborg's estart.txt (symbian-qemu baseport/syborg, EPL-1.0); The NeoSymbian Authors (2026): comments only.
+# SPDX-License-Identifier: EPL-2.0
+# Which media backs each local drive is the kernel's choice: common/specific/a64_media.cpp.
 #
 
 D:  0  ELOCAL  FAT   0       FS_FORMAT_COLD,FS_SYNC_DRIVE       # IRAM
 C:  1  ELOCAL  FAT   0       FS_FORMAT_CORRUPT,FS_NOT_RUGGED    # NVMEM
-

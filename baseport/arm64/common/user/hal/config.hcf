@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: EPL-2.0
+// config.hcf -- which HAL attributes HAL.DLL asks the kernel for (a userhal.cpp function) and which are static
+// (= 0: values.hda) on NeoSymbian. From Syborg's config.hcf (symbian-qemu baseport/syborg/hal, EPL-1.0, Nokia and
+// NTT DOCOMO); The NeoSymbian Authors (2026): ENanoTickPeriod, EFastCounterFrequency and ENumCpus come from the
+// kernel (Syborg had fixed 10 ms / 1 MHz / none; virt's counter is 62.5 MHz, the Pixel's 19.2 MHz, the tick 1 ms).
 EManufacturer=0
 EManufacturerHardwareRev=0
 EManufacturerSoftwareRev=0
@@ -77,8 +82,8 @@ EDebugPort : set = ProcessDebugPort
 EClipboardDrive=0
 ESystemDrive : set = 0
 EDisplayNumberOfScreens=0
-ENanoTickPeriod=0
-EFastCounterFrequency=0
+ENanoTickPeriod=ProcessNanoTickPeriod
+EFastCounterFrequency=ProcessFastCounterFrequency
 EFastCounterCountsUp=0
 EHardwareFloatingPoint = GetHardwareFloatingPoint
-
+ENumCpus=GetNumCpus

@@ -8,8 +8,10 @@ run-syborg (Syborg's runner, whose contract this keeps): it waits on the serial 
 
 Environment:
   MONITOR      the script, ';'-separated:
-                 expect TEXT   wait until TEXT appears in the serial log after the previous expect's match
-                               (EXPECT_MAX seconds, default 30)
+                 expect TEXT   wait until TEXT appears in the serial log after the current action began: the
+                               first abs/HMP step after the previous expect (EXPECT_MAX seconds, default 30).
+                               One action's expects match in any order: on virt's 4 CPUs an app's reaction and
+                               neoui's own "tap from" line come in either order (Syborg's run-syborg was stricter)
                  wait N        sleep N seconds
                  abs X Y       move the tablet to X, Y in QEMU's absolute range 0..0x7fff (QMP input-send-event;
                                virt_assp/virtio_input.cpp maps v to v * size / 0x8000 pixels)
@@ -226,10 +228,15 @@ def main():
             time.sleep(float(env("READY_SETTLE", "3")))
             print(f"ui-qemu: ready after {time.time() - start:.1f} s", flush=True)
             gap = float(env("MON_GAP", "0.1"))
+            new_action = True
             for kind, arg in steps:
                 if re.search(fault, serial.text):
                     break
+                if kind in ("abs", "hmp") and new_action:
+                    serial.poll()
+                    pos, new_action = len(serial.text), False
                 if kind == "expect":
+                    new_action = True
                     end = serial.wait(
                         re.escape(arg),
                         pos,
@@ -239,7 +246,6 @@ def main():
                         raise TimeoutError(
                             f"expect: {arg!r} did not appear in the serial log"
                         )
-                    pos = end
                 elif kind == "wait":
                     time.sleep(arg)
                 elif kind == "abs":

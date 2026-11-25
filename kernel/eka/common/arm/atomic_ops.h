@@ -34,6 +34,8 @@
 #undef	__LDA_INST__
 #undef	__STL_INST__
 #undef	__LDA_STL_ATOMICS__
+#undef	__NEO_STR__
+#undef	__NEO_XSTR__
 #undef	__SIGN_EXTEND__
 #undef	__LOG2_DATA_SIZE__
 
@@ -157,8 +159,10 @@
 // barrier, so ord keeps its two DMBs). 8, 16 and 32 bits (atomic_32_v6.h); 64 bits keep their DMBs.
 #if defined(__CPU_ARM_HAS_LDA_STL) && defined(__BARRIERS_NEEDED__) && __DATA_SIZE__!=64
 #define	__LDA_STL_ATOMICS__
-#define	__LDAEX_INST__(Rd,Rn)		asm("ldaex" __SIZE_CODE__ " r" #Rd ", [r" #Rn "] ")
-#define	__STLEX_INST__(Rd,Rm,Rn)	asm("stlex" __SIZE_CODE__ " r" #Rd ", r" #Rm ", [r" #Rn "] ")
+#define	__NEO_STR__(x)				#x
+#define	__NEO_XSTR__(x)				__NEO_STR__(x)		// expands the argument first (__SOURCE_REG__)
+#define	__LDAEX_INST__(Rd,Rn)		asm("ldaex" __SIZE_CODE__ " r" __NEO_XSTR__(Rd) ", [r" __NEO_XSTR__(Rn) "] ")
+#define	__STLEX_INST__(Rd,Rm,Rn)	asm("stlex" __SIZE_CODE__ " r" __NEO_XSTR__(Rd) ", r" __NEO_XSTR__(Rm) ", [r" __NEO_XSTR__(Rn) "] ")
 #define	__LDA_INST__(args)			asm("lda" __SIZE_CODE__ " " args)
 #define	__STL_INST__(args)			asm("stl" __SIZE_CODE__ " " args)
 #endif

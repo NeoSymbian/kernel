@@ -25,6 +25,8 @@ side's build volume mounted. By hand, inside that image (`KHS` defaults to this 
 BOARD=qemu   baseport/arm64/tools/build-kernel.sh      # nanokernel test image (nkernsa)
 BOARD=qemu   baseport/arm64/tools/build-ekern.sh       # full kernel + the 2010 user side (needs the NeoSymbian/build volume at S2010)
 baseport/arm64/tools/run-qemu.sh 60                    # boot out/kernel-qemu/Image on QEMU virt
+VNC=:0 baseport/arm64/tools/run-qemu.sh 3600          # the same with its 539x1079 screen, touch and keys on VNC :5900
+MONITOR="..." baseport/arm64/tools/ui-qemu.py 300     # a UI ROM driven by script (neoui symbian/taps.sh; the UI CI)
 BOARD=bonito DTB=bonito.dtb baseport/arm64/tools/build-ekern.sh   # -> out/ekern-bonito/boot.img
 fastboot boot out/ekern-bonito/boot.img
 BOARD=sargo DTB=sargo.dtb baseport/arm64/tools/build-ekern.sh     # the Pixel 3a: its own DTB (SARGO_DTB), never committed
@@ -46,7 +48,7 @@ A driver joins the running kernel in one of four ways:
 |---|---|---|
 | **Board interface** | Implements `kernel/eka/include/kernel/arm64/board.h` in the board's `BOARD_SRC` file | `pixel_bonito.cpp`, `qemu_virt.cpp`: GIC, timer, console, I/O map (`A64_IoRegions`), framebuffer |
 | **Start hook** | A strong `A64Start*()` overrides a weak empty default in `a64_variant.cpp`. The one kernel extension, `A64ExtensionEntry`, calls the hooks **in a fixed order** | `A64StartBuses`, `A64StartCpufreq`, `A64StartKeys`, `A64StartTouch`, `A64StartUsbConsole`, `A64StartSerialKeyboard`, `A64StartReboot` |
-| **Weak override** | A strong definition replaces a weak default that generic code calls | `A64BlkDev_*` (sdhci, virtio_blk), `A64_RtcSeconds` (rtc), `A64CpuBoost` (cpufreq, called from `kernel/eventq.cpp`), `A64_Restart`/`A64_CrashReset` (reboot), `A64Tel_Hal` (telhal) |
+| **Weak override** | A strong definition replaces a weak default that generic code calls | `A64BlkDev_*` (sdhci, virtio_blk), `A64Display_Scanout` (QEMU virt's ramfb), `A64_RtcSeconds` (rtc), `A64CpuBoost` (cpufreq, called from `kernel/eventq.cpp`), `A64_Restart`/`A64_CrashReset` (reboot), `A64Tel_Hal` (telhal) |
 | **Library** | Plain functions that other drivers call | `Spmi_*`, `I2c_*`, `Bcm/Arc/Vrm_Vote` (rpmh), `Smem_*`, `Scm_*`, GLINK, SMP2P |
 
 User-facing interfaces:

@@ -9,7 +9,12 @@
 #      unix:/tmp/uart1.sock,server=on,wait=off (tools/test-serial-qemu.py). The first stays the console on stdio.
 #      DISK=<file>: a virtio-blk disk (the persistent C:, board/virtio_blk.cpp), created 256 MB if missing,
 #      FBDUMP=<file.png>: a moment before the timeout, save the full kernel's RAM framebuffer (the address its display
-#      driver prints: "[display] WxH 32 bpp, framebuffer phys P") through the monitor and convert it to a PNG.
+#      driver prints: "[display] WxH 32 bpp, framebuffer phys P") through the monitor and convert it to a PNG,
+#      QMP=<socket path>: a QMP server there (tools/ui-qemu.py: input-send-event, screendump),
+#      VNC=<display>: the screen and input over VNC, e.g. VNC=:0 (port 5900) on VNC_LISTEN (default 127.0.0.1; no
+#      password: forward the port, never listen beyond localhost).
+# The machine has a ramfb display (virt_assp/a64_ramfb.cpp shows the framebuffer on it), a virtio tablet and keyboard
+# (virt_assp/virtio_input.cpp: VNC's pointer and keys, QMP input-send-event); virtio-mmio is the legacy transport.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${OUT:-$HERE/../../out/kernel-qemu}
@@ -21,11 +26,15 @@ MONITOR=none; [ -n "${MON:-}" ] && MONITOR="unix:$MON,server,nowait"
 DISKARGS=""
 if [ -n "${DISK:-}" ]; then
 	[ -f "$DISK" ] || truncate -s 256M "$DISK"
-	DISKARGS="-global virtio-mmio.force-legacy=true -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
+	DISKARGS="-drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
 fi
+EXTRA=""
+[ -n "${QMP:-}" ] && rm -f "$QMP" && EXTRA="-qmp unix:$QMP,server=on,wait=off"
+[ -n "${VNC:-}" ] && EXTRA="$EXTRA -vnc ${VNC_LISTEN:-127.0.0.1}$VNC"
 qemu() { timeout "$SECS" qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a55 -smp "${SMP:-4}" -m 512 \
-	-display none -serial stdio -serial "${SERIAL1:-null}" -monitor "$MONITOR" \
-	-no-reboot -nic none $DISKARGS -kernel "$OUT/Image" > "$OUT/serial.log" 2>&1; }
+	-display none -serial stdio -serial "${SERIAL1:-null}" -monitor "$MONITOR" $EXTRA \
+	-no-reboot -nic none -global virtio-mmio.force-legacy=true -device ramfb \
+	-device virtio-tablet-device -device virtio-keyboard-device $DISKARGS -kernel "$OUT/Image" > "$OUT/serial.log" 2>&1; }
 if [ -n "${INPUT:-}" ]; then
 	{ sleep "${INPUT_DELAY:-15}"
 	  rest=$INPUT

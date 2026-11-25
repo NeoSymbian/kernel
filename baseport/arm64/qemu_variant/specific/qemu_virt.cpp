@@ -19,13 +19,15 @@ unsigned int A64_CpuMpidr(int aCpu) { return (unsigned int)aCpu; }			// Aff0 = C
 const SA64IoRegion A64_IoRegions[] = {
 	{ 0x08000000, 0x00200000, 1 },		// GICv3 distributor + 8 redistributor frames
 	{ 0x09000000, 0x00001000, 1 },		// PL011 (the console)
+	{ 0x09020000, 0x00001000, 1 },		// fw_cfg: the ramfb display's config (virt_assp/a64_ramfb.cpp)
 	{ 0x09040000, 0x00001000, 1 },		// the second PL011 (VIRT_UART1): the debug serial port (virt_assp/a64_pl011_comm.cpp)
 	{ 0x0a000000, 0x00004000, 1 },		// 32 virtio-mmio transports (virtio_blk.cpp: run-qemu.sh DISK=)
 	};
 const int A64_IoRegionCount = sizeof(A64_IoRegions) / sizeof(A64_IoRegions[0]);
-// no display device: a RAM framebuffer the display driver allocates (run-qemu.sh FBDUMP= takes it via the monitor)
+// a RAM framebuffer the display driver allocates, shown by QEMU's ramfb (a64_ramfb.cpp). Phone-shaped with odd sizes,
+// half the Pixel's 1079x2159 (docs user-side-smp.md US6b): the UI must adapt to what the device reports
 const unsigned long A64_FbPhys = 0;
-const int A64_FbWidth = 800, A64_FbHeight = 600, A64_FbStride = 800 * 4;
+const int A64_FbWidth = 539, A64_FbHeight = 1079, A64_FbStride = 539 * 4;
 }
 
 extern "C" void A64_DebugPutc(char c)

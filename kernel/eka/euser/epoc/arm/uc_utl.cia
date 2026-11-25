@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): RFastLock takes and frees the lock with LDAEX/STLEX on ARMv8 (no DMBs).
 // Description:
 // e32\euser\epoc\arm\uc_utl.cia
 // 
@@ -1287,6 +1287,16 @@ __NAKED__ EXPORT_C void CServer2::RunL()
 	}
 #endif
 
+// NeoSymbian: on ARMv8 (cpudefs.h) the lock is taken with a load-acquire exclusive and freed with a store-release
+// exclusive, in place of the DMB after taking it and before freeing it. The timed Wait's back-out keeps its DMBs.
+#ifdef __CPU_ARM_HAS_LDA_STL
+#define	LDREX_ACQ(Rd,Rn)		asm("ldaex r" #Rd ", [r" #Rn "] ")
+#define	STREX_REL(Rd,Rm,Rn)		asm("stlex r" #Rd ", r" #Rm ", [r" #Rn "] ")
+#else
+#define	LDREX_ACQ(Rd,Rn)		LDREX(Rd,Rn)
+#define	STREX_REL(Rd,Rm,Rn)		STREX(Rd,Rm,Rn)
+#endif
+
 EXPORT_C __NAKED__ void RFastLock::Wait()
 	{
 	asm("1: ");
@@ -1294,14 +1304,14 @@ EXPORT_C __NAKED__ void RFastLock::Wait()
 
 #ifdef __CPU_ARM_HAS_LDREX_STREX
 	asm("2:		");
-	LDREX(		2, 0);							// read
+	LDREX_ACQ(	2, 0);							// read
 	asm("subs	r1, r2, #1 ");					// decrement
 	STREX(		3, 1, 0);						// write
 	asm("teq	r3, #0 ");						// success?
 	asm("bne	2b ");							// no!
 	asm("sub	r0, r0, #4 ");					// r0 = this
 	asm("bcs "	CSM_ZN10RSemaphore4WaitEv);		// if no borrow from decrement wait on semaphore
-#ifdef __SMP__
+#if defined(__SMP__) && !defined(__CPU_ARM_HAS_LDA_STL)
 	__DATA_MEMORY_BARRIER__(r3);				// no need to wait, but still need acquire barrier
 #endif
 	__JUMP(,	lr );
@@ -1328,14 +1338,14 @@ EXPORT_C __NAKED__ TInt RFastLock::Poll()
 
 #ifdef __CPU_ARM_HAS_LDREX_STREX
 	asm("2:		");
-	LDREX(		2, 0);							// read
+	LDREX_ACQ(	2, 0);							// read
 	asm("subs	r1, r2, #1 ");					// decrement
 	asm("bcs	3f ");							// if no borrow, lock cannot be obtained so bail out
 	STREX(		3, 1, 0);						// write
 	asm("teq	r3, #0 ");						// success?
 	asm("bne	2b ");							// no!
 	asm("mov	r0, #0 ");						// lock acquired so return KErrNone
-#ifdef __SMP__
+#if defined(__SMP__) && !defined(__CPU_ARM_HAS_LDA_STL)
 	__DATA_MEMORY_BARRIER__(r3);				// need acquire barrier
 #endif
 	__JUMP(,	lr);
@@ -1363,13 +1373,13 @@ EXPORT_C __NAKED__ void RFastLock::Signal()
 	asm("add	r0, r0, #4 ");					// point to iCount
 
 #ifdef __CPU_ARM_HAS_LDREX_STREX
-#ifdef __SMP__
+#if defined(__SMP__) && !defined(__CPU_ARM_HAS_LDA_STL)
 	__DATA_MEMORY_BARRIER_Z__(r3);				// need release barrier
 #endif
 	asm("2:		");
 	LDREX(		2, 0);							// read
 	asm("adds	r1, r2, #1 ");					// increment
-	STREX(		3, 1, 0);						// write
+	STREX_REL(	3, 1, 0);						// write
 	asm("teq	r3, #0 ");						// success?
 	asm("bne	2b ");							// no!
 	asm("sub	r0, r0, #4 ");					// r0 = this
@@ -1422,13 +1432,13 @@ EXPORT_C __NAKED__ TInt RFastLock::Wait(TInt /*aTimeout*/)
 
 #ifdef __CPU_ARM_HAS_LDREX_STREX
 	asm("2:		");
-	LDREX(		2, 4);							// read
+	LDREX_ACQ(	2, 4);							// read
 	asm("subs	r12, r2, #1 ");					// decrement
 	STREX(		3, 12, 4);						// write
 	asm("teq	r3, #0 ");						// success?
 	asm("bne	2b ");							// no!
 	asm("bcs	8f ");							// if no borrow from decrement, need to wait
-#ifdef __SMP__
+#if defined(__SMP__) && !defined(__CPU_ARM_HAS_LDA_STL)
 	__DATA_MEMORY_BARRIER__(r3);				// no need to wait, but still need acquire barrier
 #endif
 #else	// no LDREX/STREX - ARM arch 5 CPU

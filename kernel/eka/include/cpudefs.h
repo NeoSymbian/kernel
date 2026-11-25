@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): __CPU_ARMV8A__, the ARMv8-A AArch32 user side (LDA/STL, CRC32).
 // Description:
 // e32\include\cpudefs.h
 // 
@@ -69,13 +69,15 @@
 	#define __CPU_SPECIFIED
 #elif defined(__CPU_CORTEX_A9__)
 	#define __CPU_SPECIFIED
+#elif defined(__CPU_ARMV8A__)			// NeoSymbian
+	#define __CPU_SPECIFIED
 #elif defined(__CPU_GENERIC_ARM4__)
 	#define __CPU_SPECIFIED
 #endif
 
 #if defined(__SMP__)
 	#if defined(__CPU_SPECIFIED)
-		#if !defined(__CPU_ARM11MP__) && !defined(__CPU_CORTEX_A9__)
+		#if !defined(__CPU_ARM11MP__) && !defined(__CPU_CORTEX_A9__) && !defined(__CPU_ARMV8A__)
 			#error Specified CPU does not support SMP
 		#endif
 	#else
@@ -124,6 +126,16 @@
 
 #elif defined(__CPU_CORTEX_A9__)
 	#define __CPU_ARMV7
+
+#elif defined(__CPU_ARMV8A__)
+	// NeoSymbian: ARMv8-A in AArch32 (the user side on Cortex-A55/A75). Everything ARMv7 has, plus acquire/release
+	// loads, stores and exclusives (euser's atomics and RFastLock use them in place of DMBs) and, when the compiler
+	// targets it (-march=armv8-a+crc), the CRC32 instructions (Mem::Crc32).
+	#define __CPU_ARMV7
+	#define __CPU_ARM_HAS_LDA_STL
+	#if defined(__ARM_FEATURE_CRC32)
+		#define __CPU_ARM_HAS_CRC32
+	#endif
 
 #elif defined(__CPU_GENERIC_ARM4__)
 	#define __CPU_ARMV4

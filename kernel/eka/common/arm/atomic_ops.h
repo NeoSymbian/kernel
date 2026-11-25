@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-//
+// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-//
+// The NeoSymbian Authors (2026): acquire/release (LDA/STL) forms for the ARMv8 profile (__CPU_ARM_HAS_LDA_STL).
 // Description:
 // e32\common\arm\atomic_ops.h
 // 
@@ -29,6 +29,11 @@
 #undef	__STR_INST__
 #undef	__LDREX_INST__
 #undef	__STREX_INST__
+#undef	__LDAEX_INST__
+#undef	__STLEX_INST__
+#undef	__LDA_INST__
+#undef	__STL_INST__
+#undef	__LDA_STL_ATOMICS__
 #undef	__SIGN_EXTEND__
 #undef	__LOG2_DATA_SIZE__
 
@@ -145,6 +150,17 @@
 #endif
 #else
 #error Invalid data size
+#endif
+
+// NeoSymbian: on ARMv8 (cpudefs.h __CPU_ARM_HAS_LDA_STL) acquire/release come from the instructions, not from DMBs:
+// acq = LDA / LDAEX..STREX, rel = STL / LDREX..STLEX; rlx and ord stay as they are (LDAEX+STLEX is not a full
+// barrier, so ord keeps its two DMBs). 8, 16 and 32 bits (atomic_32_v6.h); 64 bits keep their DMBs.
+#if defined(__CPU_ARM_HAS_LDA_STL) && defined(__BARRIERS_NEEDED__) && __DATA_SIZE__!=64
+#define	__LDA_STL_ATOMICS__
+#define	__LDAEX_INST__(Rd,Rn)		asm("ldaex" __SIZE_CODE__ " r" #Rd ", [r" #Rn "] ")
+#define	__STLEX_INST__(Rd,Rm,Rn)	asm("stlex" __SIZE_CODE__ " r" #Rd ", r" #Rm ", [r" #Rn "] ")
+#define	__LDA_INST__(args)			asm("lda" __SIZE_CODE__ " " args)
+#define	__STL_INST__(args)			asm("stl" __SIZE_CODE__ " " args)
 #endif
 
 #if (defined(__GNUC__) && (__GNUC__ >= 3)) || defined(__EABI__)

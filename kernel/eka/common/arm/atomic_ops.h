@@ -29,7 +29,6 @@
 #undef	__STR_INST__
 #undef	__LDREX_INST__
 #undef	__STREX_INST__
-#undef	__LDAEX_INST__
 #undef	__STLEX_INST__
 #undef	__LDA_INST__
 #undef	__STL_INST__
@@ -154,14 +153,14 @@
 #error Invalid data size
 #endif
 
-// NeoSymbian: on ARMv8 (cpudefs.h __CPU_ARM_HAS_LDA_STL) acquire/release come from the instructions, not from DMBs:
-// acq = LDA / LDAEX..STREX, rel = STL / LDREX..STLEX; rlx and ord stay as they are (LDAEX+STLEX is not a full
-// barrier, so ord keeps its two DMBs). 8, 16 and 32 bits (atomic_32_v6.h); 64 bits keep their DMBs.
+// NeoSymbian: on ARMv8 (cpudefs.h __CPU_ARM_HAS_LDA_STL), 8, 16 and 32 bits (atomic_32_v6.h): load acq = LDA, store rel
+// = STL, and the release RMWs that always store (swp, add, and, ior, xor, axo, tau, tas) = LDREX..STLEX, with no DMB.
+// The rest keep their DMBs: Symbian's acq orders the whole operation, write included, before later accesses (LDAEX
+// orders only the read); a release CAS whose compare fails stores nothing (no STLEX); ord is a full barrier; 64 bits.
 #if defined(__CPU_ARM_HAS_LDA_STL) && defined(__BARRIERS_NEEDED__) && __DATA_SIZE__!=64
 #define	__LDA_STL_ATOMICS__
 #define	__NEO_STR__(x)				#x
 #define	__NEO_XSTR__(x)				__NEO_STR__(x)		// expands the argument first (__SOURCE_REG__)
-#define	__LDAEX_INST__(Rd,Rn)		asm("ldaex" __SIZE_CODE__ " r" __NEO_XSTR__(Rd) ", [r" __NEO_XSTR__(Rn) "] ")
 #define	__STLEX_INST__(Rd,Rm,Rn)	asm("stlex" __SIZE_CODE__ " r" __NEO_XSTR__(Rd) ", r" __NEO_XSTR__(Rm) ", [r" __NEO_XSTR__(Rn) "] ")
 #define	__LDA_INST__(args)			asm("lda" __SIZE_CODE__ " " args)
 #define	__STL_INST__(args)			asm("stl" __SIZE_CODE__ " " args)

@@ -137,12 +137,8 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,acq,__DATA_SIZE__
 	{
 	// R0=a, R1=v
 	// return value in R0
-#ifdef __LDA_STL_ATOMICS__
-	__DO_RMW1_OPX__(__LDAEX_INST__,__STREX_INST__)
-#else
 	__DO_RMW1_OP__
 	__LOCAL_DATA_MEMORY_BARRIER__(r3);
-#endif
 	__JUMP(,lr);
 	}
 
@@ -175,12 +171,7 @@ extern "C" EXPORT_C __NAKED__ TBool __fname__(__OPERATION__,rel,__DATA_SIZE__)(v
 	// R0=a, R1=q, R2=v
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
-#ifdef __LDA_STL_ATOMICS__
-	__DO_CAS_OPX__(__LDREX_INST__,__STLEX_INST__)
-	__JUMP(,lr);
-#else
-	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
-#endif
+	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);	// NeoSymbian: kept on ARMv8 too: a failed compare skips the STLEX
 #endif
 	}
 
@@ -212,12 +203,8 @@ extern "C" EXPORT_C __NAKED__ TBool __fname__(__OPERATION__,acq,__DATA_SIZE__)(v
 	{
 	// R0=a, R1=q, R2=v
 	// return value in R0
-#ifdef __LDA_STL_ATOMICS__
-	__DO_CAS_OPX__(__LDAEX_INST__,__STREX_INST__)
-#else
 	__DO_CAS_OP__
 	__LOCAL_DATA_MEMORY_BARRIER__(r3);
-#endif
 	__JUMP(,lr);
 	}
 
@@ -291,16 +278,10 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,acq,__DATA_SIZE__
 	{
 	// R0=a, R1=u, R2=v
 	// return value in R0
-#ifdef __LDA_STL_ATOMICS__
-	__SAVE_REGS__
-	__DO_AXO_OPX__(__LDAEX_INST__,__STREX_INST__)
-	__RESTORE_REGS__
-#else
 	__SAVE_REGS__
 	__DO_AXO_OP__
 	__LOCAL_DATA_MEMORY_BARRIER__(r3);
 	__RESTORE_REGS__
-#endif
 	__JUMP(,lr);
 	}
 
@@ -387,16 +368,10 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,acq,__DATA_SIZE__
 	{
 	// R0=a, R1=t, R2=u, R3=v
 	// return value in R0
-#ifdef __LDA_STL_ATOMICS__
-	__SAVE_REGS__
-	__DO_RMW3_OPX__(__LDAEX_INST__,__STREX_INST__)
-	__RESTORE_REGS__
-#else
 	__SAVE_REGS__
 	__DO_RMW3_OP__
 	__LOCAL_DATA_MEMORY_BARRIER__(r5);
 	__RESTORE_REGS__
-#endif
 	__JUMP(,lr);
 	}
 

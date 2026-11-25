@@ -78,6 +78,31 @@ def pixel(v, size):
     return v * size // 0x8000
 
 
+def ppm_rows(data):
+    r"""(width, height, row length, pixels) of QEMU's screendump PPM.
+
+    shortcut: QEMU 11.1's ppm_save writes each row at pixman's 4-byte stride, so a width whose 3 * width is not a
+    multiple of 4 (539: 1617 bytes) gets padded rows; the row length comes from the file size. Drop it once QEMU
+    writes width * 3 bytes.
+    >>> ppm_rows(b"P6\n3 2\n255\n" + bytes(12) * 2)[:3]
+    (3, 2, 12)
+    >>> ppm_rows(b"P6\n4 2\n255\n" + bytes(12) * 2)[:3]
+    (4, 2, 12)
+    """
+    m = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\s", data)
+    if not m:
+        raise ValueError("not a P6 PPM")
+    w, h = int(m[1]), int(m[2])
+    pixels = data[m.end() :]
+    return w, h, len(pixels) // h, pixels
+
+
+def save_ppm(ppm, png, image):
+    with open(ppm, "rb") as f:
+        w, h, row, pixels = ppm_rows(f.read())
+    image.frombytes("RGB", (w, h), pixels, "raw", "RGB", row).save(png)
+
+
 class Qmp:
     """A minimal QMP client: one command at a time, events skipped."""
 
@@ -187,7 +212,7 @@ def main():
             except ImportError:  # outside the build image: keep the PPM
                 shutil.copyfile(ppm, os.path.splitext(fb)[0] + ".ppm")
                 return
-            Image.open(ppm).save(fb)
+            save_ppm(ppm, fb, Image)
 
     try:
         qmp = Qmp(qmp_path, start + 30)

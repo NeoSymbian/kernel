@@ -6,7 +6,8 @@
 // sets the clock and voltage. ABL leaves silver at its top step (1708.8 MHz), gold at its bottom (300 MHz) and L3 at
 // step 5 of 10 (smooth-ui S3b, monitor `cpus`).
 // Touch boost (smooth-ui S3c): every input event (Kern::AddEvent -> A64CpuBoost) puts all three at their top step;
-// 3 s after the last one they go back to the steps ABL left.
+// 3 s after the last one they go back to the steps ABL left. A media boost (HAL ENeoHalCpuBoost, FA12) asks for the same
+// for up to 5 s at a time: a video keeps asking while it plays, with nobody touching the phone.
 // Written from the register layout in Linux drivers/cpufreq/qcom-cpufreq-hw.c (sdm845: LUT at +0x110, 32-byte
 // rows, PERF_STATE at +0x920) and drivers/interconnect/qcom/osm-l3.c, checked against the phone with `peek`.
 // shortcut: no governor and no thermal driver (Qualcomm's LMh limits clocks in hardware at 95 C); a power policy
@@ -52,15 +53,26 @@ static void DropFn(TAny*)
 	}
 static NTimer DropTimer(DropFn, NULL);
 
+// Top steps now, ABL's steps aMs after the last call. The latest caller sets the time: a 3 s touch during a video's
+// 2 s asks keeps the clocks up until the next ask.
+TInt A64CpuBoostFor(TInt aMs)
+	{
+	if (!Ready)
+		return KErrNotSupported;
+	// the timer first: a drop that fires before it is re-armed then finds Boosted clear and the steps are raised again
+	DropTimer.Cancel();
+	DropTimer.OneShot(NKern::TimerTicks(aMs));
+	if (!__e32_atomic_swp_ord32(&Boosted, 1))
+		SetSteps(ETrue);
+	// shortcut: on SMP a drop already running on another CPU can still lower the steps after this; the next ask (a touch,
+	// or the video's next one within a second) raises them again
+	return KErrNone;
+	}
+
 // Called for every input event: top steps now, ABL's steps 3 s after the last event.
 void A64CpuBoost()
 	{
-	if (!Ready)
-		return;
-	if (!__e32_atomic_swp_ord32(&Boosted, 1))
-		SetSteps(ETrue);
-	DropTimer.Cancel();
-	DropTimer.OneShot(NKern::TimerTicks(KBoostMs));
+	A64CpuBoostFor(KBoostMs);
 	}
 
 void A64CpufreqDump()

@@ -64,13 +64,17 @@ public:
 //   ENeoHalBuildInfo   a1 = TDes8* -> this kernel's build: "kernel <commit>[+dirty] <UTC time> <board>" (no capability)
 enum { ENeoHalLogRead = 0x4e00, ENeoHalLastLogRead, ENeoHalConsoleSet, ENeoHalConsoleGet, ENeoHalUsbDebugSet,
 	ENeoHalUsbDebugGet, ENeoHalBootOk = 0x4e06,
-	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c, ENeoHalDeviceList = 0x4e19, ENeoHalBatteryRead = 0x4e1a, ENeoHalWlanScan = 0x4e1e, ENeoHalWlanLink = 0x4e1f };
+	ENeoHalSlotInfo = 0x4e09, ENeoHalBuildInfo = 0x4e0a, ENeoHalPower = 0x4e0b, ENeoHalRtcRead = 0x4e0c, ENeoHalDeviceList = 0x4e19, ENeoHalBatteryRead = 0x4e1a, ENeoHalWlanScan = 0x4e1e, ENeoHalWlanLink = 0x4e1f,
+	ENeoHalCpuBoost = 0x4e29 };
 //   ENeoHalPower       a1 = 0 restart, 1 restart to fastboot, 2 power off (PowerMgmt). Returns only on a failure; the
 //                      caller finalises the drives first (neoui's Power menu)
 //   ENeoHalRtcRead     a1 = TUint32* -> the PMIC RTC's raw seconds; KErrNotSupported without one (QEMU)
 //   0x4e0d..0x4e18     the modem and the ADSP (telephony C4-C6): boot, state, QRTR send/receive, EFS partition reads,
 //                      the rmtfs carve-out, IPA, ADSP channels, audio; CommDD. qcom_telhal.cpp on the Pixel,
 //                      KErrNotSupported elsewhere; 0x4e1b reads a firmware file of modem_a (the modem's TFTP, Wi-Fi W0)
+//   ENeoHalCpuBoost    a1 = milliseconds, 1..5000 -> top CPU and L3 clocks from now until that long after the last call
+//                      or input event, as a touch gives for 3 s (FA12: a video asks again while it plays; PowerMgmt).
+//                      KErrNotSupported on boards without cpufreq (QEMU)
 //   ENeoHalDeviceList  a1 = TUint32* cursor (in/out; 0 = the first), a2 = TDes8* (1024 bytes) -> the device registry
 //                      as lines "tag\tstate\tname\tdriver\tdetail\n", none past the end (a64_devices.cpp; ReadDeviceData)
 __attribute__((weak)) TInt A64Battery_Hal(TAny*) { return KErrNotSupported; }
@@ -107,6 +111,7 @@ static TInt LogToUser(TBool aLast, TAny* aCursor, TAny* aDes)
 // qcom_cpufreq.cpp on the Pixel (smooth-ui S3c); boards without one keep these
 __attribute__((weak)) TUint A64CpuMaxKHz() { return 0; }		// the fastest core's top clock; 0 = unknown
 __attribute__((weak)) void A64CpuBoost() {}					// every input event (Kern::AddEvent)
+__attribute__((weak)) TInt A64CpuBoostFor(TInt) { return KErrNotSupported; }	// ENeoHalCpuBoost
 __attribute__((weak)) void A64CpufreqDump() { Kern::Printf("[cpufreq] none on this board"); }	// monitor `cpufreq`
 
 // EHalGroupVariant. EVariantHalVariantInfo is the one UserHal::MachineInfo() requires (us_exec.cpp); Phorepoc's shape
@@ -198,6 +203,12 @@ TInt DA64Variant::VariantHal(TInt aFunction, TAny* a1, TAny* a2)
 		return A64Battery_Hal(a1);
 	case ENeoHalDeviceList:
 		return A64Device_Hal(a1, a2);
+	case ENeoHalCpuBoost:
+		if (!Kern::CurrentThreadHasCapability(ECapabilityPowerMgmt, __PLATSEC_DIAGNOSTIC_STRING("NeoSymbian CPU boost")))
+			return KErrPermissionDenied;
+		if ((TInt)a1 < 1 || (TInt)a1 > 5000)
+			return KErrArgument;
+		return A64CpuBoostFor((TInt)a1);
 	case ENeoHalConsoleGet:
 		{
 		TInt on = A64_ConsoleShown();

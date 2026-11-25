@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
+//
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): acquire/release (LDA/STL) forms for the ARMv8 profile (__CPU_ARM_HAS_LDA_STL).
+//
 // Description:
 // e32\common\arm\atomic_ops.h
 // 
@@ -29,12 +29,6 @@
 #undef	__STR_INST__
 #undef	__LDREX_INST__
 #undef	__STREX_INST__
-#undef	__STLEX_INST__
-#undef	__LDA_INST__
-#undef	__STL_INST__
-#undef	__LDA_STL_ATOMICS__
-#undef	__NEO_STR__
-#undef	__NEO_XSTR__
 #undef	__SIGN_EXTEND__
 #undef	__LOG2_DATA_SIZE__
 
@@ -151,19 +145,6 @@
 #endif
 #else
 #error Invalid data size
-#endif
-
-// NeoSymbian: on ARMv8 (cpudefs.h __CPU_ARM_HAS_LDA_STL), 8, 16 and 32 bits (atomic_32_v6.h): load acq = LDA, store rel
-// = STL, and the release RMWs that always store (swp, add, and, ior, xor, axo, tau, tas) = LDREX..STLEX, with no DMB.
-// The rest keep their DMBs: Symbian's acq orders the whole operation, write included, before later accesses (LDAEX
-// orders only the read); a release CAS whose compare fails stores nothing (no STLEX); ord is a full barrier; 64 bits.
-#if defined(__CPU_ARM_HAS_LDA_STL) && defined(__BARRIERS_NEEDED__) && __DATA_SIZE__!=64
-#define	__LDA_STL_ATOMICS__
-#define	__NEO_STR__(x)				#x
-#define	__NEO_XSTR__(x)				__NEO_STR__(x)		// expands the argument first (__SOURCE_REG__)
-#define	__STLEX_INST__(Rd,Rm,Rn)	asm("stlex" __SIZE_CODE__ " r" __NEO_XSTR__(Rd) ", r" __NEO_XSTR__(Rm) ", [r" __NEO_XSTR__(Rn) "] ")
-#define	__LDA_INST__(args)			asm("lda" __SIZE_CODE__ " " args)
-#define	__STL_INST__(args)			asm("stl" __SIZE_CODE__ " " args)
 #endif
 
 #if (defined(__GNUC__) && (__GNUC__ >= 3)) || defined(__EABI__)

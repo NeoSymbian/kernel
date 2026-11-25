@@ -9,7 +9,7 @@
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): __CPU_ARMV8A__, the ARMv8-A AArch32 user side (LDA/STL, CRC32).
+// The NeoSymbian Authors (2026): __CPU_ARMV8A__, the ARMv8-A AArch32 user side (CRC32).
 // Description:
 // e32\include\cpudefs.h
 // 
@@ -128,11 +128,10 @@
 	#define __CPU_ARMV7
 
 #elif defined(__CPU_ARMV8A__)
-	// NeoSymbian: ARMv8-A in AArch32 (the user side on Cortex-A55/A75). Everything ARMv7 has, plus acquire/release
-	// loads, stores and exclusives (euser's atomics and RFastLock use them in place of DMBs) and, when the compiler
-	// targets it (-march=armv8-a+crc), the CRC32 instructions (Mem::Crc32).
+	// NeoSymbian: ARMv8-A in AArch32 (the user side on Cortex-A55/A75). Everything ARMv7 has and, when the compiler
+	// targets it (-march=armv8-a+crc), the CRC32 instructions (Mem::Crc32: 8-11x faster on the Pixel). LDA/STL in
+	// place of euser's DMBs measured under 10 % on the A55 (docs user-side-smp.md, ARMv8 profile), so it isn't used.
 	#define __CPU_ARMV7
-	#define __CPU_ARM_HAS_LDA_STL
 	#if defined(__ARM_FEATURE_CRC32)
 		#define __CPU_ARM_HAS_CRC32
 	#endif

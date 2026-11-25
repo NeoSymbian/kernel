@@ -4,12 +4,12 @@
 // under the terms of the License "Eclipse Public License v1.0"
 // which accompanies this distribution, and is available
 // at the URL "http://www.eclipse.org/legal/epl-v10.html".
-// SPDX-License-Identifier: EPL-2.0 (changed by the NeoSymbian Authors)
+//
 // Initial Contributors:
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): acquire/release (LDA/STL) forms for the ARMv8 profile (__CPU_ARM_HAS_LDA_STL).
+//
 // Description:
 // e32\common\arm\atomic_32_v6.h
 // 32 bit atomic operations on V6 and V6K processors
@@ -26,12 +26,8 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,acq,__DATA_SIZE__
 	// R0=a
 	// return value in R0
 
-#ifdef __LDA_STL_ATOMICS__
-	__LDA_INST__("r0, [r0] ");
-#else
 	__LDR_INST__( ," r0, [r0] ");
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r1);
-#endif
 	__JUMP(,lr);
 	}
 
@@ -43,12 +39,8 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,rel,__DATA_SIZE__
 #ifdef __BARRIERS_NEEDED__
 	// R0=a, R1=v
 	// return value in R0 equal to v
-#ifdef __LDA_STL_ATOMICS__
-	__STL_INST__("r1, [r0] ");
-#else
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
 	__STR_INST__( ," r1, [r0] ");
-#endif
 	asm("mov r0, r1 ");
 	__JUMP(,lr);
 #endif
@@ -84,15 +76,14 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,ord,__DATA_SIZE__
 #endif
 #endif
 
-#define __DO_RMW1_OPX__(LDX,STX)				\
+#define __DO_RMW1_OP__				\
 	asm("mov r12, r0 ");			\
 	asm("1: ");						\
-	LDX(0,12);			\
+	__LDREX_INST__(0,12);			\
 	__DO_PROCESSING__				\
-	STX(3,__SOURCE_REG__,12);	\
+	__STREX_INST__(3,__SOURCE_REG__,12);	\
 	asm("cmp r3, #0 ");				\
 	asm("bne 1b ");
-#define __DO_RMW1_OP__	__DO_RMW1_OPX__(__LDREX_INST__,__STREX_INST__)
 
 
 extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,rel,__DATA_SIZE__)(volatile TAny* /*a*/, __TYPE__ /*v*/)
@@ -100,12 +91,7 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,rel,__DATA_SIZE__
 	// R0=a, R1=v
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
-#ifdef __LDA_STL_ATOMICS__
-	__DO_RMW1_OPX__(__LDREX_INST__,__STLEX_INST__)
-	__JUMP(,lr);
-#else
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
-#endif
 #endif
 	}
 
@@ -125,11 +111,6 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,ord,__DATA_SIZE__
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
-#ifdef __LDA_STL_ATOMICS__
-	__DO_RMW1_OP__
-	__LOCAL_DATA_MEMORY_BARRIER__(r3);
-	__JUMP(,lr);
-#endif
 #endif
 	}
 
@@ -143,27 +124,25 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,acq,__DATA_SIZE__
 	}
 
 #undef __DO_RMW1_OP__
-#undef __DO_RMW1_OPX__
 #undef __SOURCE_REG__
 #undef __DO_PROCESSING__
 
 
 #elif defined(__OP_CAS__)
 
-#define __DO_CAS_OPX__(LDX,STX)				\
+#define __DO_CAS_OP__				\
 	__LDR_INST__( ," r12, [r1] ");	\
 	asm("1: ");						\
-	LDX(3,0);			\
+	__LDREX_INST__(3,0);			\
 	asm("cmp r3, r12 ");			\
 	asm("bne 2f ");					\
-	STX(3,2,0);			\
+	__STREX_INST__(3,2,0);			\
 	asm("cmp r3, #0 ");				\
 	asm("bne 1b ");					\
 	asm("2: ");						\
 	__STR_INST__(ne, "r3, [r1] ");	\
 	asm("movne r0, #0 ");			\
 	asm("moveq r0, #1 ");
-#define __DO_CAS_OP__	__DO_CAS_OPX__(__LDREX_INST__,__STREX_INST__)
 
 
 extern "C" EXPORT_C __NAKED__ TBool __fname__(__OPERATION__,rel,__DATA_SIZE__)(volatile TAny* /*a*/, __TYPE__ * /*q*/, __TYPE__ /*v*/)
@@ -171,7 +150,7 @@ extern "C" EXPORT_C __NAKED__ TBool __fname__(__OPERATION__,rel,__DATA_SIZE__)(v
 	// R0=a, R1=q, R2=v
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
-	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);	// NeoSymbian: kept on ARMv8 too: a failed compare skips the STLEX
+	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
 #endif
 	}
 
@@ -191,11 +170,6 @@ extern "C" EXPORT_C __NAKED__ TBool __fname__(__OPERATION__,ord,__DATA_SIZE__)(v
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
-#ifdef __LDA_STL_ATOMICS__
-	__DO_CAS_OP__
-	__LOCAL_DATA_MEMORY_BARRIER__(r3);
-	__JUMP(,lr);
-#endif
 #endif
 	}
 
@@ -209,7 +183,6 @@ extern "C" EXPORT_C __NAKED__ TBool __fname__(__OPERATION__,acq,__DATA_SIZE__)(v
 	}
 
 #undef __DO_CAS_OP__
-#undef __DO_CAS_OPX__
 
 
 
@@ -218,16 +191,15 @@ extern "C" EXPORT_C __NAKED__ TBool __fname__(__OPERATION__,acq,__DATA_SIZE__)(v
 #define	__SAVE_REGS__		asm("str r4, [sp, #-4]! ");
 #define	__RESTORE_REGS__	asm("ldr r4, [sp], #4 ");
 
-#define __DO_AXO_OPX__(LDX,STX)				\
+#define __DO_AXO_OP__				\
 	asm("mov r12, r0 ");			\
 	asm("1: ");						\
-	LDX(0,12);			\
+	__LDREX_INST__(0,12);			\
 	asm("and r4, r0, r1 ");			\
 	asm("eor r4, r4, r2 ");			\
-	STX(3,4,12);			\
+	__STREX_INST__(3,4,12);			\
 	asm("cmp r3, #0 ");				\
 	asm("bne 1b ");
-#define __DO_AXO_OP__	__DO_AXO_OPX__(__LDREX_INST__,__STREX_INST__)
 
 
 extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,rel,__DATA_SIZE__)(volatile TAny* /*a*/, __TYPE__ /*u*/, __TYPE__ /*v*/)
@@ -235,14 +207,7 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,rel,__DATA_SIZE__
 	// R0=a, R1=u, R2=v
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
-#ifdef __LDA_STL_ATOMICS__
-	__SAVE_REGS__
-	__DO_AXO_OPX__(__LDREX_INST__,__STLEX_INST__)
-	__RESTORE_REGS__
-	__JUMP(,lr);
-#else
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
-#endif
 #endif
 	}
 
@@ -264,13 +229,6 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,ord,__DATA_SIZE__
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
-#ifdef __LDA_STL_ATOMICS__
-	__SAVE_REGS__
-	__DO_AXO_OP__
-	__LOCAL_DATA_MEMORY_BARRIER__(r3);
-	__RESTORE_REGS__
-	__JUMP(,lr);
-#endif
 #endif
 	}
 
@@ -288,7 +246,6 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,acq,__DATA_SIZE__
 #undef __SAVE_REGS__
 #undef __RESTORE_REGS__
 #undef __DO_AXO_OP__
-#undef __DO_AXO_OPX__
 
 
 #elif defined(__OP_RMW3__)
@@ -306,18 +263,17 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,acq,__DATA_SIZE__
 #define	__DO_SIGN_EXTEND__	__SIGN_EXTEND__(r0)
 #endif
 
-#define __DO_RMW3_OPX__(LDX,STX)				\
+#define __DO_RMW3_OP__				\
 	asm("mov r12, r0 ");			\
 	asm("1: ");						\
-	LDX(0,12);			\
+	__LDREX_INST__(0,12);			\
 	__DO_SIGN_EXTEND__				\
 	asm("cmp r0, r1 ");				\
 	asm("add" __COND_GE__ " r4, r0, r2 ");	\
 	asm("add" __COND_LT__ " r4, r0, r3 ");	\
-	STX(5,4,12);			\
+	__STREX_INST__(5,4,12);			\
 	asm("cmp r5, #0 ");				\
 	asm("bne 1b ");
-#define __DO_RMW3_OP__	__DO_RMW3_OPX__(__LDREX_INST__,__STREX_INST__)
 
 
 extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,rel,__DATA_SIZE__)(volatile TAny* /*a*/, __TYPE__ /*t*/, __TYPE__ /*u*/, __TYPE__ /*v*/)
@@ -325,14 +281,7 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,rel,__DATA_SIZE__
 	// R0=a, R1=t, R2=u, R3=v
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
-#ifdef __LDA_STL_ATOMICS__
-	__SAVE_REGS__
-	__DO_RMW3_OPX__(__LDREX_INST__,__STLEX_INST__)
-	__RESTORE_REGS__
-	__JUMP(,lr);
-#else
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
-#endif
 #endif
 	}
 
@@ -354,13 +303,6 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,ord,__DATA_SIZE__
 	// return value in R0
 #ifdef __BARRIERS_NEEDED__				// If no barriers, all ordering variants collapse to same function
 	__LOCAL_DATA_MEMORY_BARRIER_Z__(r12);
-#ifdef __LDA_STL_ATOMICS__
-	__SAVE_REGS__
-	__DO_RMW3_OP__
-	__LOCAL_DATA_MEMORY_BARRIER__(r5);
-	__RESTORE_REGS__
-	__JUMP(,lr);
-#endif
 #endif
 	}
 
@@ -378,7 +320,6 @@ extern "C" EXPORT_C __NAKED__ __TYPE__ __fname__(__OPERATION__,acq,__DATA_SIZE__
 #undef __SAVE_REGS__
 #undef __RESTORE_REGS__
 #undef __DO_RMW3_OP__
-#undef __DO_RMW3_OPX__
 #undef __COND_GE__
 #undef __COND_LT__
 #undef __DO_SIGN_EXTEND__

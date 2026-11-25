@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // virtio_input.cpp -- QEMU virt: touch and keys from virtio-input devices (run-qemu.sh -device virtio-tablet-device
-// -device virtio-keyboard-device), so the UI can be driven over VNC and by QMP input-send-event (tools/ui-qemu.py).
+// -device virtio-keyboard-device), so the UI can be driven over VNC and by QMP input-send-event (NeoSymbian/neoqemu's ui-qemu.py).
 // The legacy virtio-mmio v1 transport as virtio_blk.cpp; each device's event queue holds 8-byte Linux input events
 // (type, code, value) the device writes into buffers posted here. The transport's interrupt (SPI 16 + slot) queues a
 // DFC that turns them into what the Pixel's touch and key drivers post (Kern::AddEvent):

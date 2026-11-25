@@ -8,11 +8,15 @@ echo matches and the console shows "[serial] PASS". Usage: test-serial-qemu.py [
 """
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+
+# NeoSymbian/neoqemu's run-qemu.sh, on the toolchain image's PATH (/opt/neoqemu/bin)
+RUN_QEMU = shutil.which("run-qemu.sh") or sys.exit("run-qemu.sh (NeoSymbian/neoqemu) is not on PATH: run inside the toolchain image")
 
 secs = int(sys.argv[1]) if len(sys.argv) > 1 else 90
 tools = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +33,7 @@ env = dict(
     INPUT_DELAY=os.environ.get("INPUT_DELAY", "25"),
 )
 qemu = subprocess.Popen(
-    ["sh", os.path.join(tools, "run-qemu.sh"), str(secs), r"\[serial\] PASS"],
+    ["sh", RUN_QEMU, str(secs), r"\[serial\] PASS"],
     env=env,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.STDOUT,

@@ -178,8 +178,16 @@ def main():
     qmp, status = None, 0
 
     def shot():
+        # QEMU's PPM (this QEMU has no libpng), as a PNG through PIL (the build image has it)
         if fb and qmp:
-            qmp.cmd("screendump", filename=os.path.abspath(fb), format="png")
+            ppm = os.path.join(tmp, "fb.ppm")
+            qmp.cmd("screendump", filename=ppm)
+            try:
+                from PIL import Image
+            except ImportError:  # outside the build image: keep the PPM
+                shutil.copyfile(ppm, os.path.splitext(fb)[0] + ".ppm")
+                return
+            Image.open(ppm).save(fb)
 
     try:
         qmp = Qmp(qmp_path, start + 30)

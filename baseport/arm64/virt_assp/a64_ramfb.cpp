@@ -58,7 +58,9 @@ static TUint16 FindFile(const char* aName)
 static const char* Scanout(TPhysAddr aFb, TInt aWidth, TInt aHeight, TInt aStride)
 	{
 	Select(KFwCfgId);
-	if (!(ReadBe32() & KFwIdDma))
+	TUint32 id;
+	Read(&id, 4);										// little-endian, unlike the file directory
+	if (!(id & KFwIdDma))
 		return "no fw_cfg DMA";
 	TUint16 key = FindFile("etc/ramfb");
 	if (!key)

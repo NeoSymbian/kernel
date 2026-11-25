@@ -70,8 +70,8 @@ static const char* Scanout(TPhysAddr aFb, TInt aWidth, TInt aHeight, TInt aStrid
 	DPlatChunkHw* chunk = NULL;
 	NKern::ThreadEnterCS();
 	TInt r = Epoc::AllocPhysicalRam(4096, phys);
-	if (r == KErrNone)
-		r = DPlatChunkHw::New(chunk, phys, 4096, EMapAttrSupRw | EMapAttrBufferedNC);
+	if (r == KErrNone && (r = DPlatChunkHw::New(chunk, phys, 4096, EMapAttrSupRw | EMapAttrBufferedNC)) != KErrNone)
+		Epoc::FreePhysicalRam(phys, 4096);
 	NKern::ThreadLeaveCS();
 	if (r != KErrNone)
 		return "no DMA page";
@@ -91,7 +91,12 @@ static const char* Scanout(TPhysAddr aFb, TInt aWidth, TInt aHeight, TInt aStrid
 	for (TInt i = 0; i < 1000000 && (__builtin_bswap32(dma->iControl) & ~EDmaError); ++i)
 		{}
 	TUint32 control = __builtin_bswap32(dma->iControl);
-	// the page stays: QEMU keeps no pointer to it, but a64_display's framebuffer is used for the system's life anyway
+	if (control & ~EDmaError)
+		return "fw_cfg DMA did not finish";				// the device may still read the page: keep it
+	NKern::ThreadEnterCS();								// done: QEMU copied the config and keeps no pointer to it
+	chunk->Close(NULL);
+	Epoc::FreePhysicalRam(phys, 4096);
+	NKern::ThreadLeaveCS();
 	return control ? "fw_cfg DMA failed" : NULL;
 	}
 

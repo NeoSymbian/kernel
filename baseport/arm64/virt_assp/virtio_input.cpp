@@ -81,6 +81,7 @@ static TInt StdKey(TUint aCode)
 	case 29:	return EStdKeyLeftCtrl;
 	case 39:	return EStdKeySemiColon;
 	case 40:	return EStdKeySingleQuote;
+	case 41:	return EStdKeyXXX;						// grave, left of 1
 	case 42:	return EStdKeyLeftShift;
 	case 43:	return EStdKeyBackSlash;
 	case 51:	return EStdKeyComma;
@@ -110,9 +111,11 @@ static TInt StdKey(TUint aCode)
 		}
 	}
 
+// as the monitor's PostKey: never drop one (a lost button-up would leave a finger down); the window server drains the
+// queue
 static void Post(const TRawEvent& aEvent)
 	{
-	for (TInt i = 0; i < 100 && Kern::AddEvent(aEvent) == KErrOverflow; ++i)	// the window server drains the queue
+	while (Kern::AddEvent(aEvent) == KErrOverflow)
 		NKern::Sleep(1);
 	}
 
@@ -207,10 +210,14 @@ static TInt Setup(SInput& aIn)
 	TPhysAddr phys;
 	DPlatChunkHw* chunk = NULL;
 	TInt r = Epoc::AllocPhysicalRam(3 * 4096, phys, 12);
-	if (r == KErrNone)
-		r = DPlatChunkHw::New(chunk, phys, 3 * 4096, EMapAttrSupRw | EMapAttrBufferedNC);
 	if (r != KErrNone)
 		return r;
+	r = DPlatChunkHw::New(chunk, phys, 3 * 4096, EMapAttrSupRw | EMapAttrBufferedNC);
+	if (r != KErrNone)
+		{
+		Epoc::FreePhysicalRam(phys, 3 * 4096);
+		return r;
+		}
 	aIn.iArea = chunk->LinearAddress();
 	memclr((TAny*)aIn.iArea, 3 * 4096);
 	R(aIn, EStatus) = 0;								// reset
@@ -239,11 +246,9 @@ static TInt Setup(SInput& aIn)
 		}
 	__e32_memory_barrier();
 	a->iIdx = KQ;
+	__e32_memory_barrier();								// the ring is complete before the device starts
 	R(aIn, EStatus) = EStAck | EStDriver | EStDriverOk;
-	r = A64_BindSpi(aIn.iIntId, InputIsr, &aIn);
-	if (r == KErrNone)
-		R(aIn, EQueueNotify) = 0;
-	return r;
+	return KErrNone;
 	}
 
 void A64StartTouch()
@@ -260,10 +265,14 @@ void A64StartTouch()
 		in.iDev = d;
 		in.iIntId = KMmioIntId0 + i;
 		TInt r = Setup(in);
-		Kern::Printf("[input] virtio-input in slot %d (INTID %d) -> %d", i, in.iIntId, r);
 		if (r == KErrNone)
-			++DeviceCount;
-		else
+			{
+			++DeviceCount;								// counted before its interrupt can run the DFC
+			r = A64_BindSpi(in.iIntId, InputIsr, &in);
+			R(in, EQueueNotify) = 0;					// events the device held while the queue was empty
+			}
+		Kern::Printf("[input] virtio-input in slot %d (INTID %d) -> %d", i, in.iIntId, r);
+		if (r != KErrNone)
 			StartResult = r;
 		}
 	NKern::ThreadLeaveCS();

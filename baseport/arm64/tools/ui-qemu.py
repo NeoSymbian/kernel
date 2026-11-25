@@ -24,8 +24,9 @@ Environment:
   LINGER       seconds to run after the script (default 2)
   OUT, VNC, SMP, DISK   as run-qemu.sh (VNC=:0 lets a person watch, or drive it by hand without MONITOR)
 
-Without MONITOR the machine runs for SECS (default 300) with QMP and, if set, VNC. Exit status: 0; 3 when FAULT
-matched; 124 when READY, an expect or the script's time ran out. `ui-qemu.py selftest` checks the parser.
+Without MONITOR the machine runs for SECS (default 300) with QMP and, if set, VNC. Exit status: 0; 2 when QEMU
+refused a command (an HMP line that printed an error) or went away; 3 when FAULT matched (checked on every read of
+the log); 124 when READY, an expect or the script's time ran out. `ui-qemu.py selftest` checks the parser.
 """
 
 import json
@@ -39,7 +40,11 @@ import tempfile
 import time
 
 env = os.environ.get
-FAULT = r"K::Fault|Kern::Fault|\[EKERN\] panic|rust panic"
+FAULT = r"K::Fault|Kern::Fault|(?m:^(\d+:)?FAULT: )|\[EKERN\] panic|rust panic"  # FAULT: = Kern::Fault's line
+
+
+class Faulted(Exception):
+    """FAULT matched the serial log."""
 
 
 def parse(script):
@@ -142,14 +147,17 @@ class Qmp:
         return msg.get("return")
 
     def hmp(self, line):
-        return self.cmd("human-monitor-command", **{"command-line": line})
+        """An HMP command the script passes through: input commands print nothing, so any output is its error."""
+        out = self.cmd("human-monitor-command", **{"command-line": line}).strip()
+        if out:
+            raise RuntimeError(f"HMP {line!r}: {out}")
 
 
 class Serial:
     """Follows the serial log run-qemu.sh writes."""
 
-    def __init__(self, path):
-        self.path, self.text = path, ""
+    def __init__(self, path, fault):
+        self.path, self.text, self.fault = path, "", re.compile(fault)
 
     def poll(self):
         try:
@@ -159,11 +167,18 @@ class Serial:
         except FileNotFoundError:
             pass
 
+    def check(self):
+        """Read on; raise Faulted if FAULT matches anywhere."""
+        self.poll()
+        m = self.fault.search(self.text)
+        if m:
+            raise Faulted(m[0])
+
     def wait(self, pattern, start, until):
         """The end of `pattern`'s first match after offset `start`, or None at `until`."""
         rx = re.compile(pattern)
         while time.time() < until:
-            self.poll()
+            self.check()
             m = rx.search(self.text, start)
             if m:
                 return m.end()
@@ -201,7 +216,7 @@ def main():
     )
     start = time.time()
     deadline = start + secs
-    serial = Serial(os.path.join(out, "serial.log"))
+    serial = Serial(os.path.join(out, "serial.log"), fault)
     qmp, status = None, 0
 
     def shot():
@@ -220,7 +235,10 @@ def main():
         qmp = Qmp(qmp_path, start + 30)
         if not steps:
             while proc.poll() is None and time.time() < deadline:
+                serial.check()
                 time.sleep(0.2)
+            if proc.poll():
+                status = proc.returncode  # QEMU failed (run-qemu.sh: 0, or 124 at its timeout)
         else:
             pos = serial.wait(ready, 0, deadline)
             if pos is None:
@@ -230,8 +248,7 @@ def main():
             gap = float(env("MON_GAP", "0.1"))
             new_action = True
             for kind, arg in steps:
-                if re.search(fault, serial.text):
-                    break
+                serial.check()
                 if kind in ("abs", "hmp") and new_action:
                     serial.poll()
                     pos, new_action = len(serial.text), False
@@ -247,7 +264,7 @@ def main():
                             f"expect: {arg!r} did not appear in the serial log"
                         )
                 elif kind == "wait":
-                    time.sleep(arg)
+                    time.sleep(max(0.0, min(arg, deadline - time.time())))
                 elif kind == "abs":
                     time.sleep(gap)  # paced like Syborg's mouse_move lines: swipes keep their speed
                     qmp.cmd(
@@ -263,15 +280,12 @@ def main():
             time.sleep(float(env("LINGER", "2")))
             if time.time() > deadline:
                 raise TimeoutError(f"the script did not finish in {secs:.0f} s")
-        serial.poll()
-        m = re.search(fault, serial.text)
-        if m:
-            print(f"ui-qemu: fault: {m[0]}", file=sys.stderr)
-            status = 3
+        serial.check()
         shot()
-    except TimeoutError as e:
-        print(f"ui-qemu: {e}", file=sys.stderr)
-        status = 124
+    except (TimeoutError, Faulted, RuntimeError, EOFError) as e:
+        status = 3 if isinstance(e, Faulted) else 124 if isinstance(e, TimeoutError) else 2
+        what = "fault" if status == 3 else "error" if status == 2 else ""
+        print(f"ui-qemu: {what + ': ' if what else ''}{e}", file=sys.stderr)
         try:
             shot()  # the screen of the failed run
         except (OSError, RuntimeError, EOFError) as e:

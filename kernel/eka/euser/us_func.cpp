@@ -9,7 +9,7 @@
 // Nokia Corporation - initial contribution.
 //
 // Contributors:
-// The NeoSymbian Authors (2026): User::Exit with an error is traced for old apps (us_trp.cpp NeoTrace).
+// The NeoSymbian Authors (2026): User::Exit with an error is traced for old apps (us_trp.cpp NeoTrace); Mem::Crc32 uses CRC32 on ARMv8.
 // Description:
 // e32\euser\us_func.cpp
 // 
@@ -2107,7 +2107,18 @@ EXPORT_C void Mem::Crc32(TUint32& aCrc, const TAny* aPtr, TInt aLength)
 	const TUint8* p = (const TUint8*)aPtr;
 	const TUint8* q = p + aLength;
 	TUint32 crc = aCrc;
+#ifdef __CPU_ARM_HAS_CRC32
+	// NeoSymbian: the table is the reflected IEEE polynomial with no inversion, which is exactly what the CRC32
+	// instructions compute; a little-endian word is four byte steps.
+	while (p < q && (TLinAddr(p) & 3))
+		crc = __builtin_arm_crc32b(crc, *p++);
+	for (; q - p >= 4; p += 4)
+		crc = __builtin_arm_crc32w(crc, *(const TUint32*)p);
+	while (p < q)
+		crc = __builtin_arm_crc32b(crc, *p++);
+#else
 	while (p < q)
 		crc = (crc >> 8) ^ CrcTab32[(crc ^ *p++) & 0xff];
+#endif
 	aCrc = crc;
 	}

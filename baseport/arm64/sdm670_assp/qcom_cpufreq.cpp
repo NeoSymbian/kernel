@@ -46,26 +46,51 @@ static void SetSteps(TBool aTop)
 			Reg(Domains[i].iBase + EPerfState) = aTop ? Domains[i].iTop : Domains[i].iIdle;
 	}
 
-static void DropFn(TAny*)
-	{
-	__e32_atomic_store_rel32(&Boosted, 0);
-	SetSteps(EFalse);
-	}
+// The boost's end: one absolute deadline (NKern::TickCount), only ever moved later while boosted, so touches (3 s) and
+// a video's asks don't shorten each other. Boosted, Deadline, the timer and the steps change only under BoostLock; NTimer
+// takes its own queue lock (EOrderNTimerQ) inside it. The drop lowers the steps only once the deadline has passed (an ask
+// that came while it was due wins), and an ask always raises them (review of kernel#44: an expiry on another CPU, or a
+// 1 ms ask's, could leave the steps low while Boosted said otherwise).
+// shortcut: no thermal limit on a long boost (TSENS is read for telemetry only; LMh caps clocks in hardware at 95 C);
+// a governor with a thermal policy comes with power (H3).
+static TSpinLock BoostLock(TSpinLock::EOrderGenericIrqLow2);
+static TUint32 Deadline;
+static void DropFn(TAny*);
 static NTimer DropTimer(DropFn, NULL);
 
-// Top steps now, ABL's steps aMs after the last call. The latest caller sets the time: a 3 s touch during a video's
-// 2 s asks keeps the clocks up until the next ask.
+static void DropFn(TAny*)
+	{
+	TInt irq = BoostLock.LockIrqSave();
+	TInt left = (TInt)(Deadline - NKern::TickCount());
+	if (left > 0)
+		DropTimer.OneShot(left);						// a later ask moved the end (KErrInUse: it re-armed already)
+	else
+		{
+		__e32_atomic_store_rel32(&Boosted, 0);
+		SetSteps(EFalse);
+		}
+	BoostLock.UnlockIrqRestore(irq);
+	}
+
+// Top steps now, ABL's steps aMs after this ask or a later one (touches ask for KBoostMs).
 TInt A64CpuBoostFor(TInt aMs)
 	{
 	if (!Ready)
 		return KErrNotSupported;
-	// the timer first: a drop that fires before it is re-armed then finds Boosted clear and the steps are raised again
-	DropTimer.Cancel();
-	DropTimer.OneShot(NKern::TimerTicks(aMs));
-	if (!__e32_atomic_swp_ord32(&Boosted, 1))
-		SetSteps(ETrue);
-	// shortcut: on SMP a drop already running on another CPU can still lower the steps after this; the next ask (a touch,
-	// or the video's next one within a second) raises them again
+	TInt ticks = NKern::TimerTicks(aMs);
+	TInt irq = BoostLock.LockIrqSave();
+	TUint32 until = NKern::TickCount() + (TUint32)ticks;
+	if (!Boosted || (TInt)(until - Deadline) > 0)
+		{
+		Deadline = until;
+		// under the lock nothing else arms the timer: an expiry running on another CPU waits for the lock and then sees
+		// the new deadline
+		DropTimer.Cancel();
+		DropTimer.OneShot(ticks);
+		}
+	__e32_atomic_store_rel32(&Boosted, 1);
+	SetSteps(ETrue);
+	BoostLock.UnlockIrqRestore(irq);
 	return KErrNone;
 	}
 

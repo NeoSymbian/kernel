@@ -82,8 +82,9 @@ variant_drivers
 # the real exstart (starts the ROM secondary), statically linked: only its entry points are renamed
 $EKXX $DEFS $INCS $PRE -DKernelModuleEntry=A64ExstartEntry -DInitExtension=A64ExstartInit \
 	-c "$EKA/kernel/exstart.cpp" -o "$I/exstart.o"
-# the AArch32 EL0 test program (the secondary for now): exec numbers from the generated exec_enum.h, assembled for
-# the 2010 user side's ISA, flattened, and carried in the ROM's .utext
+# the AArch32 EL0 test program (the secondary without a user ROM): exec numbers from the generated exec_enum.h,
+# assembled as ARMv5TE on purpose (it runs SWP: the old-app compatibility the kernel keeps), flattened, and carried
+# in the ROM's .utext
 sed -n 's/^[[:space:]]*\(E[A-Za-z0-9_]*\) = \([0-9]*\),*$/	.equ \1, \2/p' "$C/kinc/kernel/exec_enum.h" > "$I/exec_enum.inc"
 grep -q "EExecDebugPrint" "$I/exec_enum.inc" || { echo "exec_enum.inc: no exec numbers"; exit 1; }
 arm-none-eabi-as -march=armv5te -I "$I" "$KHS/kerneltest/e32test/arm64/a32test.S" -o "$I/a32test.a32"

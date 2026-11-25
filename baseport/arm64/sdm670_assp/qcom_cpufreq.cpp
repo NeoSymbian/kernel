@@ -47,11 +47,11 @@ static void SetSteps(TBool aTop)
 	}
 
 // The boost's end: one absolute deadline (NKern::TickCount), only ever moved later while boosted, so touches (3 s) and
-// a video's asks don't shorten each other. Boosted, Deadline, the timer and the steps change only under BoostLock; NTimer
-// takes its own queue lock (EOrderNTimerQ, 0x10) inside it, so BoostLock ranks above it (nested locks go down in order),
-// and the expiry takes BoostLock only after the timer code has let go of NTimerQ. The drop lowers the steps only once the deadline has passed (an ask
-// that came while it was due wins), and an ask always raises them (review of kernel#44: an expiry on another CPU, or a
-// 1 ms ask's, could leave the steps low while Boosted said otherwise).
+// a video's asks don't shorten each other. Boosted, Deadline, the timer and the steps change only under BoostLock.
+// NTimer takes its own queue lock (EOrderNTimerQ, 0x10) inside it, so BoostLock ranks above it (nested locks go down in
+// order); the expiry takes BoostLock only after the timer code has let go of NTimerQ. The drop lowers the steps only
+// once the deadline has passed (an ask that came while it was due wins), and an ask always raises them (review of
+// kernel#44: an expiry on another CPU, or a 1 ms ask's, could leave the steps low while Boosted said otherwise).
 // shortcut: no thermal limit on a long boost (TSENS is read for telemetry only; LMh caps clocks in hardware at 95 C);
 // a governor with a thermal policy comes with power (H3).
 static TSpinLock BoostLock(TSpinLock::EOrderGenericIrqHigh0);

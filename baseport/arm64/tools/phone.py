@@ -54,11 +54,16 @@ def fastboot(*args, timeout=30):
         return None
 
 
+# boards whose ABL reports another fastboot product than the board name (the Pixels report theirs)
+FASTBOOT_PRODUCT = {"fajita": "sdm845"}
+
+
 def wait_fastboot(secs):
     t0 = time.time()
     while time.time() - t0 < secs:
         r = fastboot("devices", timeout=5)
-        if r and r.stdout.strip():
+        serial = os.environ.get("ANDROID_SERIAL")  # another phone in fastboot doesn't count
+        if r and any(not serial or line.split()[0] == serial for line in r.stdout.splitlines() if line.strip()):
             return True
         time.sleep(2)
     return False
@@ -395,6 +400,7 @@ def _main(argv):
                 raise SystemExit("unknown option " + args[i])
         if not wait_fastboot(60):
             raise SystemExit("no phone in fastboot")
+        product = FASTBOOT_PRODUCT.get(product, product)
         r = fastboot("getvar", "product")
         if not r or f"product: {product}" not in (r.stdout + r.stderr):
             raise SystemExit(f"not the {product}: {r and r.stderr!r}")

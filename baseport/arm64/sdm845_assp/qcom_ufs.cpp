@@ -1,491 +1,213 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// qcom_ufs.cpp -- the UFS host (DTB ufshc@1d84000, "qcom,ufshc", UFSHCI 2.x; QMP UFS PHY v3 at 0x1d87000), READ
-// ONLY (docs fajita.md OP6: Ubuntu Touch owns the phone's storage). ABL reads UFS on every boot; this driver takes
-// over the host and link ABL leaves up ("adopt"): our own request list, then SCSI commands through UTP transfer
-// requests, polled, one slot. Written from JESD223 (UFSHCI) and JESD220 (UFS); register and clock offsets from
-// mainline Linux (ufshci.h, gcc-sdm845.c, phy-qcom-qmp-ufs.c).
-// - No write path: Command() refuses every opcode outside a read-only allow-list; there is no A64BlkDev_Write (the
-//   weak default refuses), no query UPIU, no task management.
-// - A64BlkDev_Init says KErrNotSupported, so C: stays the RAM drive; the monitor's "blk init" brings it up.
-// - The block layer's sectors are 512 bytes; the LUNs' blocks are 4096: reads go through a bounce buffer.
-// shortcut: adopt only; if ABL leaves UFS off this returns KErrNotReady (the full bring-up: supplies, GDSC, clocks,
-// QMP PHY tables, HCE, link start-up, comes when a boot needs it).
+// qcom_ufs.cpp -- Qualcomm's glue around the UFS host on SDM845 (DTB ufshc@1d84000, "qcom,ufshc", a v3 core): the
+// vendor hooks of ufshcd.h. Supplies, the power domain, GCC clocks and resets, the device's reset pad, the host's
+// vendor registers and UniPro tweaks, the device quirks. The sequence is Linux ufs-qcom.c's for a v3 core (design and
+// values only; docs fajita/ufs-linux-reference.md). The PHY is qcom_ufs_phy.cpp; the generic part ufshcd.cpp.
 #include <kernel/kern_priv.h>
-#include <kernel/cache.h>
 #include "board.h"
-#include "a64_blk.h"
-#include "a64_dbgmon.h"
-#include "a64_device.h"
+#include "ufshcd.h"
+#include "qcom_ufs_phy.h"
 #include "qcom_rpmh.h"
 #include "qcom_smmu.h"
 
-const TUint32 KHc = 0x01d84000, KPhy = 0x01d87000, KGcc = 0x00100000, KSmmu = 0x15000000;
-// UFSHCI registers
-enum { ECap = 0x00, EVer = 0x08, EIs = 0x20, EIe = 0x24, EHcs = 0x30, EHce = 0x34, EUtrlba = 0x50, EUtrlbau = 0x54,
-	EUtrldbr = 0x58, EUtrlclr = 0x5c, EUtrlrsr = 0x60, EUtmrlba = 0x70, EUtmrlbau = 0x74, EUtmrldbr = 0x78,
-	EUtmrlrsr = 0x80, EUicCmd = 0x90, EUicArg1 = 0x94, EUicArg2 = 0x98, EUicArg3 = 0x9c };
-enum { EHcsDp = 1, EHcsUtrlRdy = 2, EHcsUtmrlRdy = 4, EHcsUcRdy = 8, EIsUtrcs = 1, EIsUccs = 1 << 10 };
-// GCC (gcc-sdm845.c): the GDSC, then clock branches (bit 31 = CLK_OFF)
-enum { EGdsc = 0x77004, EAxi = 0x7700c, EAhb = 0x77010, ETxSym0 = 0x77014, ERxSym0 = 0x77018, EUnipro = 0x77054,
-	EIce = 0x77058, EAux = 0x7708c, ERxSym1 = 0x770a8, EAggreAxi = 0x82024, EClkref = 0x8c000 };
-// the QMP PHY's PCS (at +0xc00): start, power-down control, ready status (phy-qcom-qmp-pcs-ufs-v3.h)
-enum { EPcsStart = 0xc00, EPcsPwrDn = 0xc04, EPcsReady = 0xd60 };
+const TUint32 KGcc = 0x00100000, KSmmu = 0x15000000;
+const TUint32 KResetPad = 0x03d9f000;					// TLMM's ufs_reset pad: control, then I/O (bit 0 = out) at +4
+// GCC (gcc-sdm845.c): BCR, GDSC, clock branches (bit 31 = CLK_OFF), root clocks (CMD; CFG at +4)
+enum { EBcr = 0x77000, EGdsc = 0x77004, EAxi = 0x7700c, EAhb = 0x77010, ETxSym0 = 0x77014, ERxSym0 = 0x77018,
+	EAxiRcg = 0x7701c, EUnipro = 0x77054, EIce = 0x77058, EUniproRcg = 0x77074, EAux = 0x7708c, ERxSym1 = 0x770a8,
+	EAggreAxi = 0x82024, EClkref = 0x8c000 };
+// RCG configurations from GPLL0's main output (source 1): divider field 2 x div - 1
+const TUint32 KAxi200MHz = (1 << 8) | 5, KUnipro150MHz = (1 << 8) | 7;
+// the host's vendor registers
+enum { EUfsCfg1 = 0xdc, EUfsCfg2 = 0xe0, EHwVersion = 0xe4, EAh8Cfg = 0xfc };
+enum { ECfg1QunuproSel = 1 << 0, ECfg1DevRefClk = 1 << 26 };
+enum { EVendorSamsung = 0x1ce, EVendorHynix = 0x1ad };
 
-static volatile TUint32& R(TUint32 aOff) { return *(volatile TUint32*)(A64_Io(KHc) + aOff); }
 static volatile TUint32& Gcc(TUint32 aOff) { return *(volatile TUint32*)A64_Io(KGcc + aOff); }
-static volatile TUint32& Phy(TUint32 aOff) { return *(volatile TUint32*)(A64_Io(KPhy) + aOff); }
-
 static TBool On(TUint32 aBranch) { return !(Gcc(aBranch) >> 31); }
-// the host's registers answer only with its power domain and interface clocks on; touching them otherwise is a
-// secure bus error, which on this phone means QUALCOMM CrashDump
-static TBool HostClocked() { return (Gcc(EGdsc) >> 31) && On(EAhb) && On(EAxi) && On(EUnipro); }
 
-// one request at a time: the monitor, and later the media driver, share the slot and the buffers
-static DMutex* Lock;
-const TUint8 KMutexOrdUfs = 0xe0;
-class TLock
+static TBool Wait(TUint32 aOff, TUint32 aMask, TBool aSet, TInt aUs = 10000)
 	{
-public:
-	TLock() { NKern::ThreadEnterCS(); if (Lock) Kern::MutexWait(*Lock); }
-	~TLock() { if (Lock) Kern::MutexSignal(*Lock); NKern::ThreadLeaveCS(); }
-	};
-
-// memory: one non-cached 8 KB block (the transfer list at 0 (1 KB aligned), the task list at 0x400, the command
-// descriptor at 0x800: command UPIU, response UPIU at +0x200, the PRDT at +0x400), and a cached data buffer
-const TInt KXfer = 256 * 1024;							// bytes per request: one PRDT entry (its 18-bit count)
-const TUint32 KUcd = 0x800, KResp = 0x200, KPrdt = 0x400;
-static TPhysAddr DescPhys, DataPhys;
-static volatile TUint32* Desc;
-static TUint8* Data;
-
-struct TLun { TUint32 iBlocks, iBlockSize; };
-const TInt KLuns = 8;
-static TLun Luns[KLuns];
-static TInt Cur;										// the LUN A64BlkDev_Read reads ("blk lun N")
-static TInt InitResult = KErrNotReady;
-static TBuf8<200> Report[24];
-static TInt NReport;
-
-static void Log(const char* aFmt, ...)
-	{
-	VA_LIST list;
-	VA_START(list, aFmt);
-	TBuf8<200> b;
-	Kern::AppendFormat(b, aFmt, list);
-	VA_END(list);
-	Kern::Printf("[ufs] %S", &b);
-	if (NReport < (TInt)(sizeof(Report) / sizeof(Report[0])))
-		Report[NReport++] = b;
+	for (TInt t = 0; t <= aUs; t += 10)
+		{
+		if (!(Gcc(aOff) & aMask) == !aSet)
+			return ETrue;
+		Ufs_Delay(10);
+		}
+	return EFalse;
 	}
 
-static TUint32 Be32(const TUint8* p) { return (TUint32)p[0] << 24 | (TUint32)p[1] << 16 | (TUint32)p[2] << 8 | p[3]; }
-static void PutBe32(TUint8* p, TUint32 v) { p[0] = (TUint8)(v >> 24); p[1] = (TUint8)(v >> 16); p[2] = (TUint8)(v >> 8); p[3] = (TUint8)v; }
-
-// a UIC DME_GET (read a UniPro attribute): the value, or -1
-static TInt DmeGet(TUint32 aAttr)
+static TInt Branch(TUint32 aCbcr, TBool aStatus = ETrue)	// enable, then CLK_OFF clear (symbol clocks: no check)
 	{
-	if (!(R(EHcs) & EHcsUcRdy))
-		return -1;
-	R(EIs) = EIsUccs;
-	R(EUicArg1) = aAttr << 16;
-	R(EUicArg2) = 0;
-	R(EUicArg3) = 0;
-	R(EUicCmd) = 0x01;
-	for (TInt i = 0; i < 10000 && !(R(EIs) & EIsUccs); ++i)
-		Kern::NanoWait(10000);
-	if (!(R(EIs) & EIsUccs))
-		return -1;
-	R(EIs) = EIsUccs;
-	return (R(EUicArg2) & 0xff) ? -1 : (TInt)R(EUicArg3);
+	Gcc(aCbcr) |= 1;
+	return !aStatus || Wait(aCbcr, 1u << 31, EFalse) ? KErrNone : KErrTimedOut;
 	}
 
-// "blk info" (and Volume Up): what ABL left, read only
-void A64BlkDump()
+static TInt Rcg(TUint32 aCmd, TUint32 aCfg)				// root clock: configuration, then UPDATE until it latches
+	{
+	if ((Gcc(aCmd + 4) & 0x71f) == aCfg)
+		return KErrNone;
+	Ufs_Log("rcg %05x: cfg %08x -> %03x", aCmd, Gcc(aCmd + 4), aCfg);
+	Gcc(aCmd + 4) = (Gcc(aCmd + 4) & ~0x71fu) | aCfg;
+	Gcc(aCmd) |= 1;
+	return Wait(aCmd, 1, EFalse) ? KErrNone : KErrTimedOut;
+	}
+
+TBool UfsVop_Clocked() { return (Gcc(EGdsc) >> 31) && On(EAhb) && On(EAxi) && On(EUnipro); }
+
+TInt UfsVop_PowerUp()
+	{
+	// the supplies (live DT: vcc l20, vccq2 s4, PHY l1 + l26, reference clock l2), at the voltages ABL leaves
+	TInt r = Vrm_Vote("ldoa20", 2960);
+	if (r == KErrNone) r = Vrm_Vote("smpa4", 1800);
+	if (r == KErrNone) r = Vrm_Vote("ldoa1", 880);
+	if (r == KErrNone) r = Vrm_Vote("ldoa26", 1200);
+	if (r == KErrNone) r = Vrm_Vote("ldoa2", 1200);
+	if (r != KErrNone)
+		{
+		Ufs_Log("supply vote -> %d", r);
+		return r;
+		}
+	// data through aggre1 NoC to DDR (SN9; SN0, SH0, MC0 are voted for USB), registers through the config NoC (CN0)
+	Ufs_Log("bus votes: SN9 %d", Bcm_Vote("SN9", 300000, 1500000, 16));
+	if (!(Gcc(EGdsc) >> 31))
+		{
+		Gcc(EGdsc) &= ~1u;									// SW_COLLAPSE off
+		if (!Wait(EGdsc, 1u << 31, ETrue, 100000))
+			{
+			Ufs_Log("gdsc stays off: %08x", Gcc(EGdsc));
+			return KErrTimedOut;
+			}
+		}
+	const TUint32 branches[] = { EAhb, EAxi, EAggreAxi, EUnipro, EIce, EAux, EClkref };
+	for (TUint i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i)
+		if ((r = Branch(branches[i])) != KErrNone)
+			{
+			Ufs_Log("clock %05x stays off: %08x", branches[i], Gcc(branches[i]));
+			return r;
+			}
+	r = Smmu_IdentityMap(0x100, 0);						// KErrInUse: routed already (on this phone, a bypass)
+	return r == KErrInUse ? KErrNone : r;
+	}
+
+void UfsVop_DeviceReset()								// active low: 10 us asserted, 10 us to settle
+	{
+	volatile TUint32& io = *(volatile TUint32*)A64_Io(KResetPad + 4);
+	io &= ~1u;
+	Ufs_Delay(10);
+	io |= 1;
+	Ufs_Delay(10);
+	}
+
+// Linux ufs_qcom_power_up_sequence: the core reset, the PHY off and on, its tables, then the vendor's UniPro select
+// and the lane clocks
+TInt UfsVop_HcePre()
+	{
+	TInt r = Rcg(EAxiRcg, KAxi200MHz);
+	if (r == KErrNone)
+		r = Rcg(EUniproRcg, KUnipro150MHz);					// LinkPre's 1-us count assumes 150 MHz
+	if (r != KErrNone)
+		return r;
+	Gcc(EBcr) |= 1;
+	Ufs_Delay(200);
+	Gcc(EBcr) &= ~1u;
+	Ufs_Delay(1000);
+	QmpUfs_PowerOff();
+	QmpUfs_PowerOn();
+	if ((r = QmpUfs_Calibrate()) != KErrNone)
+		return r;
+	Ufs_Reg(EUfsCfg1) |= ECfg1QunuproSel;
+	Branch(ETxSym0, EFalse);
+	Branch(ERxSym0, EFalse);
+	Branch(ERxSym1, EFalse);
+	return KErrNone;
+	}
+
+static TInt DmeOr(TUint32 aAttr, TUint32 aBits)
+	{
+	TUint32 v;
+	TInt r = Ufs_DmeGet(aAttr, 0, v);
+	return r == KErrNone ? Ufs_DmeSet(aAttr, 0, v | aBits) : r;
+	}
+
+TInt UfsVop_HcePost()
+	{
+	TUint32 fsm = 0;
+	for (TInt t = 0; t < 100000; t += 200)					// the PHY's TX FSM in HIBERN8 (1)
+		{
+		if (Ufs_DmeGet(0x0041, 0, fsm) == KErrNone && fsm == 1)
+			break;
+		Ufs_Delay(200);
+		}
+	if (fsm != 1)
+		{
+		Ufs_Log("tx fsm %d, not HIBERN8", fsm);
+		return KErrTimedOut;
+		}
+	Ufs_Reg(EUfsCfg2) |= 0xff;								// the host's hardware clock gating
+	TInt r = DmeOr(0xa00b, 0x3ff);							// DL_VS_CLK_CFG
+	if (r == KErrNone)
+		r = DmeOr(0x9004, 0x1ff);							// PA_VS_CLK_CFG_REG
+	if (r == KErrNone)
+		r = DmeOr(0xd002, 1 << 9);							// DME_VS_CORE_CLK_CTRL: DME_HW_CGC_EN
+	return r;
+	}
+
+TInt UfsVop_LinkPre()
+	{
+	TUint32 v;
+	TInt r = Ufs_DmeGet(0xd002, 0, v);						// DME_VS_CORE_CLK_CTRL: unipro cycles per us, no divider
+	if (r == KErrNone)
+		r = Ufs_DmeSet(0xd002, 0, (v & ~0x1ffu) | 150);
+	if (r == KErrNone)
+		r = Ufs_DmeSet(0x155e, 0, 0);						// PA_LOCAL_TX_LCC_ENABLE
+	return r;
+	}
+
+TInt UfsVop_LinkPost()
+	{
+	if (Ufs_Reg(0x00) & (1 << 23))							// CAP.AH8: the clock requests auto-hibern8 may drop
+		Ufs_Reg(EAh8Cfg) |= 0x3c;
+	return KErrNone;
+	}
+
+TInt UfsVop_GearPre(TUint32 aVendor)
+	{
+	Ufs_Reg(EUfsCfg1) |= ECfg1DevRefClk;
+	Ufs_Delay(1);
+	TInt r = KErrNone;
+	if (aVendor == EVendorSamsung)
+		{
+		r = Ufs_DmeSet(0x1552, 0, 0x4a, ETrue);				// the peer's PA_TXHSG1SYNCLENGTH
+		for (TUint32 lane = 0; r == KErrNone && lane < 2; ++lane)
+			r = Ufs_DmeSet(0x0037, lane, 0);				// TX_HS_EQUALIZER
+		}
+	else if (aVendor == EVendorHynix)
+		r = DmeOr(0x9000, 1 << 12);							// PA_VS_CONFIG_REG1
+	Ufs_Log("gear quirks for %04x -> %d", aVendor, r);
+	return r;
+	}
+
+void UfsVop_Dump()
 	{
 	Kern::Printf("[ufs] gcc: gdsc %08x ahb %08x axi %08x unipro %08x ice %08x aux %08x tx0 %08x rx0 %08x rx1 %08x "
 		"aggre %08x clkref %08x", Gcc(EGdsc), Gcc(EAhb), Gcc(EAxi), Gcc(EUnipro), Gcc(EIce), Gcc(EAux), Gcc(ETxSym0),
 		Gcc(ERxSym0), Gcc(ERxSym1), Gcc(EAggreAxi), Gcc(EClkref));
-	// the stream matches that cover UFS's streams 0x100-0x10f (mainline: iommus <0x100 0xf>)
+	Kern::Printf("[ufs] rcg: axi %08x/%08x unipro %08x/%08x; reset pad %08x/%08x", Gcc(EAxiRcg), Gcc(EAxiRcg + 4),
+		Gcc(EUniproRcg), Gcc(EUniproRcg + 4), *(volatile TUint32*)A64_Io(KResetPad),
+		*(volatile TUint32*)A64_Io(KResetPad + 4));
+	// the stream matches that cover UFS's streams 0x100-0x10f
 	TInt smrs = *(volatile TUint32*)A64_Io(KSmmu + 0x20) & 0xff;
 	for (TInt n = 0; n < smrs; ++n)
 		{
 		TUint32 smr = *(volatile TUint32*)A64_Io(KSmmu + 0x800 + 4 * n);
 		TUint32 id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
-		if (!(smr >> 31) || ((id ^ 0x100) & ~(mask | 0xf) & 0x7fff))
-			continue;
-		TUint32 s2cr = *(volatile TUint32*)A64_Io(KSmmu + 0xc00 + 4 * n);
-		Kern::Printf("[ufs] smmu: smr %d = %08x, s2cr %08x", n, smr, s2cr);
-		if ((s2cr >> 16) & 3)
-			continue;										// not a translating context
-		// the context bank it translates through (qcom_smmu.cpp's layout)
-		TUint32 idr1 = *(volatile TUint32*)A64_Io(KSmmu + 0x24);
-		TUint32 page = (idr1 >> 31) ? 0x10000 : 0x1000, pages = 1u << (((idr1 >> 28) & 7) + 1), cb = s2cr & 0xff;
-		volatile TUint32* c = (volatile TUint32*)A64_Io(KSmmu + pages * page + cb * page);
-		Kern::Printf("[ufs] smmu: cb %d cbar %08x cba2r %08x sctlr %08x tcr %08x tcr2 %08x ttbr0 %08x:%08x mair0 %08x "
-			"fsr %08x", cb, *(volatile TUint32*)A64_Io(KSmmu + page + 4 * cb),
-			*(volatile TUint32*)A64_Io(KSmmu + page + 0x800 + 4 * cb), c[0], c[0x30 / 4], c[0x10 / 4], c[0x24 / 4],
-			c[0x20 / 4], c[0x38 / 4], c[0x58 / 4]);
+		if ((smr >> 31) && !((id ^ 0x100) & ~(mask | 0xf) & 0x7fff))
+			Kern::Printf("[ufs] smmu: smr %d = %08x, s2cr %08x", n, smr, *(volatile TUint32*)A64_Io(KSmmu + 0xc00 + 4 * n));
 		}
-	if (!HostClocked())
-		{
-		Kern::Printf("[ufs] host unclocked: not touched");
-		}
-	else
-		{
-		Kern::Printf("[ufs] host: cap %08x ver %08x hcs %08x hce %08x is %08x ie %08x", R(ECap), R(EVer), R(EHcs),
-			R(EHce), R(EIs), R(EIe));
-		Kern::Printf("[ufs] lists: utrl %08x:%08x run %d bell %08x; utmrl %08x run %d bell %08x", R(EUtrlbau),
-			R(EUtrlba), R(EUtrlrsr), R(EUtrldbr), R(EUtmrlba), R(EUtmrlrsr), R(EUtmrldbr));
-		if (On(EAux))
-			Kern::Printf("[ufs] phy: start %08x pwrdn %08x ready %08x", Phy(EPcsStart), Phy(EPcsPwrDn), Phy(EPcsReady));
-		// PA_PWRMODE (rx<<4 | tx: 1 fast, 2 slow, 4 fast auto, 5 slow auto), gears, lanes, HS series
-		Kern::Printf("[ufs] link: pwrmode %x tx gear %d rx gear %d lanes %d/%d series %d", DmeGet(0x1571),
-			DmeGet(0x1568), DmeGet(0x1583), DmeGet(0x1560), DmeGet(0x1580), DmeGet(0x156a));
-		}
-	for (TInt i = 0; i < NReport; ++i)
-		Kern::Printf("[ufs] %S", &Report[i]);
+	if (UfsVop_Clocked())
+		Kern::Printf("[ufs] vendor: cfg1 %08x cfg2 %08x ah8 %08x", Ufs_Reg(EUfsCfg1), Ufs_Reg(EUfsCfg2), Ufs_Reg(EAh8Cfg));
+	if (On(EAux))
+		QmpUfs_Dump();
 	}
-
-// one request in slot 0: a NOP OUT (aCdb NULL) or a read-only SCSI command, aBytes into Data. KErrNone and the SCSI
-// status (0 good, 2 check condition; then aSense = key << 16 | asc << 8 | ascq)
-static TInt Command(TInt aLun, const TUint8* aCdb, TUint32 aBytes, TInt& aStatus, TUint32& aSense)
-	{
-	aStatus = 0;
-	aSense = 0;
-	if (aCdb)
-		switch (aCdb[0])
-			{
-		case 0x00:	// TEST UNIT READY
-		case 0x03:	// REQUEST SENSE
-		case 0x12:	// INQUIRY
-		case 0x25:	// READ CAPACITY(10)
-		case 0x28:	// READ(10)
-			break;
-		default:
-			return KErrAccessDenied;							// the no-write rule, in one place
-			}
-	if (aBytes > (TUint32)KXfer)
-		return KErrArgument;
-	volatile TUint32* utrd = Desc;
-	TUint8* ucd = (TUint8*)Desc + KUcd;
-	memclr(ucd, KPrdt + 16);
-	if (aCdb)
-		{
-		ucd[0] = 0x01;									// COMMAND UPIU
-		ucd[1] = aBytes ? 0x40 : 0;						// R: data in; simple task
-		ucd[2] = (TUint8)aLun;
-		PutBe32(ucd + 12, aBytes);						// expected data transfer length
-		memcpy(ucd + 16, aCdb, 16);
-		}												// else NOP OUT: all zero
-	if (aBytes)
-		{
-		volatile TUint32* prd = (volatile TUint32*)(ucd + KPrdt);
-		prd[0] = (TUint32)DataPhys;
-		prd[1] = 0;
-		prd[2] = 0;
-		prd[3] = aBytes - 1;
-		Cache::SyncMemoryBeforeDmaRead((TLinAddr)Data, aBytes);
-		}
-	// UTRD: command type 1 (UFS storage), data direction 2 (device to host) or 0, interrupt on completion
-	utrd[0] = (1u << 28) | (aBytes ? (2u << 25) : 0) | (1u << 24);
-	utrd[1] = 0;
-	utrd[2] = 0x0f;										// OCS: invalid until the host writes it
-	utrd[3] = 0;
-	utrd[4] = (TUint32)(DescPhys + KUcd);
-	utrd[5] = 0;
-	utrd[6] = ((KResp / 4) << 16) | (KResp / 4);		// response UPIU offset, length (dwords)
-	utrd[7] = ((KPrdt / 4) << 16) | (aBytes ? 1 : 0);	// PRDT offset (dwords), entries
-	__e32_memory_barrier();
-	R(EIs) = EIsUtrcs;
-	R(EUtrldbr) = 1;
-	TInt i = 0;
-	for (; i < 100000 && (R(EUtrldbr) & 1); ++i)		// up to 1 s
-		Kern::NanoWait(10000);
-	if (R(EUtrldbr) & 1)
-		{
-		R(EUtrlclr) = ~1u;								// writing 0 clears the slot
-		Log("slot 0 timed out: cdb %02x lun %d, is %08x hcs %08x", aCdb ? aCdb[0] : 0xff, aLun, R(EIs), R(EHcs));
-		return KErrTimedOut;
-		}
-	R(EIs) = EIsUtrcs;
-	if (aBytes)
-		Cache::SyncMemoryAfterDmaRead((TLinAddr)Data, aBytes);
-	const TUint8* resp = ucd + KResp;
-	TUint32 ocs = utrd[2] & 0xff;
-	if (ocs != 0 || resp[0] != (aCdb ? 0x21 : 0x20) || resp[6] != 0)
-		{
-		Log("cdb %02x lun %d: ocs %x, response %02x/%02x", aCdb ? aCdb[0] : 0xff, aLun, ocs, resp[0], resp[6]);
-		return KErrGeneral;
-		}
-	aStatus = resp[7];
-	if (aStatus == 2 && (resp[32] << 8 | resp[33]) >= 14)	// fixed-format sense data after its length
-		aSense = (resp[34 + 2] & 0xf) << 16 | resp[34 + 12] << 8 | resp[34 + 13];
-	return KErrNone;
-	}
-
-// a SCSI command with up to three retries on a check condition (UNIT ATTENTION after a reset, ...)
-static TInt Scsi(TInt aLun, const TUint8* aCdb, TUint32 aBytes)
-	{
-	TInt status = 0, r = KErrNone;
-	TUint32 sense = 0;
-	for (TInt k = 0; k < 4; ++k)
-		{
-		r = Command(aLun, aCdb, aBytes, status, sense);
-		if (r != KErrNone || status != 2)
-			break;
-		}
-	if (r == KErrNone && status != 0)
-		{
-		if (aCdb[0] != 0x00)								// TUR on an absent LUN: expected, not logged
-			Log("cdb %02x lun %d: status %d sense %06x", aCdb[0], aLun, status, sense);
-		r = KErrNotReady;
-		}
-	return r;
-	}
-
-static TInt ReadBlocks(TInt aLun, TUint32 aBlock, TUint32 aCount)
-	{
-	TUint8 cdb[16] = { 0x28 };
-	PutBe32(cdb + 2, aBlock);
-	cdb[7] = (TUint8)(aCount >> 8);
-	cdb[8] = (TUint8)aCount;
-	return Scsi(aLun, cdb, aCount * Luns[aLun].iBlockSize);
-	}
-
-static TInt Adopt()
-	{
-	if (!Lock)
-		{
-		_LIT(KLockName, "Ufs");
-		NKern::ThreadEnterCS();
-		TInt r = Kern::MutexCreate(Lock, KLockName, KMutexOrdUfs);
-		NKern::ThreadLeaveCS();
-		if (r != KErrNone)
-			return r;
-		}
-	TLock lock;
-	if (!HostClocked())
-		{
-		Log("ABL left the host unclocked (gdsc %08x ahb %08x): the full bring-up isn't written yet", Gcc(EGdsc),
-			Gcc(EAhb));
-		return KErrNotReady;
-		}
-	TUint32 hcs = R(EHcs);
-	if (!(R(EHce) & 1) || (hcs & (EHcsDp | EHcsUtrlRdy)) != (EHcsDp | EHcsUtrlRdy))
-		{
-		Log("ABL left no link: hce %08x hcs %08x", R(EHce), hcs);
-		return KErrNotReady;
-		}
-	if (!Desc)
-		{
-		NKern::ThreadEnterCS();
-		TInt r = Epoc::AllocPhysicalRam(0x2000, DescPhys, 12);
-		if (r == KErrNone)
-			r = Epoc::AllocPhysicalRam(KXfer, DataPhys, 12);
-		DPlatChunkHw* d = NULL;
-		DPlatChunkHw* c = NULL;
-		if (r == KErrNone)
-			r = DPlatChunkHw::New(d, DescPhys, 0x2000, EMapAttrSupRw | EMapAttrBufferedNC);
-		if (r == KErrNone)
-			r = DPlatChunkHw::New(c, DataPhys, KXfer, EMapAttrSupRw | EMapAttrCachedMax);
-		NKern::ThreadLeaveCS();
-		if (r != KErrNone)
-			return r;
-		Desc = (volatile TUint32*)d->LinearAddress();
-		Data = (TUint8*)c->LinearAddress();
-		memclr((TAny*)Desc, 0x2000);
-		}
-	// the data path through aggre1 NoC to DDR (BCM SN9, 16 bytes wide; MC0/SH0 are voted by USB)
-	Log("bus vote SN9 -> %d", Bcm_Vote("SN9", 300000, 600000, 16));
-	TInt sm = Smmu_IdentityMap(0x100, 0);
-	Log("smmu stream 0x100 -> %d (%d: routed already)", sm, KErrInUse);
-	if (sm != KErrNone && sm != KErrInUse)
-		return sm;
-	// our lists in place of ABL's: stop both, point them at our memory, start; interrupts masked (we poll)
-	Log("ABL's lists: utrl %08x run %d bell %08x; utmrl %08x run %d; ie %08x", R(EUtrlba), R(EUtrlrsr), R(EUtrldbr),
-		R(EUtmrlba), R(EUtmrlrsr), R(EIe));
-	R(EIe) = 0;
-	R(EUtrlrsr) = 0;
-	R(EUtmrlrsr) = 0;
-	R(EUtrlba) = (TUint32)DescPhys;
-	R(EUtrlbau) = 0;
-	R(EUtmrlba) = (TUint32)DescPhys + 0x400;
-	R(EUtmrlbau) = 0;
-	R(EUtmrlrsr) = 1;
-	R(EUtrlrsr) = 1;
-	TInt status;
-	TUint32 sense;
-	TInt r = Command(0, NULL, 0, status, sense);
-	Log("NOP OUT -> %d", r);
-	if (r != KErrNone)
-		return r;
-	TInt found = 0;
-	for (TInt lun = 0; lun < KLuns; ++lun)
-		{
-		Luns[lun].iBlocks = Luns[lun].iBlockSize = 0;
-		const TUint8 tur[16] = { 0x00 };
-		if (Scsi(lun, tur, 0) != KErrNone)
-			continue;
-		const TUint8 cap[16] = { 0x25 };
-		if (Scsi(lun, cap, 8) != KErrNone)
-			continue;
-		TUint32 last = Be32(Data), size = Be32(Data + 4);
-		if (size < KA64BlkSector || size > (TUint32)KXfer || size % KA64BlkSector)
-			{
-			Log("lun %d: block size %d not usable", lun, size);
-			continue;
-			}
-		Luns[lun].iBlocks = last + 1;
-		Luns[lun].iBlockSize = size;
-		Log("lun %d: %d blocks of %d (%d MB)", lun, last + 1, size, (TInt)((TUint64)(last + 1) * size >> 20));
-		++found;
-		}
-	const TUint8 inq[16] = { 0x12, 0, 0, 0, 36 };
-	if (found && Scsi(0, inq, 36) == KErrNone)
-		{
-		TBuf8<32> id;
-		id.Copy(Data + 8, 28);								// vendor, product, revision
-		Log("device: %S", &id);
-		}
-	Cur = 0;
-	return found ? KErrNone : KErrNotFound;
-	}
-
-// C: stays the RAM drive in OP6: no mount at boot
-TInt A64BlkDev_Init(TUint64&) { return KErrNotSupported; }
-
-TInt A64BlkDev_Probe()									// "blk init"
-	{
-	NReport = 0;
-	return InitResult = Adopt();
-	}
-
-// 512-byte sectors of the selected LUN, through the bounce buffer
-TInt A64BlkDev_Read(TUint64 aLba, TInt aCount, TUint8* aBuf)
-	{
-	if (InitResult != KErrNone)
-		return KErrNotReady;
-	TLock lock;
-	const TLun& l = Luns[Cur];
-	const TUint32 per = l.iBlockSize / KA64BlkSector;
-	if (!l.iBlocks || aCount <= 0 || aLba + aCount > (TUint64)l.iBlocks * per)
-		return KErrArgument;
-	while (aCount > 0)
-		{
-		TUint32 block = (TUint32)(aLba / per), off = (TUint32)(aLba % per) * KA64BlkSector;
-		TUint32 want = off + aCount * KA64BlkSector;
-		TUint32 n = Min((want + l.iBlockSize - 1) / l.iBlockSize, (TUint32)KXfer / l.iBlockSize);
-		TInt r = ReadBlocks(Cur, block, n);
-		if (r != KErrNone)
-			return r;
-		TInt sectors = Min((TInt)((n * l.iBlockSize - off) / KA64BlkSector), aCount);
-		memcpy(aBuf, Data + off, sectors * KA64BlkSector);
-		aBuf += sectors * KA64BlkSector;
-		aLba += sectors;
-		aCount -= sectors;
-		}
-	return KErrNone;
-	}
-
-// one LUN's GPT, in its own block size: a line per partition
-static void ListGpt(TInt aLun)
-	{
-	const TLun& l = Luns[aLun];
-	A64Mon_Say("lun %d: %d blocks of %d, %d MB", aLun, l.iBlocks, l.iBlockSize, (TInt)((TUint64)l.iBlocks * l.iBlockSize >> 20));
-	if (ReadBlocks(aLun, 1, 1) != KErrNone || memcompare(Data, 8, (const TUint8*)"EFI PART", 8) != 0)
-		{
-		A64Mon_Say("lun %d: no GPT", aLun);
-		return;
-		}
-	TUint32 lba = (TUint32)*(TUint64*)(Data + 72), n = *(TUint32*)(Data + 80), size = *(TUint32*)(Data + 84);
-	if (size < 128 || l.iBlockSize % size)
-		{
-		A64Mon_Say("lun %d: GPT entry size %d", aLun, size);
-		return;
-		}
-	const TUint32 per = l.iBlockSize / size;
-	for (TUint32 i = 0; i < n && i < 256; ++i)
-		{
-		if (i % per == 0 && ReadBlocks(aLun, lba + i / per, 1) != KErrNone)
-			return;
-		const TUint8* p = Data + (i % per) * size;
-		TUint64 first = *(const TUint64*)(p + 32), last = *(const TUint64*)(p + 40);
-		if (!first)
-			continue;
-		TBuf8<40> name;
-		for (TInt c = 0; c < 36 && p[56 + 2 * c]; ++c)
-			name.Append(p[56 + 2 * c]);
-		A64Mon_Say("lun %d #%d %S %d..%d %d MB", aLun, i, &name, (TInt)first, (TInt)last,
-			(TInt)((last - first + 1) * l.iBlockSize >> 20));
-		}
-	}
-
-static TBool Is(const TDesC8& aWord, const char* aLit)
-	{
-	TInt n = 0;
-	while (aLit[n])
-		++n;
-	return aWord.Length() == n && memcompare(aWord.Ptr(), n, (const TUint8*)aLit, n) == 0;
-	}
-
-TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes8& aOut)
-	{
-	if (InitResult != KErrNone)
-		{
-		A64Device_Format(aOut, "ufs: not up (%d; blk init)", InitResult);
-		return KErrNotReady;
-		}
-	if (Is(aArg[1], "luns"))
-		{
-		TLock lock;
-		for (TInt lun = 0; lun < KLuns; ++lun)
-			if (Luns[lun].iBlocks)
-				ListGpt(lun);
-		aOut.Append((const TUint8*)"ufs: luns done", 14);
-		return KErrNone;
-		}
-	if (Is(aArg[1], "lun") && aArgc >= 3)
-		{
-		TInt lun = (TInt)aNum[2];
-		if (lun < 0 || lun >= KLuns || !Luns[lun].iBlocks)
-			return KErrNotFound;
-		Cur = lun;
-		A64Device_Format(aOut, "ufs: blk read/dump use lun %d", lun);
-		return KErrNone;
-		}
-	if (Is(aArg[1], "speed"))						// 64 MB from LUN 0's start, raw (no copy out of Data)
-		{
-		TLock lock;
-		const TUint32 n = KXfer / Luns[0].iBlockSize, total = (64u << 20) / Luns[0].iBlockSize;
-		TInt r = KErrNone;
-		TUint32 t0 = NKern::TickCount();
-		for (TUint32 b = 0; b < total && r == KErrNone; b += n)
-			r = ReadBlocks(0, b, n);
-		TInt ms = Max(1, (TInt)((NKern::TickCount() - t0) * NKern::TickPeriod() / 1000));
-		A64Device_Format(aOut, "ufs: read 64 MB in %d ms (%d KB/s)", ms, 65536 * 1000 / ms);
-		return r;
-		}
-	aOut.Append((const TUint8*)"blk luns | blk lun <n> | blk speed", 34);
-	return KErrArgument;
-	}
-
-static TA64DevState UfsStatus(TDes8& aDetail)
-	{
-	if (InitResult == KErrNotReady && !Desc)
-		{
-		A64Device_Format(aDetail, "read-only; not started (blk init)");
-		return EA64DevOff;
-		}
-	if (InitResult != KErrNone)
-		{
-		A64Device_Format(aDetail, "init failed: %d", InitResult);
-		return EA64DevError;
-		}
-	TInt luns = 0;
-	for (TInt i = 0; i < KLuns; ++i)
-		luns += Luns[i].iBlocks != 0;
-	A64Device_Format(aDetail, "read-only, %d LUNs, ABL's link adopted, polled", luns);
-	return EA64DevPartial;
-	}
-A64_DEVICE("ufs", "Storage (UFS)", "qcom_ufs", UfsStatus);

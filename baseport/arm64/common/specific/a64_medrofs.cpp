@@ -237,7 +237,11 @@ DECLARE_STANDARD_EXTENSION()
 	if (!Bounce)
 		return KErrNoMemory;
 	TUint64 first = 0, count = 0;
+#ifdef A64_ROFS_SLOT
+	const char* const system = A64_ROFS_SLOT;				// ROFS_SLOT=a|b: that slot's, whatever the GPT marks active
+#else
 	const char* const system = A64Slot_Current() == 'b' ? "system_b" : "system_a";	// FS5b: the booted slot's
+#endif
 	TInt part = A64BlkDev_Partition(system, first, count);
 	Ram = InRam() ? __urofs_base : MapRamdisk();
 	if (Ram)

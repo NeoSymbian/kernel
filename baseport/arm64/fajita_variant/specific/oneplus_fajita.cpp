@@ -52,6 +52,9 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x03963000, 0x00001000, 1 },		// TLMM north: gpio99 (touch reset)
 	{ 0x03558000, 0x00001000, 1 },		// TLMM east: gpio88 (touch 1.8 V enable)
 	{ 0x0357d000, 0x00001000, 1 },		// TLMM east: gpio125 (touch attention)
+	{ 0x01d84000, 0x00003000, 1 },		// UFS host (qcom_ufs.cpp, read-only)
+	{ 0x01d87000, 0x00001000, 1 },		// UFS QMP PHY v3 (status reads only)
+	{ 0x00177000, 0x00001000, 1 },		// GCC: UFS_PHY BCR, GDSC and clock branches
 	{ 0x0c3f0000, 0x00001000, 1 },		// AOP message RAM: the command DB's address at +0xc (qcom_rpmh.cpp CmdDbBase)
 	{ 0x85fe0000, 0x00020000, 2 },		// the command DB, candidate 1: mainline sdm845.dtsi (removed_region, no-map)
 	{ 0x861e0000, 0x00020000, 2 },		// the command DB, candidate 2: the downstream DT's qcom,cmd-db@861e0000

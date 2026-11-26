@@ -6,7 +6,8 @@
 // sets the clock and voltage. ABL leaves silver at its top step (1708.8 MHz), gold at its bottom (300 MHz) and L3 at
 // step 5 of 10 (smooth-ui S3b, monitor `cpus`).
 // Touch boost (smooth-ui S3c): every input event (Kern::AddEvent -> A64CpuBoost) puts all three at their top step;
-// 3 s after the last one they go back to the steps ABL left.
+// 3 s after the last one they go back to the steps ABL left. A media boost (HAL ENeoHalCpuBoost, FA12) asks for the same
+// for up to 5 s at a time: a video keeps asking while it plays, with nobody touching the phone.
 // Written from the register layout in Linux drivers/cpufreq/qcom-cpufreq-hw.c (sdm845: LUT at +0x110, 32-byte
 // rows, PERF_STATE at +0x920) and drivers/interconnect/qcom/osm-l3.c, checked against the phone with `peek`.
 // shortcut: no governor and no thermal driver (Qualcomm's LMh limits clocks in hardware at 95 C); a power policy
@@ -45,22 +46,60 @@ static void SetSteps(TBool aTop)
 			Reg(Domains[i].iBase + EPerfState) = aTop ? Domains[i].iTop : Domains[i].iIdle;
 	}
 
+// The boost's end: one absolute deadline (NKern::TickCount), only ever moved later while boosted, so touches (3 s) and
+// a video's asks don't shorten each other. Boosted, Deadline, the timer and the steps change only under BoostLock.
+// NTimer takes its own queue lock (EOrderNTimerQ, 0x10) inside it, so BoostLock ranks above it (nested locks go down in
+// order); the expiry takes BoostLock only after the timer code has let go of NTimerQ. The drop lowers the steps only
+// once the deadline has passed (an ask that came while it was due wins), and an ask always raises them (review of
+// kernel#44: an expiry on another CPU, or a 1 ms ask's, could leave the steps low while Boosted said otherwise).
+// shortcut: no thermal limit on a long boost (TSENS is read for telemetry only; LMh caps clocks in hardware at 95 C);
+// a governor with a thermal policy comes with power (H3).
+static TSpinLock BoostLock(TSpinLock::EOrderGenericIrqHigh0);
+// the first tick at which the boost may end: an ask's tick + its ticks + 1, the earliest tick its expiry can see
+static TUint32 Deadline;
+static void DropFn(TAny*);
+static NTimer DropTimer(DropFn, NULL);
+
 static void DropFn(TAny*)
 	{
-	__e32_atomic_store_rel32(&Boosted, 0);
-	SetSteps(EFalse);
+	TInt irq = BoostLock.LockIrqSave();
+	TInt left = (TInt)(Deadline - NKern::TickCount());
+	if (left > 0)
+		DropTimer.OneShot(left - 1 > 0 ? left - 1 : 1);	// a later ask moved the end (KErrInUse: it re-armed already)
+	else
+		{
+		__e32_atomic_store_rel32(&Boosted, 0);
+		SetSteps(EFalse);
+		}
+	BoostLock.UnlockIrqRestore(irq);
 	}
-static NTimer DropTimer(DropFn, NULL);
+
+// Top steps now, ABL's steps aMs after this ask or a later one (touches ask for KBoostMs).
+TInt A64CpuBoostFor(TInt aMs)
+	{
+	if (!Ready)
+		return KErrNotSupported;
+	TInt ticks = NKern::TimerTicks(aMs);
+	TInt irq = BoostLock.LockIrqSave();
+	TUint32 until = NKern::TickCount() + (TUint32)ticks + 1;
+	if (!Boosted || (TInt)(until - Deadline) > 0)
+		{
+		Deadline = until;
+		// under the lock nothing else arms the timer: an expiry running on another CPU waits for the lock and then sees
+		// the new deadline
+		DropTimer.Cancel();
+		DropTimer.OneShot(ticks);
+		}
+	__e32_atomic_store_rel32(&Boosted, 1);
+	SetSteps(ETrue);
+	BoostLock.UnlockIrqRestore(irq);
+	return KErrNone;
+	}
 
 // Called for every input event: top steps now, ABL's steps 3 s after the last event.
 void A64CpuBoost()
 	{
-	if (!Ready)
-		return;
-	if (!__e32_atomic_swp_ord32(&Boosted, 1))
-		SetSteps(ETrue);
-	DropTimer.Cancel();
-	DropTimer.OneShot(NKern::TimerTicks(KBoostMs));
+	A64CpuBoostFor(KBoostMs);
 	}
 
 void A64CpufreqDump()

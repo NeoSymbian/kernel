@@ -40,6 +40,13 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x088e2000, 0x00001000, 1 },		// QUSB2 HS PHY
 	{ 0x179e0000, 0x00010000, 1 },		// apps RSC DRV2: RPMh votes (qcom_rpmh.cpp)
 	{ 0x15000000, 0x00080000, 1 },		// apps SMMU (MMU-500): USB's stream 0x740 (qcom_smmu.cpp)
+	{ 0x00118000, 0x00001000, 1 },		// GCC: QUP wrapper 1 AHB branches, SE4 branch + RCG (fajita_touch.cpp)
+	{ 0x00152000, 0x00001000, 1 },		// GCC: APCS clock branch enable vote 1 (QUP wrapper 1, SE4)
+	{ 0x00a90000, 0x00004000, 1 },		// GENI SE12 (QUP wrapper 1 SE4): the touchscreen's I2C
+	{ 0x03931000, 0x00002000, 1 },		// TLMM north: gpio49, gpio50 (I2C SDA/SCL, qup12)
+	{ 0x03963000, 0x00001000, 1 },		// TLMM north: gpio99 (touch reset)
+	{ 0x03558000, 0x00001000, 1 },		// TLMM east: gpio88 (touch 1.8 V enable)
+	{ 0x0357d000, 0x00001000, 1 },		// TLMM east: gpio125 (touch attention)
 	{ 0x0c3f0000, 0x00001000, 1 },		// AOP message RAM: the command DB's address at +0xc (qcom_rpmh.cpp CmdDbBase)
 	{ 0x85fe0000, 0x00020000, 2 },		// the command DB, candidate 1: mainline sdm845.dtsi (removed_region, no-map)
 	{ 0x861e0000, 0x00020000, 2 },		// the command DB, candidate 2: the downstream DT's qcom,cmd-db@861e0000

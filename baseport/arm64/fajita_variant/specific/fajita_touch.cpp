@@ -1,0 +1,539 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// fajita_touch.cpp -- the OnePlus 6T touchscreen (a copy of bonito's a64_touch.cpp with the 6T's wiring; docs
+// fajita.md OP4): Synaptics RMI4 (S3706) at I2C 0x20 on the GENI serial engine i2c@a90000 (QUP wrapper 1 SE4 = SE12;
+// SDA/SCL = TLMM gpio49/50 "qup12", north tile), reset gpio99 (north), attention gpio125 (east on SDM845), 1.8 V =
+// TLMM gpio88 (east) driven high, 2.8 V = PM8998 LDO28 (RPMh "ldoa28", 3.008 V) (live DT synaptics-rmi-ts@20).
+// shortcut: a copy (owner, 2026-11-26: the Pixel's files stay untouched); merge with a board pin table later.
+// We bring all of it up ourselves, as on the Pixel:
+//   clocks on -> pins -> supply on, reset released -> the SE's I2C firmware -> the RMI4 function table.
+// Register offsets: Linux gcc-sdm845.c (covers sdm670), pinctrl-sdm670.c, pinctrl-spmi-gpio.c, rmi_driver.c, rmi_f12.c.
+// Then the Synaptics F12 2-D sensor's finger objects (up to 5, each its own pointer number) are polled and posted as
+// EButton1Down/EPointerMove/EButton1Up in screen pixels (Kern::AddEvent). Volume Up re-prints the bring-up report
+// (boot-time lines scroll out of the strip).
+#include <kernel/kern_priv.h>
+#include "board.h"
+#include "qcom_spmi.h"
+#include "qcom_geni_i2c.h"
+#include "qcom_rpmh.h"
+#include "a64_device.h"
+
+static volatile TUint32& Reg(TUint32 aPhys) { return *(volatile TUint32*)A64_Io(aPhys); }
+
+// GCC: the QUP wrapper 1 clocks. Vote bits 20/21 = wrapper 1 m/s AHB, 26 = SE4; 18/19 = the wrapper's core and
+// core-2x clocks in the downstream kernel (upstream left them to an interconnect vote; unused bits otherwise).
+const TUint32 KGcc = 0x00100000;
+// SE4: branch 0x184d4, RCG 0x184d8 (Linux gcc-sdm845.c gcc_qupv3_wrap1_s4_clk[_src])
+enum { EGccVote1 = 0x5200c, EWrap1MAhbCbcr = 0x1800c, EWrap1SAhbCbcr = 0x18010, ESe1Cbcr = 0x184d4,
+	ESe1RcgCmd = 0x184d8, ESe1RcgCfg = 0x184dc };
+const TUint32 KVoteBits = (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 26);
+const TUint32 KCbcrOff = 1u << 31;
+// TLMM: per pin CTL (pull [1:0], function [5:2], drive [8:6], OE [9]) and IO (in [0], out [1])
+const TUint32 KTlmm = 0x03400000, KNorth = 0x00500000, KEast = 0x00100000;	// SDM845 tiles (pinctrl-sdm845.c)
+const TUint32 KPullNone = 0, KPullUp = 3, KOe = 1u << 9;
+static volatile TUint32& Ctl(TUint32 aTile, TInt aPin) { return Reg(KTlmm + aTile + 0x1000 * aPin); }
+static volatile TUint32& Io(TUint32 aTile, TInt aPin) { return Reg(KTlmm + aTile + 0x1000 * aPin + 4); }
+const TUint32 KSe1 = 0x00a90000;					// SE12 (the name kept from the Pixel copy)
+const TUint KRmiAddr = 0x20;
+
+// the report, kept for the Volume Up re-print
+static TBuf8<120> Lines[20];
+static TInt NLines;
+static void Log(const char* aFmt, ...)
+	{
+	VA_LIST list;
+	VA_START(list, aFmt);
+	TBuf8<120> b;
+	Kern::AppendFormat(b, aFmt, list);
+	VA_END(list);
+	Kern::Printf("[touch] %S", &b);
+	if (NLines < (TInt)(sizeof(Lines) / sizeof(Lines[0])))
+		Lines[NLines++] = b;
+	}
+
+static const char* volatile CurStep = "not started";
+static void Step(const char* aStep)
+	{
+	CurStep = aStep;
+	Kern::Printf("[touch] step: %s", aStep);
+	}
+
+static TInt Logged, Dropped;							// presses + releases seen; events the full queue refused
+
+void A64TouchDump()
+	{
+	Kern::Printf("[touch] last step: %s", CurStep);
+	for (TInt i = 0; i < NLines; ++i)
+		Kern::Printf("[touch] %S", &Lines[i]);
+	Kern::Printf("[touch] presses+releases %d, events dropped %d", Logged, Dropped);
+	}
+
+static TBool ClocksOn()
+	{
+	Step("clock vote");
+	Reg(KGcc + EGccVote1) |= KVoteBits;
+	Step("clock rcg");
+	Reg(KGcc + ESe1RcgCfg) = 1;							// source 0 = XO 19.2 MHz, pre-divider 1 (encoded 2*1-1)
+	Reg(KGcc + ESe1RcgCmd) |= 1;							// UPDATE
+	TInt i;
+	for (i = 0; i < 100000 && (Reg(KGcc + ESe1RcgCmd) & 1); ++i)
+		{}
+	Step("clock wait");
+	TBool on = EFalse;
+	for (TInt j = 0; j < 100000 && !on; ++j)
+		on = !((Reg(KGcc + EWrap1MAhbCbcr) | Reg(KGcc + EWrap1SAhbCbcr) | Reg(KGcc + ESe1Cbcr)) & KCbcrOff);
+	Log("clocks %s: vote %08x m_ahb %08x s_ahb %08x se1 %08x rcg %08x/%08x", on ? "on" : "STILL OFF",
+		Reg(KGcc + EGccVote1), Reg(KGcc + EWrap1MAhbCbcr), Reg(KGcc + EWrap1SAhbCbcr), Reg(KGcc + ESe1Cbcr),
+		Reg(KGcc + ESe1RcgCmd), Reg(KGcc + ESe1RcgCfg));
+	return on;
+	}
+
+// the 6T: 2.8 V from PM8998 LDO28 (an RPMh vote), then the 1.8 V enable TLMM gpio88 (east) driven high
+static TInt SupplyOn()
+	{
+	TInt r = Vrm_Vote("ldoa28", 3008);
+	Io(KEast, 88) = 2;
+	Ctl(KEast, 88) = KPullNone | KOe;
+	Log("supply: ldoa28 3008 mV -> %d; gpio88 %08x/%x", r, Ctl(KEast, 88), Io(KEast, 88));
+	return r;
+	}
+
+// the Pixel's ts_1p8 enable (PM660 GPIO12), unused on the 6T: kept so the copy diffs cleanly against a64_touch.cpp
+__attribute__((unused)) static TInt SupplyOnPixel()
+	{
+	TInt sub = Spmi_Read(0, 0xcb05), r;
+	if (sub == 0x10 || sub == 0x11)						// LV/MV: mode in MODE_CTL, level in DIG_OUT_SOURCE_CTL bit 7
+		{
+		r = Spmi_Write(0, 0xcb40, 1);
+		if (r == KErrNone)
+			r = Spmi_Write(0, 0xcb44, 0x80);
+		}
+	else													// older GPIO: MODE_CTL = dir << 4 | function << 1 | value
+		r = Spmi_Write(0, 0xcb40, (1 << 4) | 1);
+	if (r == KErrNone)
+		r = Spmi_Write(0, 0xcb46, 0x80);					// enabled
+	Log("supply: subtype %02x -> %d; mode %02x out %02x en %02x status1 %02x", sub, r, Spmi_Read(0, 0xcb40),
+		Spmi_Read(0, 0xcb44), Spmi_Read(0, 0xcb46), Spmi_Read(0, 0xcb08));
+	return r;
+	}
+
+static TDynamicDfcQue* TouchQ;								// the bring-up and the poll run here
+static TInt RmiPage = -1;									// the controller's page register, as last written
+
+static TInt RmiSetPage(TUint aAddr)
+	{
+	TInt page = (aAddr >> 8) & 0xff;
+	if (page == RmiPage)
+		return KErrNone;
+	TUint8 w[2] = { 0xff, (TUint8)page };
+	TInt r = I2c_WriteRead(KRmiAddr, w, 2, NULL, 0);
+	RmiPage = r == KErrNone ? page : -1;
+	return r;
+	}
+
+static TInt RmiRead(TUint aAddr, TUint8* aBuf, TInt aLen)
+	{
+	TInt r = RmiSetPage(aAddr);
+	if (r != KErrNone)
+		return r;
+	TUint8 a = (TUint8)aAddr;
+	r = I2c_WriteRead(KRmiAddr, &a, 1, aBuf, aLen);
+	if (r != KErrNone)
+		RmiPage = -1;										// unknown after a failed transfer: select it again
+	return r;
+	}
+
+static TInt RmiWrite(TUint aAddr, const TUint8* aData, TInt aLen)
+	{
+	TInt r = RmiSetPage(aAddr);
+	if (r != KErrNone)
+		return r;
+	TUint8 w[8];
+	if (aLen > 7)
+		return KErrArgument;
+	w[0] = (TUint8)aAddr;
+	memcpy(w + 1, aData, aLen);
+	r = I2c_WriteRead(KRmiAddr, w, aLen + 1, NULL, 0);
+	if (r != KErrNone)
+		RmiPage = -1;
+	return r;
+	}
+
+// ---- RMI4 register descriptors (Linux rmi_driver.c rmi_read_register_desc): which packet registers a function
+// has, each one's size and subpackets. A control/query packet register has one address: base + its index among the
+// present ones; the data packet is read as one block from the data base, a register at the byte sum below it.
+struct SDesc
+	{
+	TUint64 iPresent;										// registers 0..63
+	TUint32 iSize[64];
+	TUint8 iSubpackets[64], iSub0[64];
+	TBool Has(TInt aReg) const { return (iPresent >> aReg) & 1; }
+	TUint32 Index(TInt aReg) const
+		{
+		TUint32 i = 0;
+		for (TInt k = 0; k < aReg; ++k)
+			i += Has(k);
+		return i;
+		}
+	TUint32 Offset(TInt aReg) const
+		{
+		TUint32 o = 0;
+		for (TInt k = 0; k < aReg; ++k)
+			if (Has(k))
+				o += iSize[k];
+		return o;
+		}
+	};
+
+static TInt ReadDesc(TUint aAddr, SDesc& aDesc)
+	{
+	memclr(&aDesc, sizeof(aDesc));
+	TUint8 n, p[35], st[64];
+	TInt r = RmiRead(aAddr, &n, 1);
+	if (r == KErrNone && (n == 0 || n > sizeof(p)))
+		r = KErrCorrupt;
+	if (r == KErrNone)
+		r = RmiRead(aAddr + 1, p, n);
+	if (r != KErrNone)
+		return r;
+	TInt first = 1;
+	TUint size = p[0];
+	if (p[0] == 0)
+		{
+		first = 3;
+		size = p[1] | (p[2] << 8);
+		}
+	if (size > sizeof(st))
+		return KErrTooBig;
+	r = RmiRead(aAddr + 2, st, size);
+	if (r != KErrNone)
+		return r;
+	TUint off = 0;
+	for (TInt i = first, reg = 0; i < n; ++i)
+		for (TInt b = 0; b < 8; ++b, ++reg)
+			{
+			if (!(p[i] & (1 << b)))
+				continue;
+			if (off >= size)
+				return KErrCorrupt;
+			TUint32 rs = st[off++];
+			if (rs == 0)
+				{
+				rs = st[off] | (st[off + 1] << 8);
+				off += 2;
+				if (rs == 0)
+					{
+					rs = st[off] | (st[off + 1] << 8) | (st[off + 2] << 16) | ((TUint32)st[off + 3] << 24);
+					off += 4;
+					}
+				}
+			TInt subs = 0;
+			TUint8 sub0 = st[off];
+			do
+				for (TInt k = 0; k < 7; ++k)
+					subs += (st[off] >> k) & 1;
+			while ((st[off++] & 0x80) && off < size);
+			if (reg < 64)
+				{
+				aDesc.iPresent |= 1ull << reg;
+				aDesc.iSize[reg] = rs;
+				aDesc.iSubpackets[reg] = (TUint8)subs;
+				aDesc.iSub0[reg] = sub0;
+				}
+			}
+	return KErrNone;
+	}
+
+// ---- the function table, the sensor, the poll
+struct SFn { TUint8 iQuery, iCtrl, iData; TBool iFound; };
+static SFn F01, F12;
+static TUint32 MaxX = 1080, MaxY = 2160;				// the sensor's range (F12 control 8)
+static TUint32 Data1Off;								// F12 data register 1 (the finger objects, 8 bytes each) in the packet
+const TInt KMaxFingers = 5;								// pointer numbers 0..4 (neoui: 0 drives gestures, the rest go to apps)
+const TInt KPacket = 128;
+static TInt Fingers = 1;								// the objects read per poll (the sensor's count, at most KMaxFingers)
+
+static TInt RmiSetup()
+	{
+	TUint8 q0;
+	TInt r = RmiRead(F12.iQuery, &q0, 1);
+	if (r != KErrNone || !(q0 & 1))
+		{
+		Log("F12 query0 %02x -> %d: no register descriptors", q0, r);
+		return KErrNotSupported;
+		}
+	static SDesc ctrl, data;
+	r = ReadDesc(F12.iQuery + 4, ctrl);
+	if (r == KErrNone)
+		r = ReadDesc(F12.iQuery + 7, data);
+	if (r != KErrNone || !data.Has(1))
+		{
+		Log("F12 descriptors -> %d, data1 %d", r, data.Has(1));
+		return r != KErrNone ? r : KErrNotSupported;
+		}
+	Data1Off = data.Offset(1);
+	if (Data1Off + 8 > (TUint32)KPacket)
+		{
+		Log("F12 data1 at byte %d: too far into the packet", Data1Off);
+		return KErrTooBig;
+		}
+	Fingers = data.iSubpackets[1];
+	Fingers = Fingers < 1 ? 1 : Fingers > KMaxFingers ? KMaxFingers : Fingers;
+	while (Fingers > 1 && Data1Off + 8 * Fingers > (TUint32)KPacket)
+		--Fingers;
+	if (ctrl.Has(8) && (ctrl.iSub0[8] & 1))
+		{
+		TUint8 c8[4];
+		if (RmiRead(F12.iCtrl + ctrl.Index(8), c8, 4) == KErrNone && (c8[0] | c8[1]) && (c8[2] | c8[3]))
+			{
+			MaxX = c8[0] | (c8[1] << 8);
+			MaxY = c8[2] | (c8[3] << 8);
+			}
+		}
+	// F01 device control: no sleep, configured; interrupt enable for F12 (source 1, after F01's 0)
+	TUint8 c[2];
+	r = RmiRead(F01.iCtrl, c, 2);
+	if (r == KErrNone)
+		{
+		c[0] = (TUint8)((c[0] & ~3) | (1 << 2) | (1 << 7));
+		c[1] |= 0x02;
+		r = RmiWrite(F01.iCtrl, c, 2);
+		}
+	Log("F12 max %d x %d, data1 at byte %d (%d objects, %d read); F01 ctrl %02x %02x -> %d", MaxX, MaxY, Data1Off,
+		data.iSubpackets[1], Fingers, c[0], c[1], r);
+	return KErrNone;
+	}
+
+// Up to KMaxFingers fingers, each F12 object (a slot the sensor keeps for a finger while it is down) as its own
+// pointer number. shortcut: polled at 10 ms off the attention pin (no TLMM interrupt); upgrade to the TLMM summary
+// interrupt
+const TInt KPollMs = 10, KFallbackTicks = 10;			// read anyway every 100 ms in case attention never asserts
+const TBool KFlipX = EFalse, KFlipY = EFalse, KSwapXY = EFalse;	// set from the corner test if an axis is off
+
+static void PollDfcFn(TAny*);
+static TDfc PollDfc(PollDfcFn, NULL, 1);
+static void PollTimerFn(TAny*) { PollDfc.Add(); }
+static NTimer PollTimer(PollTimerFn, NULL);
+static TBool Down[KMaxFingers];
+static TInt LastX[KMaxFingers], LastY[KMaxFingers];
+static TInt Quiet, Errors, AttnSeen;
+static TBool Polling, BringUpDone;						// the device registry: running, or stopped where CurStep says
+
+static void Post(TRawEvent::TType aType, TInt aX, TInt aY, TInt aFinger)
+	{
+	TRawEvent e;
+	e.Set(aType, aX, aY, 0, (TUint8)aFinger);
+	if (Kern::AddEvent(e) == KErrOverflow)
+		++Dropped;
+	}
+
+static volatile TBool Asleep;							// the screen is off: no polls, the sensor in F01 sensor sleep
+
+static void PollDfcFn(TAny*)
+	{
+	if (Asleep)												// stop until A64Touch_Sleep(EFalse) restarts the poll
+		{
+		for (TInt f = 0; f < KMaxFingers; ++f)
+			{
+			if (Down[f])
+				Post(TRawEvent::EButton1Up, LastX[f], LastY[f], f);
+			Down[f] = EFalse;
+			}
+		return;
+		}
+	TInt next = KPollMs;
+	TBool attn = !(Io(KEast, 125) & 1);
+	AttnSeen += attn;
+	if (attn || ++Quiet >= KFallbackTicks)
+		{
+		Quiet = 0;
+		TUint8 st, pkt[KPacket];
+		TInt r = RmiRead(F01.iData + 1, &st, 1);			// interrupt status: reading it releases attention
+		if (r == KErrNone)
+			r = RmiRead(F12.iData, pkt, Data1Off + 8 * Fingers);	// the data packet up to the last object read
+		if (r != KErrNone)
+			{
+			if (++Errors == 50)
+				Log("poll: 50 I2C errors in a row (last %d), slowing to 1 s", r);
+			next = Errors >= 50 ? 1000 : KPollMs;
+			}
+		else
+			{
+			Errors = 0;
+			for (TInt f = 0; f < Fingers; ++f)
+				{
+				const TUint8* o = pkt + Data1Off + 8 * f;
+				TInt rx = o[1] | (o[2] << 8), ry = o[3] | (o[4] << 8);
+				TInt x = rx, y = ry;
+				TInt mx = MaxX, my = MaxY;
+				if (KSwapXY)
+					{
+					TInt t = x; x = y; y = t;
+					t = mx; mx = my; my = t;
+					}
+				if (KFlipX)
+					x = mx - x;
+				if (KFlipY)
+					y = my - y;
+				x = x * A64_FbWidth / mx;
+				y = y * A64_FbHeight / my;
+				x = x < 0 ? 0 : x >= A64_FbWidth ? A64_FbWidth - 1 : x;
+				y = y < 0 ? 0 : y >= A64_FbHeight ? A64_FbHeight - 1 : y;
+				TBool down = (o[0] == 1 || o[0] == 2 || o[0] == 4);	// finger, stylus, unclassified
+				if (down && !Down[f])
+					Post(TRawEvent::EButton1Down, x, y, f);
+				else if (down && (x != LastX[f] || y != LastY[f]))
+					Post(TRawEvent::EPointerMove, x, y, f);
+				else if (!down && Down[f])
+					Post(TRawEvent::EButton1Up, LastX[f], LastY[f], f);
+				// the first presses and releases only (bring-up evidence): Kern::Printf runs with interrupts off, and a
+				// print per tap slows a busy UI (smooth-ui S1); the monitor's `touch` shows the counts
+				if (down != Down[f] && ++Logged <= 10)
+					Kern::Printf("[touch] %d finger %d %s %d %d (type %d, attn %d)", Logged, f, down ? "down" : "up",
+						down ? x : LastX[f], down ? y : LastY[f], o[0], AttnSeen);
+				Down[f] = down;
+				if (down)
+					{
+					LastX[f] = x;
+					LastY[f] = y;
+					}
+				}
+			}
+		}
+	PollTimer.OneShot(NKern::TimerTicks(next));			// not Again(): it stops for good after a slow poll
+	}
+
+// screen off/on (a64_display.cpp): F01 device control sleep mode 1 (sensor sleep) or 0, on the touch thread
+static void SleepDfcFn(TAny*)
+	{
+	TUint8 c = 0;
+	TInt r = RmiRead(F01.iCtrl, &c, 1);
+	if (r == KErrNone)
+		{
+		c = (TUint8)((c & ~3) | (Asleep ? 1 : 0));
+		r = RmiWrite(F01.iCtrl, &c, 1);
+		}
+	Log("%s: F01 ctrl %02x -> %d", Asleep ? "sleep" : "wake", c, r);
+	if (!Asleep)
+		PollTimer.OneShot(NKern::TimerTicks(KPollMs));	// KErrInUse if a poll is still pending: it re-arms itself
+	}
+static TDfc SleepDfc(SleepDfcFn, NULL, 1);
+
+void A64Touch_Sleep(TBool aSleep)						// thread context
+	{
+	if (!Polling)
+		return;												// not brought up: nothing to put to sleep
+	Asleep = aSleep;
+	SleepDfc.Enque();
+	}
+
+static void BringUpDfcFn(TAny*)
+	{
+	struct SDone { ~SDone() { BringUpDone = ETrue; } } done;	// every return below
+	NKern::ThreadEnterCS();
+	Step("pins");
+	Io(KNorth, 99) = 0;									// hold the controller in reset while its supply comes up
+	Ctl(KNorth, 99) = KPullUp | KOe;
+	Ctl(KEast, 125) = KPullNone;							// attention: input
+	Ctl(KNorth, 49) = KPullNone | (1 << 2);					// function 1 = qup12: SDA, SCL
+	Ctl(KNorth, 50) = KPullNone | (1 << 2);
+	Step("clocks");
+	TBool clocks = ClocksOn();
+	Step("supply");
+	TInt supply = SupplyOn();
+	Step("reset release");
+	NKern::Sleep(NKern::TimerTicks(10));
+	Io(KNorth, 99) = 2;									// out of reset
+	NKern::Sleep(NKern::TimerTicks(200));					// syna,reset-delay-ms
+	Log("pins: gpio49 %08x gpio50 %08x gpio99 %08x/%x gpio125 %08x/%x gpio88 %08x/%x", Ctl(KNorth, 49),
+		Ctl(KNorth, 50), Ctl(KNorth, 99), Io(KNorth, 99), Ctl(KEast, 125), Io(KEast, 125), Ctl(KEast, 88), Io(KEast, 88));
+	if (!clocks || supply != KErrNone)
+		{
+		Log("stopped: clocks or supply");
+		NKern::ThreadLeaveCS();
+		return;
+		}
+	Step("SE12");
+	TInt proto = I2c_Init(KSe1);
+	Log("SE12 firmware protocol %d (I2C = 3), status %08x", proto, Reg(KSe1 + 0x40));
+	if (proto != 3)
+		{
+		NKern::ThreadLeaveCS();
+		return;
+		}
+	Step("rmi");
+	// the RMI4 page description table, page 0 and 1: function number, query/command/control/data bases
+	for (TInt page = 0; page < 2; ++page)
+		for (TInt addr = 0xe9; addr >= 0x05; addr -= 6)
+			{
+			TUint8 e[6];
+			Step("rmi read");
+			TInt r = RmiRead((page << 8) | addr, e, 6);
+			if (r != KErrNone)
+				{
+				Log("rmi page %d @%02x: error %d", page, addr, r);
+				page = 2;
+				break;
+				}
+			if (e[5] == 0 || e[5] == 0xff)
+				break;
+			Log("rmi page %d F%02x: query %02x cmd %02x ctrl %02x data %02x ints %d v%d", page, e[5], e[0], e[1],
+				e[2], e[3], e[4] & 7, (e[4] >> 5) & 3);
+			SFn* fn = page != 0 ? NULL : e[5] == 0x01 ? &F01 : e[5] == 0x12 ? &F12 : NULL;
+			if (fn)
+				{
+				fn->iQuery = e[0];
+				fn->iCtrl = e[2];
+				fn->iData = e[3];
+				fn->iFound = ETrue;
+				}
+			}
+	if (!F01.iFound || !F12.iFound)
+		{
+		Log("stopped: no F01/F12 on page 0");
+		NKern::ThreadLeaveCS();
+		return;
+		}
+	Step("rmi setup");
+	if (RmiSetup() != KErrNone)
+		{
+		NKern::ThreadLeaveCS();
+		return;
+		}
+	PollDfc.SetDfcQ(TouchQ);
+	SleepDfc.SetDfcQ(TouchQ);
+	PollTimer.OneShot(NKern::TimerTicks(KPollMs));
+	Polling = ETrue;
+	Step("polling");
+	NKern::ThreadLeaveCS();
+	}
+
+static TDfc BringUpDfc(BringUpDfcFn, NULL, 1);
+
+void A64StartTouch()
+	{
+	_LIT(KName, "TouchQ");
+	TInt r = Kern::DynamicDfcQCreate(TouchQ, 24, KName);	// its own thread: a stuck bring-up must not stop the keys
+	if (r != KErrNone)
+		{
+		Kern::Printf("[touch] no DFC queue: %d", r);
+		return;
+		}
+	BringUpDfc.SetDfcQ(TouchQ);
+	BringUpDfc.Enque();
+	}
+
+static TA64DevState TouchStatus(TDes8& aDetail)
+	{
+	if (Polling)
+		{
+		A64Device_Format(aDetail, "%dx%d, %d fingers, polled %d ms; %d presses+releases, %d errors, %d dropped", MaxX,
+			MaxY, Fingers, KPollMs, Logged, Errors, Dropped);
+		if (Asleep)
+			A64Device_Format(aDetail, "; asleep (screen off)");
+		return EA64DevOk;
+		}
+	A64Device_Format(aDetail, BringUpDone ? "stopped at: %s" : "step: %s", CurStep);
+	return BringUpDone || !TouchQ ? EA64DevError : EA64DevStarting;
+	}
+A64_DEVICE("touch", "Touchscreen (Synaptics RMI4)", "fajita_touch", TouchStatus);

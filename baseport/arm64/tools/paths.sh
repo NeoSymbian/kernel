@@ -24,13 +24,13 @@ FONT=""; NKSA_FAST_CPU=""; DTB=${DTB:-}; BOOTIMG=none
 ASSPDIR=$BSP/${ASSP}_assp
 
 # make_bootimg <Image> <out dir>: the image the board's bootloader takes (BOOTIMG=fastboot: gzip(Image) + DTB in an
-# Android boot.img)
+# Android boot.img, with $RAMDISK as its ramdisk when set)
 make_bootimg() {
 	case $BOOTIMG in
 	none) ;;
 	fastboot)
 		gzip -9nc "$1" > "$2/Image.gz"
-		python3 -I "$HERE/tools/mkboot.py" "$2/Image.gz" "${DTB:?set DTB to the board's device tree blob}" "$2/boot.img" ;;
+		python3 -I "$HERE/tools/mkboot.py" "$2/Image.gz" "${DTB:?set DTB to the board's device tree blob}" "$2/boot.img" ${RAMDISK:+"$RAMDISK"} ;;
 	*) echo "unknown BOOTIMG=$BOOTIMG" >&2; exit 2 ;;
 	esac
 }

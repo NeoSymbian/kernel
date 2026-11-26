@@ -100,10 +100,14 @@ if [ "${USERSIDE:-1}" != 0 ]; then
 	printf '\t.section .uimage, "a"\n\t.incbin "%s"\n' "$OUT/romsect.bin" > "$I/uimage.S"
 	$AS "$I/uimage.S" -o "$I/uimage.o"
 	# Z:'s ROFS part, after the section (ekern.lds .urofs, a64_medrofs.cpp): ROFS=1 the whole image (read from RAM;
-	# ROFS_INSTALL=1 also copies it to system_a), ROFS=flash its first 4 KB (the image is read from system_a)
+	# ROFS_INSTALL=1 also copies it to system_a), ROFS=flash its first 4 KB (the image is read from system_a),
+	# ROFS=ramdisk its first 4 KB with the image as boot.img's ramdisk (read from RAM, past the bootloader's limit
+	# on the unpacked kernel: docs filesystem.md FS7)
 	case ${ROFS:-0} in
+	0)		;;
 	1)		printf '\t.section .urofs, "a"\n\t.incbin "%s"\n' "$OUT/user/rofs.img" > "$I/urofs.S" ;;
-	flash)	printf '\t.section .urofs, "a"\n\t.incbin "%s", 0, 4096\n' "$OUT/user/rofs.img" > "$I/urofs.S" ;;
+	flash|ramdisk)	printf '\t.section .urofs, "a"\n\t.incbin "%s", 0, 4096\n' "$OUT/user/rofs.img" > "$I/urofs.S" ;;
+	*)		echo "unknown ROFS=$ROFS (0, 1, flash or ramdisk)"; exit 2 ;;
 	esac
 	# FS5a: the per-block hashes ride in boot.img, the root of trust (a64_medverity.cpp checks every ROFS read)
 	[ "${ROFS:-0}" = 0 ] || printf '\t.section .urofshash, "a"\n\t.incbin "%s"\n' "$OUT/user/rofs.hash" >> "$I/urofs.S"
@@ -131,4 +135,4 @@ grep -i "warning" "$OUT/link.log" | grep -vE "orphan section .(\.rela\.|\.iplt|\
 ${X}objcopy -O binary "$OUT/ekern.elf" "$OUT/Image"
 ${X}size -A "$OUT/ekern.elf" | grep -E "^\.(boot|text|rodata|data|bss) "
 echo "built $OUT/Image ($(wc -c < "$OUT/Image") bytes, $BOARD at $BASE)"
-make_bootimg "$OUT/Image" "$OUT"
+RAMDISK=$([ "${ROFS:-0}" = ramdisk ] && echo "$OUT/user/rofs.img") make_bootimg "$OUT/Image" "$OUT"

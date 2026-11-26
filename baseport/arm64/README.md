@@ -10,8 +10,8 @@ It follows `bsptemplate/asspandvariant`: the chip (ASSP) is split from the board
 |---|---|
 | `common/` | The variant code every arm64 board shares: static variant and HAL (`a64_variant.cpp`), display HAL, block media and drives (`a64_blk`, `a64_med*`), debug monitor and log ring (`a64_dbgmon.cpp`), the CPU's SHA-256, `estart.txt` |
 | `common/user/` | The user side's board config every board shares, built into the ROM by NeoSymbian/build: `hal/` (HAL.DLL's `values.hda` + `config.hcf`), `keymap/` (EKDATA.DLL). ESTART is the generic `userlibandfileserver/fileserver/estart`; its drive map is `common/estart.txt`. They began as Syborg's (symbian-qemu `baseport/syborg`) |
-| `<soc>_assp/` | One SoC's drivers: `virt_assp` (the QEMU virt machine), `sdm670_assp` (Qualcomm SDM670) |
-| `<board>_variant/` | One board: `variant.conf`, `specific/` (its `board.h` implementation and board-only drivers). `qemu_variant` (QEMU virt), `bonito_variant` (Pixel 3a XL, the main target), `sargo_variant` (Pixel 3a: its board file and OLED panel; every other driver is bonito's, see "Adding a device") |
+| `<soc>_assp/` | One SoC's drivers: `virt_assp` (the QEMU virt machine), `sdm670_assp` (Qualcomm SDM670), `sdm845_assp` (Qualcomm SDM845: drivers copied from sdm670 stage by stage, docs `fajita.md`) |
+| `<board>_variant/` | One board: `variant.conf`, `specific/` (its `board.h` implementation and board-only drivers). `qemu_variant` (QEMU virt), `bonito_variant` (Pixel 3a XL, the main target), `sargo_variant` (Pixel 3a: its board file and OLED panel; every other driver is bonito's, see "Adding a device"), `fajita_variant` (OnePlus 6T, SDM845: RAM boots only, docs `fajita.md`) |
 | `bonito_variant/probes/` | Standalone bare-metal probe images used to study the Pixel's bootloader (ABL). The kernel build does not use them. |
 | `tools/` | Build, run and phone tools (`build-ekern.sh`, `paths.sh`, `phone.py`, …) |
 

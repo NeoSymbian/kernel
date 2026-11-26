@@ -7,7 +7,10 @@
 //   - the whole image (ROFS=1): from RAM. Built with -DA64_ROFS_INSTALL (ROFS_INSTALL=1) it is also copied to the
 //     GPT partition system_a, chunk by chunk where it differs, each written chunk read back and compared (FS4b);
 //   - its first 4 KB only (ROFS=flash): from system_a, and only if system_a starts with exactly that header -- the
-//     ROFS this core was built with, never another build's.
+//     ROFS this core was built with, never another build's;
+//   - its first 4 KB, the image in boot.img's ramdisk (ROFS=ramdisk; past the bootloader's limit on the unpacked
+//     kernel, docs filesystem.md FS7): from RAM, when the ramdisk the bootstrap found (super page iReserved[0..1],
+//     a64boot.cpp) starts with exactly that header; else from system_a as above. ROFS_INSTALL copies it as for ROFS=1.
 // Shaped like a64_medblk.cpp, but on its own DFC queue: a64_medverity.cpp (FS5a) sits on top of it and sends it
 // requests through its message queue, so success is KErrCompletion here (KErrNone would mean "pending").
 #include "locmedia.h"
@@ -31,6 +34,8 @@ static TInt ImageSize()									// TRofsHeader::iImageSize, or 0 if no ROFS head
 	return h[36] | (h[37] << 8) | (h[38] << 16) | (h[39] << 24);
 	}
 static TBool InRam() { return ImageSize() && Carried() >= ImageSize(); }
+static const TUint8* Ram;								// the whole image in RAM (carried or the ramdisk), else NULL
+static DPlatChunkHw* RamdiskChunk;
 static TUint64 FlashFirst;								// system_a's first sector, when read from flash
 static TUint8* Bounce;									// KChunk bytes, for flash reads and the install
 static DMutex* Lock;
@@ -137,11 +142,11 @@ TInt DMediaDriverRofs::Request(TLocDrvRequest& m)
 		if (pos < 0 || len < 0 || pos + len > ImageSize())
 			return KErrArgument;
 		TInt r;
-		if (!InRam())
+		if (!Ram)
 			r = ReadFlash(m, pos, len);
 		else
 			{
-			TPtrC8 des(__urofs_base + (TInt)pos, (TInt)len);
+			TPtrC8 des(Ram + (TInt)pos, (TInt)len);
 			r = m.WriteRemote(&des, 0);
 			}
 		return r == KErrNone ? KErrCompletion : r;
@@ -169,14 +174,14 @@ static TInt Install(TUint64 aFirst, TUint64 aCount, TInt& aWritten)
 		TInt r = A64BlkDev_Read(lba, sectors, Bounce);
 		if (r != KErrNone)
 			return r;
-		if (memcompare(Bounce, n, __urofs_base + off, n) == 0)
+		if (memcompare(Bounce, n, Ram + off, n) == 0)
 			continue;
 		memclr(Bounce, sectors * KA64BlkSector);			// the last chunk's tail: zero past the image
-		memcpy(Bounce, __urofs_base + off, n);
+		memcpy(Bounce, Ram + off, n);
 		r = A64BlkDev_Write(lba, sectors, Bounce);
 		if (r == KErrNone)
 			r = A64BlkDev_Read(lba, sectors, Bounce);
-		if (r == KErrNone && memcompare(Bounce, n, __urofs_base + off, n) != 0)
+		if (r == KErrNone && memcompare(Bounce, n, Ram + off, n) != 0)
 			r = KErrCorrupt;
 		if (r != KErrNone)
 			return r;
@@ -195,6 +200,31 @@ static const TInt DriveNumbers[1] = { 2 };				// local drive 2: estart.txt's FS_
 
 static TDfcQue DfcQ;									// the media's thread ("MedRofsQ")
 
+// The bootstrap's ramdisk, mapped read-only, if it holds this build's image (its first KHeader bytes are exactly the
+// header this kernel carries); else NULL and the chunk is closed
+static const TUint8* MapRamdisk()
+	{
+	const SSuperPageBase& sp = Kern::SuperPage();
+	const TUint32 phys = (TUint32)sp.iReserved[0], size = ((TUint32)sp.iReserved[1] + 0xFFFu) & ~0xFFFu;
+	if (!size || size < (TUint32)ImageSize() || Carried() < KHeader || (phys & 0xFFFu))
+		return NULL;
+	NKern::ThreadEnterCS();
+	TInt r = DPlatChunkHw::New(RamdiskChunk, phys, size, EMapAttrSupRo | EMapAttrCachedMax);
+	NKern::ThreadLeaveCS();
+	const TUint8* p = r == KErrNone ? (const TUint8*)RamdiskChunk->LinearAddress() : NULL;
+	if (p && memcompare(p, KHeader, __urofs_base, KHeader) == 0)
+		return p;
+	Kern::Printf("[media] ramdisk (%d KB): %s -> %d", size >> 10, p ? "another build's, not used" : "not mapped", r);
+	if (RamdiskChunk)
+		{
+		NKern::ThreadEnterCS();
+		RamdiskChunk->Close(NULL);
+		NKern::ThreadLeaveCS();
+		RamdiskChunk = NULL;
+		}
+	return NULL;
+	}
+
 DECLARE_STANDARD_EXTENSION()
 	{
 	if (!ImageSize())
@@ -209,13 +239,16 @@ DECLARE_STANDARD_EXTENSION()
 	TUint64 first = 0, count = 0;
 	const char* const system = A64Slot_Current() == 'b' ? "system_b" : "system_a";	// FS5b: the booted slot's
 	TInt part = A64BlkDev_Partition(system, first, count);
-	if (InRam())
+	Ram = InRam() ? __urofs_base : MapRamdisk();
+	if (Ram)
 		{
 #ifdef A64_ROFS_INSTALL
 		TInt written = 0;
 		r = part == KErrNone ? Install(first, count, written) : part;
 		Kern::Printf("[media] ROFS -> %s: %d KB written, verified -> %d", system, written >> 10, r);
 #endif
+		if (Ram != __urofs_base)
+			Kern::Printf("[media] ROFS from the ramdisk (%d KB): this build's", ImageSize() >> 10);
 		}
 	else
 		{

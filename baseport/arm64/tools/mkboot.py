@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Write an Android boot.img (header v0) for the Pixel 3a XL ABL: kernel with the DTB appended, no ramdisk.
+"""Write an Android boot.img (header v0) for the Pixel 3a XL ABL: kernel with the DTB appended, and an optional
+ramdisk (ROFS=ramdisk: Z:'s ROFS image, which ABL copies raw and names in the DTB's /chosen linux,initrd-*).
 
-Usage: python3 mkboot.py KERNEL DTB OUT
+Usage: python3 mkboot.py KERNEL DTB OUT [RAMDISK]
 Addresses match the working ztOS boot.img for bonito.
 """
 
@@ -49,14 +50,17 @@ def mkboot(kernel: bytes, ramdisk: bytes = b"") -> bytes:
 def main() -> None:
     kernel_path, dtb_path, out_path = sys.argv[1:4]
     kernel = Path(kernel_path).read_bytes() + Path(dtb_path).read_bytes()
-    img = mkboot(kernel)
+    ramdisk = Path(sys.argv[4]).read_bytes() if len(sys.argv) > 4 else b""
+    img = mkboot(kernel, ramdisk)
     # self-check: header parses back to what we wrote
     assert img[:8] == b"ANDROID!"
     ksize, _, rsize = struct.unpack_from("<3I", img, 8)
-    assert ksize == len(kernel) and rsize == 0
+    assert ksize == len(kernel) and rsize == len(ramdisk)
     assert img[PAGE : PAGE + ksize] == kernel
+    rat = PAGE + len(pad(kernel))
+    assert img[rat : rat + rsize] == ramdisk
     Path(out_path).write_bytes(img)
-    print(f"{out_path}: {len(img)} bytes, kernel+dtb {ksize}")
+    print(f"{out_path}: {len(img)} bytes, kernel+dtb {ksize}, ramdisk {rsize}")
 
 
 if __name__ == "__main__":

@@ -122,6 +122,7 @@ static SRange MemRanges[KMaxRanges], Holes[KMaxRanges];
 static TInt MemCount, HoleCount;
 static SRamBank Banks[KMaxBanks];
 static TInt BankCount;
+static TUint64 InitrdStart, InitrdEnd;	// the DTB's /chosen linux,initrd-*: the bootloader's ramdisk (ROFS=ramdisk: Z:)
 
 static TUint32 Be32(TUint32 aPhys)
 	{ return __builtin_bswap32(*(const volatile TUint32*)aPhys); }
@@ -170,7 +171,7 @@ static TBool ParseDtb(TUint64 aDtb)
 	TUint32 rootAc = 2, rootSc = 1, resAc = 2, resSc = 1;		// #address-cells, #size-cells (the spec's defaults)
 	TInt depth = 0;
 	TBool inReserved = EFalse;
-	TInt kind = 0;							// the current node: 1 a /memory node, 2 a /reserved-memory child
+	TInt kind = 0;							// the current node: 1 a /memory node, 2 a /reserved-memory child, 3 /chosen
 	for (TUint32 p = fdt + Be32(fdt + 8); p + 4 <= end; )
 		{
 		const TUint32 token = Be32(p);
@@ -182,7 +183,7 @@ static TBool ParseDtb(TUint64 aDtb)
 			if (depth == 2)
 				{
 				inReserved = NodeIs(p, "reserved-memory");
-				kind = NodeIs(p, "memory") ? 1 : 0;
+				kind = NodeIs(p, "memory") ? 1 : StrIs(p, "chosen") ? 3 : 0;
 				}
 			else if (depth == 3 && inReserved)
 				kind = 2;
@@ -210,7 +211,11 @@ static TBool ParseDtb(TUint64 aDtb)
 				(root ? rootAc : resAc) = Be32(v);
 			else if ((root || res) && len == 4 && StrIs(name, "#size-cells"))
 				(root ? rootSc : resSc) = Be32(v);
-			else if (kind && StrIs(name, "reg"))
+			else if (kind == 3 && (len == 4 || len == 8) && StrIs(name, "linux,initrd-start"))
+				InitrdStart = Cells(v, len >> 2);
+			else if (kind == 3 && (len == 4 || len == 8) && StrIs(name, "linux,initrd-end"))
+				InitrdEnd = Cells(v, len >> 2);
+			else if ((kind == 1 || kind == 2) && StrIs(name, "reg"))
 				{
 				const TUint32 ac = kind == 1 ? rootAc : resAc, sc = kind == 1 ? rootSc : resSc;
 				if (ac < 1 || ac > 2 || sc < 1 || sc > 2)
@@ -227,6 +232,8 @@ static TBool ParseDtb(TUint64 aDtb)
 		else if (token != 4)				// FDT_NOP
 			return EFalse;
 		}
+	if (InitrdEnd > InitrdStart)
+		AddRange(Holes, HoleCount, InitrdStart, InitrdEnd - InitrdStart);	// never handed out: a64_medrofs.cpp reads it
 	return MemCount > 0;
 	}
 
@@ -588,6 +595,14 @@ extern "C" void A64_BootMain(TUint64 aDtb)
 	sp.iRootDirList = rootDirList;		// FindRomRootDirectory prefers this over the ROM header's
 	sp.iKernelLimit = rh.iKernelLimit;
 	sp.iRomHeaderPhys = romPhys;
+	// the bootloader's ramdisk, kept out of the RAM banks above: iReserved[0] its physical base, [1] its size (0: none,
+	// or above 4 GB); a64_medrofs.cpp maps it as Z:'s ROFS when it starts with the header this kernel carries
+	if (fromDtb && InitrdEnd > InitrdStart && InitrdEnd <= KPhysTop)
+		{
+		sp.iReserved[0] = (TInt)(TUint32)InitrdStart;
+		sp.iReserved[1] = (TInt)(TUint32)(InitrdEnd - InitrdStart);
+		Trace("ramdisk phys", (TUint32)InitrdStart); Trace("ramdisk size", (TUint32)(InitrdEnd - InitrdStart));
+		}
 
 	// ---- a temporary identity window: one 2 MB block over the boot stub (ekern.lds keeps it inside one), so the
 	// instruction after the MMU switch is still mapped. _E32Startup removes it before the memory model walks.

@@ -26,6 +26,11 @@ const SA64IoRegion A64_IoRegions[] = {
 	{ 0x17a00000, 0x00200000, 1 },		// GICv3 distributor + redistributors
 	{ 0x9d400000, 0x00a00000, 2 },		// the framebuffer's 4320 x 2340 bytes (in RAM: the bank must stop below it)
 	{ 0x17980000, 0x00001000, 1 },		// APSS watchdog
+	{ 0x17d41000, 0x00006000, 1 },		// OSM: L3 (+0), silver (+0x2000) and gold (+0x4800) clock steps (qcom_cpufreq.cpp)
+	{ 0x0c263000, 0x00001000, 1 },		// TSENS0 temperature monitor
+	{ 0x0c265000, 0x00001000, 1 },		// TSENS1 temperature monitor
+	{ 0x0c222000, 0x00001000, 1 },		// TSENS0 configuration (read only)
+	{ 0x0c223000, 0x00001000, 1 },		// TSENS1 configuration (read only)
 	{ 0x0c440000, 0x00002000, 1 },		// SPMI PMIC arbiter core: version + the apid map (qcom_spmi.cpp)
 	{ 0x0e600000, 0x00010000, 1 },		// SPMI arbiter observer channels, ee 0: 512 x 0x80
 	{ 0x0c40a000, 0x00001000, 1 },		// SPMI arbiter cnfg: the channel ownership table (writes)

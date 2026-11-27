@@ -368,6 +368,8 @@ static TInt ProbeThread(TAny*)
 void A64StartMedia();									// a64_media.cpp
 void A64StartDisplay();									// a64_display.cpp
 void A64StartPipe();									// a64_pipe.cpp: the pipe LDD (RPipe, P.I.P.S. pipe())
+// Board/ASSP firmware state, first (SDM845: download mode off, qcom_dload.cpp).
+__attribute__((weak)) void A64StartFirmware() {}
 // Board/ASSP buses, before any peripheral starts using them (SDM670: SPMI).
 __attribute__((weak)) void A64StartBuses() {}
 // a64_serialkbd.cpp on QEMU virt; boards without a serial keyboard keep this
@@ -405,6 +407,7 @@ extern "C" TInt A64ExtensionEntry(TInt aReason)
 		}
 	Kern::Printf("[ram] %d MB in %d banks", total >> 20, n);
 	}
+	A64StartFirmware();
 	A64StartBuses();
 	A64_IrqEntropyOn = ETrue;							// the secure RNG exists now (K::Init3): feed it
 	A64SeedEntropy();

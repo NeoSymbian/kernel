@@ -3,7 +3,8 @@
 
 	.arm
 	.text
-	mov	r1, #FB_BASE
+	movw	r1, #(FB_BASE & 0xffff)		// any base (0x9d400000 is no ARM immediate)
+	movt	r1, #(FB_BASE >> 16)
 	movw	r2, #(COLOR_A32 & 0xffff)
 	movt	r2, #(COLOR_A32 >> 16)
 	movw	r3, #(FB_BYTES & 0xffff)

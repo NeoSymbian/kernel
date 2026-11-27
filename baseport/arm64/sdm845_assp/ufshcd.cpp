@@ -264,7 +264,16 @@ static TUint32 WaitSlots(TUint32 aMask, TInt aUs, const char* aWhat, TInt aCode)
 			Ufs_Delay(10);
 			continue;
 			}
-		DoneSem.SetOwner(NULL);							// this thread (the monitor's or the file server's)
+		// this thread (the monitor's or the file server's, one at a time under Lock). The interrupt and the timer can
+		// both signal one wait, and SetOwner faults on a count left for another thread: drop it on a change of owner
+		// only (a reset on every wait loses completions that came before it: 10 ms per command)
+		NKern::Lock();
+		if (DoneSem.iOwningThread != NKern::CurrentThread())
+			{
+			DoneSem.Reset();
+			DoneSem.SetOwner(NULL);
+			}
+		NKern::Unlock();
 		DoneTimer.OneShot(NKern::TimerTicks(10));
 		NKern::FSWait(&DoneSem);
 		DoneTimer.Cancel();

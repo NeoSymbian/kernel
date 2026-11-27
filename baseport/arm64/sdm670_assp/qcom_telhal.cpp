@@ -253,6 +253,7 @@ static TInt ChanIo(TBool aSend, TInt aRing, TAny* aBuf, TInt aLen, TBool aTry = 
 		else
 			kumemput(aBuf, k, r);
 		}
+	memclr(k, KMaxMsg);										// a sent QMI request may carry a SIM PIN (D11)
 	NKern::ThreadEnterCS();
 	Kern::Free(k);
 	NKern::ThreadLeaveCS();

@@ -8,14 +8,15 @@
 // - READ ONLY for now (docs fajita.md U5 adds writes): Command() refuses every opcode outside an allow-list; there
 //   is no A64BlkDev_Write (the weak default refuses), and the only query that writes is SET_FLAG fDeviceInit.
 // - The block layer's sectors are 512 bytes; the LUNs' blocks are 4096: reads go through a bounce buffer.
-// shortcut: polled, one request at a time in slot 0 (32-slot memory is laid out); docs fajita.md U4 adds the IRQ
-// and the queue.
+// - Requests: block reads keep up to KQueue slots in flight, each with its own 256 KB buffer; everything else runs
+//   in slot 0, one at a time. Completion is the host's interrupt (SPI 265) or, with "blk irq off", polling.
 #include <kernel/kern_priv.h>
 #include <kernel/cache.h>
 #include "board.h"
 #include "a64_blk.h"
 #include "a64_dbgmon.h"
 #include "a64_device.h"
+#include "a64_platform.h"
 #include "ufshcd.h"
 
 const TUint32 KHc = 0x01d84000;
@@ -48,8 +49,9 @@ public:
 
 // memory, non-cached: the transfer list (32 slots x 32 bytes, 1 KB aligned) at 0, the task list at 0x400, then a
 // command descriptor per slot from 0x800, KUcdSize apart (command UPIU, response UPIU at +0x200, PRDT at +0x400);
-// and one cached data buffer
+// and a cached data buffer per queued slot
 const TInt KSlots = 32, KXfer = 256 * 1024;			// bytes per request: one PRDT entry (its 18-bit count)
+const TInt KQueue = 8;									// slots in flight for reads (2 MB of buffers)
 const TUint32 KUcd0 = 0x800, KUcdSize = 0x480, KResp = 0x200, KPrdt = 0x400;
 const TUint32 KDescBytes = KUcd0 + KSlots * KUcdSize;	// 37 KB
 static TPhysAddr DescPhys, DataPhys;
@@ -67,6 +69,23 @@ static TUint32 Vendor, Spec;							// the device descriptor's manufacturer ID an
 static TBuf8<200> Report[32];
 static TInt NReport;
 static TUint32 UicErrors, FatalErrors, Timeouts;
+
+// completion by interrupt: the ISR masks the level line and adds an IDFC that wakes the waiting thread; the thread
+// clears IS.UTRCS and unmasks (as qcom_wcn3990.cpp's copy engines). A 10-ms timer bounds every wait.
+const TUint32 KIntId = 32 + 265;						// DTB ufshc@1d84000: GIC_SPI 265, level high
+static TBool IrqBound, IrqWanted = ETrue, IrqOn;
+static TUint32 Irqs, Waits;
+static NFastSemaphore DoneSem;
+static void DoneIdfcFn(TAny*) { DoneSem.Signal(); }	// IDFC: the kernel is locked
+static TDfc DoneIdfc(DoneIdfcFn, NULL);
+static void DoneTimerFn(TAny*) { DoneIdfc.Add(); }
+static NTimer DoneTimer(DoneTimerFn, NULL);
+static void UfsIsr(TAny*)
+	{
+	A64_MaskSpi(KIntId, ETrue);
+	++Irqs;
+	DoneIdfc.Add();
+	}
 
 void Ufs_Log(const char* aFmt, ...)
 	{
@@ -174,49 +193,76 @@ static TInt DmeGetOr(TUint32 aAttr)
 
 // ---- requests (slot 0)
 
-static TUint8* Ucd() { return (TUint8*)Desc + KUcd0; }
+static TUint8* Ucd(TInt aSlot = 0) { return (TUint8*)Desc + KUcd0 + aSlot * KUcdSize; }
+static TUint8* Buf(TInt aSlot = 0) { return Data + aSlot * KXfer; }
 
-// issue slot 0 as prepared (UCD filled) and wait: KErrNone and the response UPIU's transaction code checked
-static TInt Issue(TUint32 aDd, TUint32 aBytes, TUint8 aRespCode, const char* aWhat, TInt aCode, TInt aUs = 1000000)
+// the transfer request in slot aSlot (its UCD filled), rung
+static void Start(TInt aSlot, TUint32 aDd, TUint32 aBytes)
 	{
-	volatile TUint32* utrd = Desc;
-	TUint8* ucd = Ucd();
+	volatile TUint32* utrd = Desc + aSlot * 8;
 	if (aBytes)
 		{
-		volatile TUint32* prd = (volatile TUint32*)(ucd + KPrdt);
-		prd[0] = (TUint32)DataPhys;
+		volatile TUint32* prd = (volatile TUint32*)(Ucd(aSlot) + KPrdt);
+		prd[0] = (TUint32)DataPhys + aSlot * KXfer;
 		prd[1] = 0;
 		prd[2] = 0;
 		prd[3] = aBytes - 1;
-		Cache::SyncMemoryBeforeDmaRead((TLinAddr)Data, aBytes);
+		Cache::SyncMemoryBeforeDmaRead((TLinAddr)Buf(aSlot), aBytes);
 		}
 	// UTRD: command type 1 (UFS storage), data direction, interrupt on completion
+	TUint32 ucd = (TUint32)DescPhys + KUcd0 + aSlot * KUcdSize;
 	utrd[0] = (1u << 28) | (aDd << 25) | (1u << 24);
 	utrd[1] = 0;
 	utrd[2] = 0x0f;										// OCS: invalid until the host writes it
 	utrd[3] = 0;
-	utrd[4] = (TUint32)(DescPhys + KUcd0);
+	utrd[4] = ucd;
 	utrd[5] = 0;
 	utrd[6] = ((KResp / 4) << 16) | (KResp / 4);		// response UPIU offset, length (dwords)
 	utrd[7] = ((KPrdt / 4) << 16) | (aBytes ? 1 : 0);	// PRDT offset (dwords), entries
 	__e32_memory_barrier();
-	R(EIs) = EIsUtrcs;
-	R(EUtrldbr) = 1;
-	if (!Poll(EUtrldbr, 1, 0, aUs, 10))
+	R(EUtrldbr) = 1u << aSlot;
+	}
+
+// until the doorbell bits aMask are clear or aUs passed: the bits still set (cleared from the list, counted)
+static TUint32 WaitSlots(TUint32 aMask, TInt aUs, const char* aWhat, TInt aCode)
+	{
+	const TUint32 t0 = NKern::TickCount(), limit = aUs / NKern::TickPeriod() + 2;
+	TUint32 left;
+	while ((left = R(EUtrldbr) & aMask) != 0 && NKern::TickCount() - t0 < limit)
 		{
-		R(EUtrlclr) = ~1u;								// writing 0 clears the slot
-		Poll(EUtrldbr, 1, 0, 1000000, 100);
-		++Timeouts;
-		Log("%s %02x timed out: is %08x hcs %08x", aWhat, aCode, R(EIs), R(EHcs));
-		TakeErrors();
-		return KErrTimedOut;
+		if (!IrqOn)
+			{
+			Ufs_Delay(10);
+			continue;
+			}
+		DoneSem.SetOwner(NULL);							// this thread (the monitor's or the file server's)
+		DoneTimer.OneShot(NKern::TimerTicks(10));
+		NKern::FSWait(&DoneSem);
+		DoneTimer.Cancel();
+		++Waits;
+		R(EIs) = EIsUtrcs;								// before the doorbell is read again: a later completion re-raises it
+		A64_MaskSpi(KIntId, EFalse);
 		}
-	R(EIs) = EIsUtrcs;
+	if (left)
+		{
+		R(EUtrlclr) = ~left;							// writing 0 clears a slot
+		Poll(EUtrldbr, left, 0, 1000000, 100);
+		++Timeouts;
+		Log("%s %02x timed out: slots %08x is %08x hcs %08x", aWhat, aCode, left, R(EIs), R(EHcs));
+		}
+	if (!IrqOn)
+		R(EIs) = EIsUtrcs;
 	TakeErrors();
+	return left;
+	}
+
+// a completed slot: KErrNone and the response UPIU's transaction code checked
+static TInt Finish(TInt aSlot, TUint32 aBytes, TUint8 aRespCode, const char* aWhat, TInt aCode)
+	{
 	if (aBytes)
-		Cache::SyncMemoryAfterDmaRead((TLinAddr)Data, aBytes);
-	const TUint8* resp = ucd + KResp;
-	TUint32 ocs = utrd[2] & 0xff;
+		Cache::SyncMemoryAfterDmaRead((TLinAddr)Buf(aSlot), aBytes);
+	const TUint8* resp = Ucd(aSlot) + KResp;
+	TUint32 ocs = Desc[aSlot * 8 + 2] & 0xff;
 	// a SCSI command's outcome is its status byte (Linux reads only that): with CHECK CONDITION this device also sets
 	// the response field to "target failure"
 	if (ocs != 0 || resp[0] != aRespCode || (aRespCode != 0x21 && resp[6] != 0))
@@ -226,6 +272,27 @@ static TInt Issue(TUint32 aDd, TUint32 aBytes, TUint8 aRespCode, const char* aWh
 		return KErrGeneral;
 		}
 	return KErrNone;
+	}
+
+// slot 0, prepared, issued and waited for
+static TInt Issue(TUint32 aDd, TUint32 aBytes, TUint8 aRespCode, const char* aWhat, TInt aCode, TInt aUs = 1000000)
+	{
+	Start(0, aDd, aBytes);
+	if (WaitSlots(1, aUs, aWhat, aCode))
+		return KErrTimedOut;
+	return Finish(0, aBytes, aRespCode, aWhat, aCode);
+	}
+
+// the host's interrupt for transfer completions on (bound once, IE.UTRCE) or off (polled)
+static void SetIrq(TBool aOn)
+	{
+	if (aOn && !IrqBound)
+		IrqBound = A64_BindSpi(KIntId, UfsIsr, NULL) == KErrNone;
+	IrqOn = aOn && IrqBound;
+	R(EIs) = EIsUtrcs;
+	R(EIe) = IrqOn ? EIsUtrcs : 0;
+	if (IrqBound)
+		A64_MaskSpi(KIntId, !IrqOn);
 	}
 
 static TInt Nop()
@@ -264,11 +331,9 @@ static TInt Query(TUint8 aOp, TUint8 aIdn, TUint8 aIndex, TUint32& aValue)
 	return KErrNone;
 	}
 
-// a SCSI command; aSense = key << 16 | asc << 8 | ascq after a check condition
-static TInt Command(TInt aLun, const TUint8* aCdb, TUint32 aBytes, TInt& aStatus, TUint32& aSense)
+// a SCSI command's UPIU in slot aSlot's UCD, if the allow-list lets it through
+static TInt Build(TInt aSlot, TInt aLun, const TUint8* aCdb, TUint32 aBytes)
 	{
-	aStatus = 0;
-	aSense = 0;
 	switch (aCdb[0])
 		{
 	case 0x00:	// TEST UNIT READY
@@ -286,17 +351,28 @@ static TInt Command(TInt aLun, const TUint8* aCdb, TUint32 aBytes, TInt& aStatus
 		}
 	if (aBytes > (TUint32)KXfer)
 		return KErrArgument;
-	TUint8* ucd = Ucd();
+	TUint8* ucd = Ucd(aSlot);
 	memclr(ucd, KPrdt + 16);
 	ucd[0] = 0x01;										// COMMAND UPIU
 	ucd[1] = aBytes ? 0x40 : 0;							// R: data in; simple task
 	ucd[2] = (TUint8)aLun;
+	ucd[3] = (TUint8)aSlot;								// task tag
 	PutBe32(ucd + 12, aBytes);							// expected data transfer length
 	memcpy(ucd + 16, aCdb, 16);
-	TInt r = Issue(aBytes ? 2 : 0, aBytes, 0x21, "cdb", aCdb[0]);
+	return KErrNone;
+	}
+
+// a SCSI command in slot 0; aSense = key << 16 | asc << 8 | ascq after a check condition
+static TInt Command(TInt aLun, const TUint8* aCdb, TUint32 aBytes, TInt& aStatus, TUint32& aSense)
+	{
+	aStatus = 0;
+	aSense = 0;
+	TInt r = Build(0, aLun, aCdb, aBytes);
+	if (r == KErrNone)
+		r = Issue(aBytes ? 2 : 0, aBytes, 0x21, "cdb", aCdb[0]);
 	if (r != KErrNone)
 		return r;
-	const TUint8* resp = ucd + KResp;
+	const TUint8* resp = Ucd() + KResp;
 	aStatus = resp[7];
 	if (aStatus == 2 && Be16(resp + 32) >= 14)			// fixed-format sense data after its length
 		aSense = (resp[34 + 2] & 0xf) << 16 | resp[34 + 12] << 8 | resp[34 + 13];
@@ -332,6 +408,51 @@ static TInt ReadBlocks(TInt aLun, TUint32 aBlock, TUint32 aCount)
 	return Scsi(aLun, cdb, aCount * Luns[aLun].iBlockSize);
 	}
 
+// bytes [aFrom, aFrom + aBytes) of a LUN into aBuf (NULL: read only), up to KQueue READ(10)s in flight. A slot that
+// fails (a check condition, a timeout) is read again alone through Scsi()'s retries.
+static TInt ReadSpan(TInt aLun, TUint64 aFrom, TUint32 aBytes, TUint8* aBuf)
+	{
+	const TUint32 bs = Luns[aLun].iBlockSize, per = KXfer / bs;
+	TUint32 b = (TUint32)(aFrom / bs);
+	const TUint32 end = (TUint32)((aFrom + aBytes + bs - 1) / bs);
+	while (b < end)
+		{
+		const TUint32 first = b;
+		TInt q = 0;
+		for (; q < KQueue && b < end; ++q, b += per)
+			{
+			TUint32 n = Min(end - b, per);
+			TUint8 cdb[16] = { 0x28 };
+			PutBe32(cdb + 2, b);
+			cdb[7] = (TUint8)(n >> 8);
+			cdb[8] = (TUint8)n;
+			TInt r = Build(q, aLun, cdb, n * bs);
+			if (r != KErrNone)
+				return r;
+			Start(q, 2, n * bs);
+			}
+		TUint32 left = WaitSlots((1u << q) - 1, 1000000, "read", q);
+		b = first;
+		for (TInt s = 0; s < q; ++s, b += per)
+			{
+			TUint32 n = Min(end - b, per);
+			const TUint8* src = Buf(s);
+			if ((left >> s & 1) || Finish(s, n * bs, 0x21, "read", s) != KErrNone || Ucd(s)[KResp + 7] != 0)
+				{
+				TInt r = ReadBlocks(aLun, b, n);			// slot 0's buffer: slot 0 is copied out already
+				if (r != KErrNone)
+					return r;
+				src = Buf(0);
+				}
+			if (!aBuf)
+				continue;
+			TUint64 lo = Max((TUint64)b * bs, aFrom), hi = Min((TUint64)(b + n) * bs, aFrom + aBytes);
+			memcpy(aBuf + (TUint32)(lo - aFrom), src + (TUint32)(lo - (TUint64)b * bs), (TUint32)(hi - lo));
+			}
+		}
+	return KErrNone;
+	}
+
 // ---- bring-up
 
 static TInt Prepare()
@@ -350,13 +471,13 @@ static TInt Prepare()
 		NKern::ThreadEnterCS();
 		TInt r = Epoc::AllocPhysicalRam(KDescBytes, DescPhys, 12);
 		if (r == KErrNone)
-			r = Epoc::AllocPhysicalRam(KXfer, DataPhys, 12);
+			r = Epoc::AllocPhysicalRam(KQueue * KXfer, DataPhys, 12);
 		DPlatChunkHw* d = NULL;
 		DPlatChunkHw* c = NULL;
 		if (r == KErrNone)
 			r = DPlatChunkHw::New(d, DescPhys, KDescBytes, EMapAttrSupRw | EMapAttrBufferedNC);
 		if (r == KErrNone)
-			r = DPlatChunkHw::New(c, DataPhys, KXfer, EMapAttrSupRw | EMapAttrCachedMax);
+			r = DPlatChunkHw::New(c, DataPhys, KQueue * KXfer, EMapAttrSupRw | EMapAttrCachedMax);
 		NKern::ThreadLeaveCS();
 		if (r != KErrNone)
 			return r;
@@ -370,7 +491,7 @@ static TInt Prepare()
 // our lists in place of whatever is there: stop both, point them at our memory, start (HCS must say ready)
 static TInt MakeOperational()
 	{
-	R(EIe) = 0;											// polled
+	SetIrq(EFalse);
 	R(EUtriacr) = 0;
 	R(EUtrlrsr) = 0;
 	R(EUtmrlrsr) = 0;
@@ -385,6 +506,7 @@ static TInt MakeOperational()
 		}
 	R(EUtmrlrsr) = 1;
 	R(EUtrlrsr) = 1;
+	SetIrq(IrqWanted);
 	return KErrNone;
 	}
 
@@ -558,7 +680,7 @@ static TInt FullInit()
 	if (r != KErrNone)
 		return r;
 	Log("full init: hw %08x cap %08x ver %08x", R(0xe4), R(ECap), R(EVer));
-	R(EIe) = 0;
+	SetIrq(EFalse);
 	R(EIs) = R(EIs);
 	UfsVop_DeviceReset();
 	Log("full init: HCE");
@@ -648,21 +770,7 @@ TInt A64BlkDev_Read(TUint64 aLba, TInt aCount, TUint8* aBuf)	// 512-byte sectors
 	const TUint32 per = l.iBlockSize / KA64BlkSector;
 	if (!l.iBlocks || aCount <= 0 || aLba + aCount > (TUint64)l.iBlocks * per)
 		return KErrArgument;
-	while (aCount > 0)
-		{
-		TUint32 block = (TUint32)(aLba / per), off = (TUint32)(aLba % per) * KA64BlkSector;
-		TUint32 want = off + aCount * KA64BlkSector;
-		TUint32 n = Min((want + l.iBlockSize - 1) / l.iBlockSize, (TUint32)KXfer / l.iBlockSize);
-		TInt r = ReadBlocks(Cur, block, n);
-		if (r != KErrNone)
-			return r;
-		TInt sectors = Min((TInt)((n * l.iBlockSize - off) / KA64BlkSector), aCount);
-		memcpy(aBuf, Data + off, sectors * KA64BlkSector);
-		aBuf += sectors * KA64BlkSector;
-		aLba += sectors;
-		aCount -= sectors;
-		}
-	return KErrNone;
+	return ReadSpan(Cur, aLba * KA64BlkSector, aCount * KA64BlkSector, aBuf);
 	}
 
 // "blk info" (and Volume Up): the state, read only
@@ -681,8 +789,9 @@ void A64BlkDump()
 			DmeGetOr(EPaActiveRxLanes), DmeGetOr(EPaConnectedTxLanes), DmeGetOr(EPaConnectedRxLanes),
 			DmeGetOr(EPaHsSeries));
 		}
-	Kern::Printf("[ufs] %s; manufacturer %04x; errors: uic %d fatal %d timeouts %d", Ours ? "our own bring-up" :
-		"adopted or not up", Vendor, UicErrors, FatalErrors, Timeouts);
+	Kern::Printf("[ufs] %s; manufacturer %04x; errors: uic %d fatal %d timeouts %d; %s, irqs %d waits %d",
+		Ours ? "our own bring-up" : "adopted or not up", Vendor, UicErrors, FatalErrors, Timeouts,
+		IrqOn ? "interrupts" : "polled", Irqs, Waits);
 	for (TInt i = 0; i < NReport; ++i)
 		Kern::Printf("[ufs] %S", &Report[i]);
 	}
@@ -776,16 +885,22 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		{
 		TLock lock;
 		const TUint32 mb = aArgc >= 3 && aNum[2] >= 1 && aNum[2] <= 1024 ? (TUint32)aNum[2] : 64;
-		const TUint32 n = KXfer / Luns[0].iBlockSize, total = (mb << 20) / Luns[0].iBlockSize;
-		TInt r = KErrNone;
-		TUint32 t0 = NKern::TickCount();
-		for (TUint32 b = 0; b < total && r == KErrNone; b += n)
-			r = ReadBlocks(0, b, n);
+		TUint32 t0 = NKern::TickCount(), irqs = Irqs;
+		TInt r = ReadSpan(0, 0, mb << 20, NULL);
 		TInt ms = Max(1, (TInt)((NKern::TickCount() - t0) * NKern::TickPeriod() / 1000));
-		A64Device_Format(aOut, "ufs: read %d MB in %d ms (%d KB/s) -> %d", mb, ms, (TInt)((TUint64)mb * 1024 * 1000 / ms), r);
+		A64Device_Format(aOut, "ufs: read %d MB in %d ms (%d KB/s) -> %d; %s, %d irqs", mb, ms,
+			(TInt)((TUint64)mb * 1024 * 1000 / ms), r, IrqOn ? "interrupts" : "polled", Irqs - irqs);
 		return r;
 		}
-	aOut.Append((const TUint8*)"blk init | reset | gear | luns | lun <n> | speed [MB]", 53);
+	if (Is(aArg[1], "irq") && aArgc >= 3)					// "irq on" / "irq off" (polled)
+		{
+		TLock lock;
+		IrqWanted = Is(aArg[2], "on");
+		SetIrq(IrqWanted);
+		A64Device_Format(aOut, "ufs: %s", IrqOn ? "interrupts" : "polled");
+		return IrqOn == IrqWanted ? KErrNone : KErrNotSupported;
+		}
+	aOut.Append((const TUint8*)"blk init | reset | gear | luns | lun <n> | speed [MB] | irq on|off", 66);
 	return KErrArgument;
 	}
 

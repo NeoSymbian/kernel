@@ -5,9 +5,11 @@
 // written anew; the SoC parts are the vendor hooks (ufshcd.h, qcom_ufs.cpp).
 // - Two ways up: Adopt() takes over the host and link the bootloader leaves running ("blk init"); FullInit() brings
 //   them up itself, from the core reset on ("blk reset"). Gear() then moves the link to HS-G3, 2 lanes ("blk gear").
-// - READ ONLY for now (docs fajita.md U5 adds writes): Command() refuses every opcode outside an allow-list; there
-//   is no A64BlkDev_Write (the weak default refuses), and the only query that writes is SET_FLAG fDeviceInit.
-// - The block layer's sectors are 512 bytes; the LUNs' blocks are 4096: reads go through a bounce buffer.
+// - Writes (EMMC_C builds) reach only system_b on LUN 0, checked twice: A64BlkDev_Write against the partition, and
+//   Build() against the WRITE(10)'s own LUN and blocks. Every other opcode outside the allow-list is refused; the
+//   only query that writes is SET_FLAG fDeviceInit.
+// - The block layer's sectors are 512 bytes; the LUNs' blocks are 4096: reads go through bounce buffers, writes of
+//   part of a block read it first.
 // - Requests: block reads keep up to KQueue slots in flight, each with its own 256 KB buffer; everything else runs
 //   in slot 0, one at a time. Completion is the host's interrupt (SPI 265) or, with "blk irq off", polling.
 #include <kernel/kern_priv.h>
@@ -17,6 +19,7 @@
 #include "a64_dbgmon.h"
 #include "a64_device.h"
 #include "a64_platform.h"
+#include <sha256.h>
 #include "ufshcd.h"
 
 const TUint32 KHc = 0x01d84000;
@@ -57,6 +60,29 @@ const TUint32 KDescBytes = KUcd0 + KSlots * KUcdSize;	// 37 KB
 static TPhysAddr DescPhys, DataPhys;
 static volatile TUint32* Desc;
 static TUint8* Data;
+
+// EMMC_C=1: C: (and E:) on system_b at boot; EMMC_C=2: writes from the monitor only (C: stays the RAM drive);
+// unset: read-only. The name is the Pixel's flag, which build/neo already passes through.
+#ifdef A64_EMMC_C
+const TBool KWritable = ETrue;
+const TBool KBootDrive = A64_EMMC_C == 1;
+#else
+const TBool KWritable = EFalse;
+const TBool KBootDrive = EFalse;
+#endif
+const TInt KWriteLun = 0;								// system_b's LUN: writes never follow "blk lun"
+
+// LUN 0's partitions by GPT name, each found exactly once, in 512-byte sectors; only system_b is writable (the
+// owner's choice, 2026-11-26: slot b's 1 GB, its contents given up). The others: "blk hash" before and after writes
+struct TPart { const char* iName; TBool iWritable; TInt iFound; TUint64 iFirst, iLast; };
+static TPart Parts[] = { { "system_b", ETrue }, { "system_a", EFalse }, { "userdata", EFalse } };
+const TInt KParts = sizeof(Parts) / sizeof(Parts[0]);
+
+static TBool WriteAllowed(TUint64 aLba, TInt aCount)
+	{
+	const TPart& p = Parts[0];
+	return KWritable && p.iFound == 1 && aCount > 0 && aLba >= p.iFirst && aLba + aCount - 1 <= p.iLast;
+	}
 
 struct TLun { TUint32 iBlocks, iBlockSize; };
 const TInt KLuns = 8;
@@ -207,7 +233,10 @@ static void Start(TInt aSlot, TUint32 aDd, TUint32 aBytes)
 		prd[1] = 0;
 		prd[2] = 0;
 		prd[3] = aBytes - 1;
-		Cache::SyncMemoryBeforeDmaRead((TLinAddr)Buf(aSlot), aBytes);
+		if (aDd == 1)
+			Cache::SyncMemoryBeforeDmaWrite((TLinAddr)Buf(aSlot), aBytes);
+		else
+			Cache::SyncMemoryBeforeDmaRead((TLinAddr)Buf(aSlot), aBytes);
 		}
 	// UTRD: command type 1 (UFS storage), data direction, interrupt on completion
 	TUint32 ucd = (TUint32)DescPhys + KUcd0 + aSlot * KUcdSize;
@@ -256,7 +285,7 @@ static TUint32 WaitSlots(TUint32 aMask, TInt aUs, const char* aWhat, TInt aCode)
 	return left;
 	}
 
-// a completed slot: KErrNone and the response UPIU's transaction code checked
+// a completed slot: KErrNone and the response UPIU's transaction code checked (aBytes: read data to sync)
 static TInt Finish(TInt aSlot, TUint32 aBytes, TUint8 aRespCode, const char* aWhat, TInt aCode)
 	{
 	if (aBytes)
@@ -280,7 +309,7 @@ static TInt Issue(TUint32 aDd, TUint32 aBytes, TUint8 aRespCode, const char* aWh
 	Start(0, aDd, aBytes);
 	if (WaitSlots(1, aUs, aWhat, aCode))
 		return KErrTimedOut;
-	return Finish(0, aBytes, aRespCode, aWhat, aCode);
+	return Finish(0, aDd == 2 ? aBytes : 0, aRespCode, aWhat, aCode);
 	}
 
 // the host's interrupt for transfer completions on (bound once, IE.UTRCE) or off (polled)
@@ -342,6 +371,14 @@ static TInt Build(TInt aSlot, TInt aLun, const TUint8* aCdb, TUint32 aBytes)
 	case 0x25:	// READ CAPACITY(10)
 	case 0x28:	// READ(10)
 		break;
+	case 0x2a:	// WRITE(10): on LUN 0, inside the writable partition, the length matching the blocks
+		{
+		const TUint32 bs = Luns[KWriteLun].iBlockSize, per = bs / KA64BlkSector;
+		if (aLun == KWriteLun && per && aBytes == Be16(aCdb + 7) * bs &&
+			WriteAllowed((TUint64)Be32(aCdb + 2) * per, (TInt)(Be16(aCdb + 7) * per)))
+			break;
+		return KErrAccessDenied;
+		}
 	case 0x1b:	// START STOP UNIT: only the UFS device W-LUN's power condition (no media access)
 		if (aLun == KWlunDevice)
 			break;
@@ -354,7 +391,7 @@ static TInt Build(TInt aSlot, TInt aLun, const TUint8* aCdb, TUint32 aBytes)
 	TUint8* ucd = Ucd(aSlot);
 	memclr(ucd, KPrdt + 16);
 	ucd[0] = 0x01;										// COMMAND UPIU
-	ucd[1] = aBytes ? 0x40 : 0;							// R: data in; simple task
+	ucd[1] = !aBytes ? 0 : aCdb[0] == 0x2a ? 0x20 : 0x40;	// W: data out, R: data in; simple task
 	ucd[2] = (TUint8)aLun;
 	ucd[3] = (TUint8)aSlot;								// task tag
 	PutBe32(ucd + 12, aBytes);							// expected data transfer length
@@ -369,7 +406,7 @@ static TInt Command(TInt aLun, const TUint8* aCdb, TUint32 aBytes, TInt& aStatus
 	aSense = 0;
 	TInt r = Build(0, aLun, aCdb, aBytes);
 	if (r == KErrNone)
-		r = Issue(aBytes ? 2 : 0, aBytes, 0x21, "cdb", aCdb[0]);
+		r = Issue(!aBytes ? 0 : aCdb[0] == 0x2a ? 1 : 2, aBytes, 0x21, "cdb", aCdb[0]);
 	if (r != KErrNone)
 		return r;
 	const TUint8* resp = Ucd() + KResp;
@@ -602,6 +639,56 @@ static TInt ScanLuns()
 	return found ? KErrNone : KErrNotFound;
 	}
 
+// LUN 0's GPT (in its own block size): the allow-list's partitions, in 512-byte sectors
+static void FindParts()
+	{
+	for (TInt p = 0; p < KParts; ++p)
+		Parts[p].iFound = 0;
+	const TLun& l = Luns[KWriteLun];
+	if (!l.iBlocks || ReadBlocks(KWriteLun, 1, 1) != KErrNone || memcompare(Data, 8, (const TUint8*)"EFI PART", 8) != 0)
+		{
+		Log("lun %d: no GPT, nothing writable", KWriteLun);
+		return;
+		}
+	TUint32 lba = (TUint32)*(TUint64*)(Data + 72), n = *(TUint32*)(Data + 80), size = *(TUint32*)(Data + 84);
+	if (size < 128 || l.iBlockSize % size)
+		return;
+	const TUint32 per = l.iBlockSize / size, sectors = l.iBlockSize / KA64BlkSector;
+	for (TUint32 i = 0; i < n && i < 256; ++i)
+		{
+		if (i % per == 0 && ReadBlocks(KWriteLun, lba + i / per, 1) != KErrNone)
+			{
+			for (TInt p = 0; p < KParts; ++p)
+				Parts[p].iFound = 0;
+			return;
+			}
+		const TUint8* e = Data + (i % per) * size;
+		for (TInt p = 0; p < KParts; ++p)
+			{
+			const char* name = Parts[p].iName;
+			TBool match = ETrue;
+			for (TInt c = 0; match; ++c)					// the letters and the terminating 0, as UTF-16
+				{
+				match = e[56 + 2 * c] == (TUint8)name[c] && e[57 + 2 * c] == 0;
+				if (!name[c])
+					break;
+				}
+			TUint64 first = *(const TUint64*)(e + 32), last = *(const TUint64*)(e + 40);
+			if (match && ++Parts[p].iFound == 1)
+				{
+				Parts[p].iFirst = first * sectors;
+				Parts[p].iLast = (last + 1) * sectors - 1;
+				if (first < 6 || last < first || last >= l.iBlocks)	// past the GPT, inside the LUN
+					Parts[p].iFound = 99;
+				}
+			}
+		}
+	for (TInt p = 0; p < KParts; ++p)
+		Log("allow-list: %s sectors %d..%d (found %d), %s", Parts[p].iName, (TInt)Parts[p].iFirst,
+			(TInt)Parts[p].iLast, Parts[p].iFound, !Parts[p].iWritable ? "read-only" : WriteAllowed(Parts[p].iFirst, 1) ?
+			(KBootDrive ? "writable, C: + E:" : "writable (monitor only)") : "not writable");
+	}
+
 // the device descriptor: manufacturer (for the vendor's quirks), spec version, LUN count
 static void ReadDevice()
 	{
@@ -668,6 +755,8 @@ static TInt Adopt()
 	if (r == KErrNone)
 		r = ScanLuns();
 	Ours = EFalse;
+	if (r == KErrNone)
+		FindParts();
 	return r;
 	}
 
@@ -712,6 +801,8 @@ static TInt FullInit()
 	WakeDevice();
 	r = ScanLuns();
 	Ours = r == KErrNone;
+	if (r == KErrNone)
+		FindParts();
 	return r;
 	}
 
@@ -749,7 +840,112 @@ static TInt Gear()
 
 // ---- the block backend (a64_blk.h) and the monitor
 
-TInt A64BlkDev_Init(TUint64&) { return KErrNotSupported; }	// C: stays the RAM drive (docs fajita.md U5)
+// at boot only with EMMC_C=1: our own bring-up, HS-G3, and LUN 0 as the device (system_b its window)
+TInt A64BlkDev_Init(TUint64& aSectors)
+	{
+	if (!KBootDrive)
+		return KErrNotSupported;
+	TInt r = Prepare();
+	if (r != KErrNone)
+		return InitResult = r;
+	TLock lock;
+	if ((r = InitResult = FullInit()) != KErrNone)
+		return r;
+	Log("boot: gear -> %d", Gear());						// a slow link still works
+	aSectors = (TUint64)Luns[KWriteLun].iBlocks * (Luns[KWriteLun].iBlockSize / KA64BlkSector);
+	return KErrNone;
+	}
+
+TInt A64BlkBoard_Window(TUint64, TUint64& aFirst, TUint64& aCount)
+	{
+	const TPart& p = Parts[0];
+	if (!KBootDrive || p.iFound != 1)
+		return KErrNotFound;
+	aFirst = p.iFirst;
+	aCount = p.iLast - p.iFirst + 1;
+	return KErrNone;
+	}
+
+TUint32 A64BlkDev_EraseBlock() { return Luns[KWriteLun].iBlockSize; }	// FAT's clusters on whole 4 KB blocks
+
+static TInt WriteBlocks(TUint32 aBlock, TUint32 aCount)	// from Buf(0)
+	{
+	// shortcut: FUA on every write (no flush at shutdown yet); SYNCHRONIZE CACHE at power-down would be faster
+	TUint8 cdb[16] = { 0x2a, 0x08 };
+	PutBe32(cdb + 2, aBlock);
+	cdb[7] = (TUint8)(aCount >> 8);
+	cdb[8] = (TUint8)aCount;
+	return Scsi(KWriteLun, cdb, aCount * Luns[KWriteLun].iBlockSize);
+	}
+
+// 512-byte sectors of LUN 0, inside system_b only; a part-block is read first (one slot at a time)
+TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
+	{
+	if (InitResult != KErrNone)
+		return KErrNotReady;
+	if (!WriteAllowed(aLba, aCount))					// a second check under a64_blk.cpp's window, whoever asks
+		return KErrAccessDenied;
+	TLock lock;
+	const TUint32 bs = Luns[KWriteLun].iBlockSize;
+	TUint64 from = aLba * KA64BlkSector;
+	TUint32 bytes = (TUint32)aCount * KA64BlkSector;
+	while (bytes)
+		{
+		const TUint32 b = (TUint32)(from / bs), off = (TUint32)(from % bs);
+		const TUint32 n = Min((off + bytes + bs - 1) / bs, (TUint32)KXfer / bs), len = Min(n * bs - off, bytes);
+		TInt r = off || len < n * bs ? ReadBlocks(KWriteLun, b, n) : KErrNone;
+		if (r != KErrNone)
+			return r;
+		memcpy(Buf(0) + off, aBuf, len);
+		if ((r = WriteBlocks(b, n)) != KErrNone)
+			return r;
+		from += len;
+		aBuf += len;
+		bytes -= len;
+		}
+	return KErrNone;
+	}
+
+// the first system_b sector a partition of medblk's MBR uses, or 2048 without one: the sectors before it are free
+static TUint64 GapEnd()
+	{
+	static TUint8 s[KA64BlkSector];
+	TUint64 end = 2048;
+	if (A64BlkDev_Read(Parts[0].iFirst, 1, s) == KErrNone && s[510] == 0x55 && s[511] == 0xaa && s[0] != 0xeb &&
+		s[0] != 0xe9)
+		for (TInt i = 0; i < 4; ++i)
+			{
+			const TUint8* e = s + 446 + 16 * i;
+			TUint64 base = e[8] | (e[9] << 8) | (e[10] << 16) | ((TUint32)e[11] << 24);
+			if (e[4] && base)
+				end = Min(end, base);
+			}
+	return end;
+	}
+
+// "blk wtest": a pattern on system_b sectors 1..8 (part of block 0, all of block 1: both write paths), read back,
+// compared, then zeroed
+TInt A64BlkDev_SelfTest()
+	{
+	if (!WriteAllowed(Parts[0].iFirst, 1) || Cur != KWriteLun || GapEnd() < 16)
+		return KErrNotReady;
+	static TUint8 b[8 * KA64BlkSector], c[8 * KA64BlkSector];
+	for (TInt i = 0; i < 8 * KA64BlkSector; ++i)
+		b[i] = (TUint8)(i % KA64BlkSector < 8 ? "NEOSYMB"[i % 8] : i / KA64BlkSector + i);
+	const TUint64 at = Parts[0].iFirst + 1;
+	TInt r = A64BlkDev_Write(at, 8, b);
+	Log("wtest: write 8 at %d -> %d", (TInt)at, r);
+	if (r == KErrNone)
+		r = A64BlkDev_Read(at, 8, c);
+	TInt bad = r == KErrNone ? memcompare(b, sizeof(b), c, sizeof(c)) : -1;
+	Log("wtest: read back -> %d, %s", r, bad ? "MISMATCH" : "matches");
+	if (r != KErrNone || bad)
+		return r != KErrNone ? r : KErrCorrupt;
+	memclr(b, sizeof(b));
+	r = A64BlkDev_Write(at, 8, b);
+	Log("wtest: zeroed them again -> %d", r);
+	return r;
+	}
 
 TInt A64BlkDev_Probe()									// "blk init": adopt the bootloader's link
 	{
@@ -792,6 +988,9 @@ void A64BlkDump()
 	Kern::Printf("[ufs] %s; manufacturer %04x; errors: uic %d fatal %d timeouts %d; %s, irqs %d waits %d",
 		Ours ? "our own bring-up" : "adopted or not up", Vendor, UicErrors, FatalErrors, Timeouts,
 		IrqOn ? "interrupts" : "polled", Irqs, Waits);
+	Kern::Printf("[ufs] writes: %s; system_b sectors %d..%d (found %d)", !KWritable ? "off (read-only build)" :
+		KBootDrive ? "C: + E: on system_b" : "monitor only", (TInt)Parts[0].iFirst, (TInt)Parts[0].iLast,
+		Parts[0].iFound);
 	for (TInt i = 0; i < NReport; ++i)
 		Kern::Printf("[ufs] %S", &Report[i]);
 	}
@@ -877,6 +1076,11 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		TInt lun = (TInt)aNum[2];
 		if (lun < 0 || lun >= KLuns || !Luns[lun].iBlocks)
 			return KErrNotFound;
+		if (KBootDrive && lun != KWriteLun)					// C: reads through the selected LUN
+			{
+			A64Device_Format(aOut, "ufs: C: is on lun %d, it stays selected", KWriteLun);
+			return KErrInUse;
+			}
 		Cur = lun;
 		A64Device_Format(aOut, "ufs: blk read/dump use lun %d", lun);
 		return KErrNone;
@@ -892,6 +1096,83 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 			(TInt)((TUint64)mb * 1024 * 1000 / ms), r, IrqOn ? "interrupts" : "polled", Irqs - irqs);
 		return r;
 		}
+	if (Is(aArg[1], "guard") && aArgc >= 3)				// no I/O: what the write check says for a LUN 0 sector
+		{
+		const TPart* p = NULL;
+		for (TInt i = 0; i < KParts; ++i)
+			if (Parts[i].iFound == 1 && aNum[2] >= Parts[i].iFirst && aNum[2] <= Parts[i].iLast)
+				p = &Parts[i];
+		A64Device_Format(aOut, "lun 0 sector %d: write %s (%s)", (TInt)aNum[2], WriteAllowed(aNum[2], 1) ? "allowed" :
+			"denied", p ? p->iName : "outside the allow-list");
+		return KErrNone;
+		}
+	if (Is(aArg[1], "wspeed"))							// "wspeed [MB]" (64): system_b from 1 MB in, C: not on it
+		{
+		const TUint32 mb = aArgc >= 3 && aNum[2] >= 1 && aNum[2] <= 512 ? (TUint32)aNum[2] : 64;
+		const TUint64 at = Parts[0].iFirst + 2048;
+		if (KBootDrive || !WriteAllowed(at, (TInt)(mb << 11)))
+			return KErrAccessDenied;
+		NKern::ThreadEnterCS();
+		TUint8* src = (TUint8*)Kern::Alloc(KXfer);
+		TUint8* back = (TUint8*)Kern::Alloc(KXfer);
+		NKern::ThreadLeaveCS();
+		TInt r = src && back ? KErrNone : KErrNoMemory;
+		for (TInt i = 0; src && i < KXfer; ++i)
+			src[i] = (TUint8)(i * 7 + (i >> 12));
+		TUint32 t0 = NKern::TickCount();
+		const TInt per = KXfer / KA64BlkSector;
+		for (TUint32 i = 0; i < mb * 4 && r == KErrNone; ++i)	// 4 x 256 KB per MB
+			r = A64BlkDev_Write(at + i * per, per, src);
+		TInt ms = Max(1, (TInt)((NKern::TickCount() - t0) * NKern::TickPeriod() / 1000));
+		TInt same = -1;										// the last piece, read back
+		if (r == KErrNone && (r = A64BlkDev_Read(at + (mb * 4 - 1) * per, per, back)) == KErrNone)
+			same = memcompare(src, KXfer, back, KXfer) == 0;
+		if (r == KErrNone && same != 1)
+			r = KErrCorrupt;
+		NKern::ThreadEnterCS();
+		Kern::Free(src);
+		Kern::Free(back);
+		NKern::ThreadLeaveCS();
+		A64Device_Format(aOut, "ufs: wrote %d MB at %d in %d ms (%d KB/s), read back %s -> %d", mb, (TInt)at, ms,
+			(TInt)((TUint64)mb * 1024 * 1000 / ms), same == 1 ? "matches" : "MISMATCH", r);
+		return r;
+		}
+	if (Is(aArg[1], "hash") && aArgc >= 3)				// "hash <part> [MB]" (64): SHA-256 of a partition's start
+		{
+		const TPart* p = NULL;
+		for (TInt i = 0; i < KParts; ++i)
+			if (Is(aArg[2], Parts[i].iName) && Parts[i].iFound == 1)
+				p = &Parts[i];
+		if (!p)
+			return KErrNotFound;
+		const TUint32 mb = aArgc >= 4 && aNum[3] >= 1 && aNum[3] <= 1024 ? (TUint32)aNum[3] : 64;
+		if (((TUint64)mb << 11) > p->iLast - p->iFirst + 1)
+			return KErrArgument;
+		NKern::ThreadEnterCS();
+		SHA256* sha = new SHA256;							// heap: a static would need a C++ constructor run
+		TUint8* buf = (TUint8*)Kern::Alloc(1 << 20);
+		NKern::ThreadLeaveCS();
+		TInt r = sha && buf ? KErrNone : KErrNoMemory;
+		for (TUint32 i = 0; r == KErrNone && i < mb; ++i)		// 1 MB at a time (4 reads in flight)
+			{
+			TLock lock;
+			if ((r = ReadSpan(KWriteLun, p->iFirst * KA64BlkSector + ((TUint64)i << 20), 1 << 20, buf)) == KErrNone)
+				sha->Update(buf, 1 << 20);
+			}
+		A64Device_Format(aOut, "ufs: %s first %d MB sha256 ", p->iName, mb);
+		if (r == KErrNone)
+			{
+			const TUint8* h = sha->Final().Ptr();
+			for (TInt i = 0; i < KSHA256HashSize; ++i)
+				A64Device_Format(aOut, "%02x", h[i]);
+			}
+		A64Device_Format(aOut, " -> %d", r);
+		NKern::ThreadEnterCS();
+		delete sha;
+		Kern::Free(buf);
+		NKern::ThreadLeaveCS();
+		return r;
+		}
 	if (Is(aArg[1], "irq") && aArgc >= 3)					// "irq on" / "irq off" (polled)
 		{
 		TLock lock;
@@ -900,7 +1181,8 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		A64Device_Format(aOut, "ufs: %s", IrqOn ? "interrupts" : "polled");
 		return IrqOn == IrqWanted ? KErrNone : KErrNotSupported;
 		}
-	aOut.Append((const TUint8*)"blk init | reset | gear | luns | lun <n> | speed [MB] | irq on|off", 66);
+	aOut.Append((const TUint8*)"blk init | reset | gear | luns | lun <n> | speed [MB] | irq on|off | guard <sector> | "
+		"wspeed [MB] | hash <part> [MB] | wtest", 124);
 	return KErrArgument;
 	}
 

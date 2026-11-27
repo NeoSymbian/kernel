@@ -389,7 +389,8 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		}
 	else if (aArgc >= 2 && (Eq(aArg[1], "speed") || Eq(aArg[1], "guard") || Eq(aArg[1], "mode") ||
 		Eq(aArg[1], "luns") || Eq(aArg[1], "lun") ||
-		Eq(aArg[1], "reset") || Eq(aArg[1], "gear") || Eq(aArg[1], "irq")))	// the board's
+		Eq(aArg[1], "reset") || Eq(aArg[1], "gear") || Eq(aArg[1], "irq") ||
+		Eq(aArg[1], "wspeed") || Eq(aArg[1], "hash")))	// the board's
 		{
 		TBuf8<200> b;
 		TInt r = KErrNone, x;

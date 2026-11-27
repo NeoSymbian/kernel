@@ -390,7 +390,7 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 	else if (aArgc >= 2 && (Eq(aArg[1], "speed") || Eq(aArg[1], "guard") || Eq(aArg[1], "mode") ||
 		Eq(aArg[1], "luns") || Eq(aArg[1], "lun") ||
 		Eq(aArg[1], "reset") || Eq(aArg[1], "gear") || Eq(aArg[1], "irq") ||
-		Eq(aArg[1], "wspeed") || Eq(aArg[1], "hash")))	// the board's
+		Eq(aArg[1], "wspeed") || Eq(aArg[1], "hash") || Eq(aArg[1], "inject")))	// the board's
 		{
 		TBuf8<200> b;
 		TInt r = KErrNone, x;
@@ -398,7 +398,7 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 		Say("%S (%d, trap %d)", &b, r, x);
 		}
 	else
-		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> | blk wtest | blk speed | blk guard <lba> | blk mode <0-2> | blk luns | blk lun <n> | blk reset | blk gear | blk irq on|off");
+		Say("blk init | blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> | blk wtest | blk speed | blk guard <lba> | blk mode <0-2> | blk luns | blk lun <n> | blk reset | blk gear | blk irq on|off | blk inject <n>");
 	}
 
 // smooth-ui S3b: per CPU, the core type (MIDR part) and the real clock: PMU cycles over 5 ms of the generic timer,

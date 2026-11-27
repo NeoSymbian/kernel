@@ -95,6 +95,12 @@ static TUint32 Vendor, Spec;							// the device descriptor's manufacturer ID an
 static TBuf8<200> Report[32];
 static TInt NReport;
 static TUint32 UicErrors, FatalErrors, Timeouts;
+// error handling (U6, Linux's ufshcd_err_handler reduced): a timeout, a fatal error, a PA_INIT error or a lost host
+// marks the link Broken; the block entry points then Recover() (reset and restore) and run the request again
+static TBool Broken;
+static TUint32 Resets, ResetFails;
+static TInt Inject;										// "blk inject N": the N-th request from now meets a fault
+static TBool InjectDev;									// ... a device reset (else: the host disabled)
 
 // completion by interrupt: the ISR masks the level line and adds an IDFC that wakes the waiting thread; the thread
 // clears IS.UTRCS and unmasks (as qcom_wcn3990.cpp's copy engines). A 10-ms timer bounds every wait.
@@ -163,9 +169,12 @@ static void TakeErrors()
 		TUint32 pa = R(EUecpa), dl = R(EUecdl), n = R(EUecn), t = R(EUect), dme = R(EUecdme);
 		if (++UicErrors <= 8)
 			Log("uic error: pa %08x dl %08x n %08x t %08x dme %08x", pa, dl, n, t, dme);
+		if (dl & 0x2000)									// PA_INIT: the link must be started again (Linux)
+			Broken = ETrue;
 		}
 	if (is & ~EIsUe)
 		{
+		Broken = ETrue;
 		if (++FatalErrors <= 8)
 			Log("error status %08x, hcs %08x", is, R(EHcs));
 		}
@@ -250,6 +259,14 @@ static void Start(TInt aSlot, TUint32 aDd, TUint32 aBytes)
 	utrd[7] = ((KPrdt / 4) << 16) | (aBytes ? 1 : 0);	// PRDT offset (dwords), entries
 	__e32_memory_barrier();
 	R(EUtrldbr) = 1u << aSlot;
+	if (Inject && --Inject == 0)						// "blk inject": a fault with this request in flight
+		{
+		Log("inject: %s, slot %d in flight", InjectDev ? "device reset" : "host disabled", aSlot);
+		if (InjectDev)
+			UfsVop_DeviceReset();
+		else
+			R(EHce) = 0;
+		}
 	}
 
 // until the doorbell bits aMask are clear or aUs passed: the bits still set (cleared from the list, counted)
@@ -286,8 +303,11 @@ static TUint32 WaitSlots(TUint32 aMask, TInt aUs, const char* aWhat, TInt aCode)
 		R(EUtrlclr) = ~left;							// writing 0 clears a slot
 		Poll(EUtrldbr, left, 0, 1000000, 100);
 		++Timeouts;
+		Broken = ETrue;									// shortcut: no ABORT TASK first, a timeout resets the link
 		Log("%s %02x timed out: slots %08x is %08x hcs %08x", aWhat, aCode, left, R(EIs), R(EHcs));
 		}
+	if (!(R(EHce) & 1) || !(R(EHcs) & EHcsDp))			// the host reset itself or lost the device: no doorbell to trust
+		Broken = ETrue;
 	if (!IrqOn)
 		R(EIs) = EIsUtrcs;
 	TakeErrors();
@@ -478,6 +498,8 @@ static TInt ReadSpan(TInt aLun, TUint64 aFrom, TUint32 aBytes, TUint8* aBuf)
 			Start(q, 2, n * bs);
 			}
 		TUint32 left = WaitSlots((1u << q) - 1, 1000000, "read", q);
+		if (Broken)
+			return KErrTimedOut;							// the caller resets and reads again
 		b = first;
 		for (TInt s = 0; s < q; ++s, b += per)
 			{
@@ -739,6 +761,9 @@ static void WakeDevice()
 	Log("device w-lun: start stop unit (active) -> %d status %d sense %06x; power mode now %02x", r, status, sense, mode);
 	}
 
+static TInt Bringup();
+static TInt Gear();
+
 static TInt Adopt()
 	{
 	if (!UfsVop_Clocked())
@@ -778,13 +803,49 @@ static TInt FullInit()
 	if (r != KErrNone)
 		return r;
 	Log("full init: hw %08x cap %08x ver %08x", R(0xe4), R(ECap), R(EVer));
+	if ((r = Bringup()) != KErrNone)
+		return r;
+	r = ScanLuns();
+	Ours = r == KErrNone;
+	if (r == KErrNone)
+		FindParts();
+	return r;
+	}
+
+// Linux ufshcd_reset_and_restore, reduced: the device and the host again, the link, NOP, fDeviceInit, the gear; up
+// to 5 tries. The LUNs and the allow-list stay as found (the same device). Under Lock.
+static TInt Recover(const char* aWhy)
+	{
+	TInt r = KErrGeneral;
+	for (TInt k = 1; k <= 5 && r != KErrNone; ++k)			// always back to HS-G3: the speed the block layer had
+		{
+		++Resets;
+		r = Bringup();
+		if (r == KErrNone)
+			r = Gear();
+		Log("recover (%s): try %d -> %d", aWhy, k, r);
+		}
+	if (r != KErrNone)
+		{
+		++ResetFails;
+		Broken = ETrue;
+		}
+	else
+		Ours = ETrue;
+	return r;
+	}
+
+// from the device reset to an initialised, active device (FullInit's and Recover's common part)
+static TInt Bringup()
+	{
 	SetIrq(EFalse);
 	R(EIs) = R(EIs);
 	UfsVop_DeviceReset();
-	Log("full init: HCE");
-	if ((r = HbaEnable()) != KErrNone)
+	Log("bring-up: HCE");
+	TInt r = HbaEnable();
+	if (r != KErrNone)
 		return r;
-	Log("full init: link");
+	Log("bring-up: link");
 	if ((r = LinkStartup()) != KErrNone)
 		return r;
 	if ((r = MakeOperational()) != KErrNone)
@@ -792,7 +853,7 @@ static TInt FullInit()
 	for (TInt k = 0; k < 10; ++k)							// the device may need a moment after the link
 		if ((r = Nop()) == KErrNone)
 			break;
-	Log("full init: nop -> %d", r);
+	Log("bring-up: nop -> %d", r);
 	if (r != KErrNone)
 		return r;
 	TUint32 flag = 1;
@@ -803,16 +864,13 @@ static TInt FullInit()
 			break;
 		Ufs_Delay(2000);
 		}
-	Log("full init: fDeviceInit -> %d (flag %d)", r, flag);
+	Log("bring-up: fDeviceInit -> %d (flag %d)", r, flag);
 	if (r != KErrNone || flag)
 		return r != KErrNone ? r : KErrTimedOut;
 	ReadDevice();
 	WakeDevice();
-	r = ScanLuns();
-	Ours = r == KErrNone;
-	if (r == KErrNone)
-		FindParts();
-	return r;
+	Broken = EFalse;										// the NOP tries above may have timed out
+	return KErrNone;
 	}
 
 // HS-G3, Rate B, both lanes, fast mode (Linux ufshcd_change_power_mode with ufs-qcom's limits)
@@ -849,11 +907,10 @@ static TInt Gear()
 
 // ---- the block backend (a64_blk.h) and the monitor
 
-// at boot only with EMMC_C=1: our own bring-up, HS-G3, and LUN 0 as the device (system_b its window)
+// at boot, every build: our own bring-up and HS-G3 (U6). With EMMC_C=1, LUN 0 is the device (system_b its window);
+// else the "blk" commands find UFS up and C: stays the RAM drive
 TInt A64BlkDev_Init(TUint64& aSectors)
 	{
-	if (!KBootDrive)
-		return KErrNotSupported;
 	TInt r = Prepare();
 	if (r != KErrNone)
 		return InitResult = r;
@@ -861,6 +918,8 @@ TInt A64BlkDev_Init(TUint64& aSectors)
 	if ((r = InitResult = FullInit()) != KErrNone)
 		return r;
 	Log("boot: gear -> %d", Gear());						// a slow link still works
+	if (!KBootDrive)
+		return KErrNotSupported;
 	aSectors = (TUint64)Luns[KWriteLun].iBlocks * (Luns[KWriteLun].iBlockSize / KA64BlkSector);
 	return KErrNone;
 	}
@@ -887,6 +946,26 @@ static TInt WriteBlocks(TUint32 aBlock, TUint32 aCount)	// from Buf(0)
 	return Scsi(KWriteLun, cdb, aCount * Luns[KWriteLun].iBlockSize);
 	}
 
+// a block request with the error handling around it: a broken link is reset and restored, then the request runs
+// again (3 tries). Writing the same sectors twice is harmless. Under Lock.
+#define UFS_RETRY(aWhat, aCall)																\
+	TInt r = KErrNotReady;																	\
+	for (TInt k = 0; k < 3; ++k)															\
+		{																					\
+		if (Broken && Recover(aWhat) != KErrNone)											\
+			continue;																		\
+		if ((r = (aCall)) == KErrNone || !Broken)											\
+			break;																			\
+		}																					\
+	return r
+
+static TInt ReadRetry(TInt aLun, TUint64 aFrom, TUint32 aBytes, TUint8* aBuf)
+	{
+	UFS_RETRY("read", ReadSpan(aLun, aFrom, aBytes, aBuf));
+	}
+
+static TInt WriteSpan(TUint64 aLba, TInt aCount, const TUint8* aBuf);
+
 // 512-byte sectors of LUN 0, inside system_b only; a part-block is read first (one slot at a time)
 TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
 	{
@@ -895,6 +974,11 @@ TInt A64BlkDev_Write(TUint64 aLba, TInt aCount, const TUint8* aBuf)
 	if (!WriteAllowed(aLba, aCount))					// a second check under a64_blk.cpp's window, whoever asks
 		return KErrAccessDenied;
 	TLock lock;
+	UFS_RETRY("write", WriteSpan(aLba, aCount, aBuf));
+	}
+
+static TInt WriteSpan(TUint64 aLba, TInt aCount, const TUint8* aBuf)
+	{
 	const TUint32 bs = Luns[KWriteLun].iBlockSize;
 	TUint64 from = aLba * KA64BlkSector;
 	TUint32 bytes = (TUint32)aCount * KA64BlkSector;
@@ -975,7 +1059,7 @@ TInt A64BlkDev_Read(TUint64 aLba, TInt aCount, TUint8* aBuf)	// 512-byte sectors
 	const TUint32 per = l.iBlockSize / KA64BlkSector;
 	if (!l.iBlocks || aCount <= 0 || aLba + aCount > (TUint64)l.iBlocks * per)
 		return KErrArgument;
-	return ReadSpan(Cur, aLba * KA64BlkSector, aCount * KA64BlkSector, aBuf);
+	return ReadRetry(Cur, aLba * KA64BlkSector, aCount * KA64BlkSector, aBuf);
 	}
 
 // "blk info" (and Volume Up): the state, read only
@@ -994,9 +1078,9 @@ void A64BlkDump()
 			DmeGetOr(EPaActiveRxLanes), DmeGetOr(EPaConnectedTxLanes), DmeGetOr(EPaConnectedRxLanes),
 			DmeGetOr(EPaHsSeries));
 		}
-	Kern::Printf("[ufs] %s; manufacturer %04x; errors: uic %d fatal %d timeouts %d; %s, irqs %d waits %d",
-		Ours ? "our own bring-up" : "adopted or not up", Vendor, UicErrors, FatalErrors, Timeouts,
-		IrqOn ? "interrupts" : "polled", Irqs, Waits);
+	Kern::Printf("[ufs] %s; manufacturer %04x; errors: uic %d fatal %d timeouts %d; resets %d (failed %d)%s; %s, "
+		"irqs %d waits %d", Ours ? "our own bring-up" : "adopted or not up", Vendor, UicErrors, FatalErrors, Timeouts,
+		Resets, ResetFails, Broken ? ", BROKEN" : "", IrqOn ? "interrupts" : "polled", Irqs, Waits);
 	Kern::Printf("[ufs] writes: %s; system_b sectors %d..%d (found %d)", !KWritable ? "off (read-only build)" :
 		KBootDrive ? "C: + E: on system_b" : "monitor only", (TInt)Parts[0].iFirst, (TInt)Parts[0].iLast,
 		Parts[0].iFound);
@@ -1099,7 +1183,7 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		TLock lock;
 		const TUint32 mb = aArgc >= 3 && aNum[2] >= 1 && aNum[2] <= 1024 ? (TUint32)aNum[2] : 64;
 		TUint32 t0 = NKern::TickCount(), irqs = Irqs;
-		TInt r = ReadSpan(0, 0, mb << 20, NULL);
+		TInt r = ReadRetry(0, 0, mb << 20, NULL);
 		TInt ms = Max(1, (TInt)((NKern::TickCount() - t0) * NKern::TickPeriod() / 1000));
 		A64Device_Format(aOut, "ufs: read %d MB in %d ms (%d KB/s) -> %d; %s, %d irqs", mb, ms,
 			(TInt)((TUint64)mb * 1024 * 1000 / ms), r, IrqOn ? "interrupts" : "polled", Irqs - irqs);
@@ -1165,7 +1249,7 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		for (TUint32 i = 0; r == KErrNone && i < mb; ++i)		// 1 MB at a time (4 reads in flight)
 			{
 			TLock lock;
-			if ((r = ReadSpan(KWriteLun, p->iFirst * KA64BlkSector + ((TUint64)i << 20), 1 << 20, buf)) == KErrNone)
+			if ((r = ReadRetry(KWriteLun, p->iFirst * KA64BlkSector + ((TUint64)i << 20), 1 << 20, buf)) == KErrNone)
 				sha->Update(buf, 1 << 20);
 			}
 		A64Device_Format(aOut, "ufs: %s first %d MB sha256 ", p->iName, mb);
@@ -1182,6 +1266,15 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		NKern::ThreadLeaveCS();
 		return r;
 		}
+	if (Is(aArg[1], "inject") && aArgc >= 3)				// "inject <n> [dev]": the n-th request from now meets a fault
+		{
+		TLock lock;
+		Inject = (TInt)Min(aNum[2], (TUint64)1000000);
+		InjectDev = aArgc >= 4 && Is(aArg[3], "dev");
+		A64Device_Format(aOut, "ufs: request %d from now: %s", Inject, !Inject ? "no fault" : InjectDev ?
+			"device reset" : "host disabled");
+		return KErrNone;
+		}
 	if (Is(aArg[1], "irq") && aArgc >= 3)					// "irq on" / "irq off" (polled)
 		{
 		TLock lock;
@@ -1191,7 +1284,7 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		return IrqOn == IrqWanted ? KErrNone : KErrNotSupported;
 		}
 	aOut.Append((const TUint8*)"blk init | reset | gear | luns | lun <n> | speed [MB] | irq on|off | guard <sector> | "
-		"wspeed [MB] | hash <part> [MB] | wtest", 124);
+		"wspeed [MB] | hash <part> [MB] | wtest | inject <n> [dev]", 143);
 	return KErrArgument;
 	}
 
@@ -1210,7 +1303,9 @@ static TA64DevState UfsStatus(TDes8& aDetail)
 	TInt luns = 0;
 	for (TInt i = 0; i < KLuns; ++i)
 		luns += Luns[i].iBlocks != 0;
-	A64Device_Format(aDetail, "read-only, %d LUNs, %s, polled", luns, Ours ? "own bring-up" : "ABL's link adopted");
+	A64Device_Format(aDetail, "%s, %d LUNs, %s, %s; resets %d (failed %d)", !KWritable ? "read-only" : KBootDrive ?
+		"C: on system_b" : "system_b writable", luns, Ours ? "own bring-up" : "ABL's link adopted",
+		IrqOn ? "interrupts" : "polled", Resets, ResetFails);
 	return EA64DevPartial;
 	}
 A64_DEVICE("ufs", "Storage (UFS)", "ufshcd", UfsStatus);

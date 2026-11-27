@@ -6,7 +6,7 @@
 // Pixel -- and answer through that transport's blocking writer:
 //   help | log | lastlog | drivers (the device registry, a64_device.h) | peek <phys> [n] | poke <phys> <val> | spmi r <sid> <addr> | spmi w <sid> <addr> <val>
 //   rpmh <bcm> (vote a bus clock manager, Pixel) | scm | smem | fw ls|sha | smp2p | qmp | mss | glink (telephony, Pixel: qcom_telmon.cpp)
-//   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> (vendor_a/_b, EMMC_C=2) | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
+//   blk info | blk gpt | blk read <lba> [n] | blk dump <lba> <n> | blk put <lba> <n> (vendor_a/_b, DISK_C=2) | slot | slot ok (dry run) | slot ok now | slot boot (dry run) | touch | keys | threads | cpus | cpufreq | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [moves [ms]]
 //   key <scancode> | type <text> | shot | reboot | poweroff | fastboot | thermal | rtc | date <unix UTC s> [UTC offset s]
 // "shot" sends "SHOT <w> <h>\n" and then w*h*4 bytes of BGRX pixels; "blk dump" sends "DUMP <n>\n", n*512 raw bytes,
 // then a text line with their SHA-256; every other answer is text, ending "\n.\n".
@@ -390,7 +390,7 @@ static void Blk(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum)
 	else if (aArgc >= 2 && (Eq(aArg[1], "speed") || Eq(aArg[1], "guard") || Eq(aArg[1], "mode") ||
 		Eq(aArg[1], "luns") || Eq(aArg[1], "lun") ||
 		Eq(aArg[1], "reset") || Eq(aArg[1], "gear") || Eq(aArg[1], "irq") ||
-		Eq(aArg[1], "wspeed") || Eq(aArg[1], "hash") || Eq(aArg[1], "inject")))	// the board's
+		Eq(aArg[1], "wspeed") || Eq(aArg[1], "hash") || Eq(aArg[1], "inject") || Eq(aArg[1], "head")))	// the board's
 		{
 		TBuf8<200> b;
 		TInt r = KErrNone, x;
@@ -458,7 +458,7 @@ static void Shot()
 	}
 
 // ---- "blk put <lba> <n>" (telephony C5b): n sectors from the host, written from lba on. Only into vendor_a or vendor_b
-// (the firmware ext4), and only where the eMMC driver's allow-list lets a write through (an EMMC_C=2 build). The host
+// (the firmware ext4), and only where the eMMC driver's allow-list lets a write through (an DISK_C=2 build). The host
 // waits for "PUT <n>", sends n*512 raw bytes, and gets "put sha256 <hex> err <e> written <bytes>": SHA-256 of what
 // arrived; every 64 KB stage is written, read back and compared.
 __attribute__((weak)) TInt A64Usb_RawIn(TInt) { return KErrNotSupported; }

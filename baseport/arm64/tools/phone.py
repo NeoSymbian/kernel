@@ -9,7 +9,7 @@ with nothing but the Python standard library and the fastboot tool.
       first it sets the phone's clock to the Mac's (monitor "date"; neoui then keeps it), unless --no-date
   phone.py cmd C...          run commands on a phone already up
   phone.py shot OUT.png      the framebuffer as a PNG
-  phone.py put vendor_a|vendor_b FILE   FILE onto the partition (kernel "blk put", EMMC_C=2 builds), verified
+  phone.py put vendor_a|vendor_b FILE   FILE onto the partition (kernel "blk put", DISK_C=2 builds), verified
   phone.py dump PART OUT     a GPT partition by name (or FIRST:COUNT sectors), read-only, checked against the
                              kernel's SHA-256; prints the hash (docs hardware/modem.md C0: radio partition backups)
   phone.py console [--log F] interactive (Ctrl-D ends), optionally capture continuously
@@ -163,7 +163,7 @@ class Console:
 
     def put(self, first, data, secs=600):
         """data (padded to whole sectors) onto the eMMC from sector first: "blk put", which the kernel allows only
-        inside vendor_a/vendor_b in an EMMC_C=2 build; returns the SHA-256, checked against the kernel's"""
+        inside vendor_a/vendor_b in an DISK_C=2 build; returns the SHA-256, checked against the kernel's"""
         data = data + bytes(-len(data) % 512)
         n = len(data) // 512
         self.read(0.3)

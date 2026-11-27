@@ -13,6 +13,8 @@
 set -eu
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/tools/paths.sh"
+# DISK_C=1|2: C: on the phone's storage (eMMC or UFS); EMMC_C is its old name, still accepted
+DISK_C=${DISK_C:-${EMMC_C:-}}
 OUT=${OUT:-$HERE/../../out/ekern-$BOARD}
 BASE=$KERNEL_BASE
 X=${CROSS:-aarch64-linux-gnu-}

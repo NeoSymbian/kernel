@@ -5,7 +5,7 @@
 // written anew; the SoC parts are the vendor hooks (ufshcd.h, qcom_ufs.cpp).
 // - Two ways up: Adopt() takes over the host and link the bootloader leaves running ("blk init"); FullInit() brings
 //   them up itself, from the core reset on ("blk reset"). Gear() then moves the link to HS-G3, 2 lanes ("blk gear").
-// - Writes (EMMC_C builds) reach only system_b on LUN 0, checked twice: A64BlkDev_Write against the partition, and
+// - Writes (DISK_C builds) reach only system_b on LUN 0, checked twice: A64BlkDev_Write against the partition, and
 //   Build() against the WRITE(10)'s own LUN and blocks. Every other opcode outside the allow-list is refused; the
 //   only query that writes is SET_FLAG fDeviceInit.
 // - The block layer's sectors are 512 bytes; the LUNs' blocks are 4096: reads go through bounce buffers, writes of
@@ -61,11 +61,11 @@ static TPhysAddr DescPhys, DataPhys;
 static volatile TUint32* Desc;
 static TUint8* Data;
 
-// EMMC_C=1: C: (and E:) on system_b at boot; EMMC_C=2: writes from the monitor only (C: stays the RAM drive);
+// DISK_C=1: C: (and E:) on system_b at boot; DISK_C=2: writes from the monitor only (C: stays the RAM drive);
 // unset: read-only. The name is the Pixel's flag, which build/neo already passes through.
-#ifdef A64_EMMC_C
+#ifdef A64_DISK_C
 const TBool KWritable = ETrue;
-const TBool KBootDrive = A64_EMMC_C == 1;
+const TBool KBootDrive = A64_DISK_C == 1;
 #else
 const TBool KWritable = EFalse;
 const TBool KBootDrive = EFalse;
@@ -717,7 +717,7 @@ static void FindParts()
 	for (TInt p = 0; p < KParts; ++p)
 		Log("allow-list: %s sectors %d..%d (found %d), %s", Parts[p].iName, (TInt)Parts[p].iFirst,
 			(TInt)Parts[p].iLast, Parts[p].iFound, !Parts[p].iWritable ? "read-only" : WriteAllowed(Parts[p].iFirst, 1) ?
-			(KBootDrive ? "writable, C: + E:" : "writable (monitor only)") : "not writable");
+			(KBootDrive ? "writable, C:" : "writable (monitor only)") : "not writable");
 	}
 
 // the device descriptor: manufacturer (for the vendor's quirks), spec version, LUN count
@@ -907,7 +907,7 @@ static TInt Gear()
 
 // ---- the block backend (a64_blk.h) and the monitor
 
-// at boot, every build: our own bring-up and HS-G3 (U6). With EMMC_C=1, LUN 0 is the device (system_b its window);
+// at boot, every build: our own bring-up and HS-G3 (U6). With DISK_C=1, LUN 0 is the device (system_b its window);
 // else the "blk" commands find UFS up and C: stays the RAM drive
 TInt A64BlkDev_Init(TUint64& aSectors)
 	{
@@ -924,17 +924,57 @@ TInt A64BlkDev_Init(TUint64& aSectors)
 	return KErrNone;
 	}
 
+// OP7: medblk writes an MBR and FAT over a window without our MBR, so system_b becomes C: only when its first 4 KB
+// hold our MBR (a FAT32 entry) or are all zero (a first boot). Anything else is another system's (an /e/OS update
+// into slot b, a flash): left alone, and C: stays the RAM drive
+static const char* HeadNote = "not checked";
+static TBool HeadIsOurs(const TUint8* aHead)
+	{
+	const TUint32 magic = aHead[1024] | aHead[1025] << 8 | aHead[1026] << 16 | (TUint32)aHead[1027] << 24;
+	if (aHead[510] == 0x55 && aHead[511] == 0xaa && aHead[0] != 0xeb && aHead[0] != 0xe9)	// an MBR, not a boot sector
+		for (TInt i = 0; i < 4; ++i)
+			if (aHead[446 + 16 * i + 4] == 0x0b || aHead[446 + 16 * i + 4] == 0x0c)
+				{
+				HeadNote = "our MBR: C:";
+				return ETrue;
+				}
+	TInt i = 0;
+	while (i < 4096 && !aHead[i])
+		++i;
+	if (i == 4096)
+		{
+		HeadNote = "blank: C: made here";
+		return ETrue;
+		}
+	HeadNote = aHead[1080] == 0x53 && aHead[1081] == 0xef ? "an ext4 filesystem: left alone, no C:" :
+		magic == 0xe0f5e1e2 ? "an erofs filesystem: left alone, no C:" :
+		magic == 0xf2f52010 ? "an f2fs filesystem: left alone, no C:" : "unknown data: left alone, no C:";
+	return EFalse;
+	}
+
 TInt A64BlkBoard_Window(TUint64, TUint64& aFirst, TUint64& aCount)
 	{
 	const TPart& p = Parts[0];
 	if (!KBootDrive || p.iFound != 1)
 		return KErrNotFound;
+	static TUint8 head[4096];
+	TInt r = A64BlkDev_Read(p.iFirst, 8, head);
+	if (r != KErrNone || !HeadIsOurs(head))
+		{
+		if (r != KErrNone)
+			HeadNote = "unreadable: no C:";
+		Log("system_b holds %s (%d)", HeadNote, r);
+		return r != KErrNone ? r : KErrInUse;
+		}
+	Log("system_b holds %s", HeadNote);
 	aFirst = p.iFirst;
 	aCount = p.iLast - p.iFirst + 1;
 	return KErrNone;
 	}
 
 TUint32 A64BlkDev_EraseBlock() { return Luns[KWriteLun].iBlockSize; }	// FAT's clusters on whole 4 KB blocks
+// shortcut: no UNMAP (A64BlkDev_Discard stays the weak no-op): a 2.79 GB C: on a 128 GB device can do without; add it
+// when C: or E: grows
 
 static TInt WriteBlocks(TUint32 aBlock, TUint32 aCount)	// from Buf(0)
 	{
@@ -1081,9 +1121,9 @@ void A64BlkDump()
 	Kern::Printf("[ufs] %s; manufacturer %04x; errors: uic %d fatal %d timeouts %d; resets %d (failed %d)%s; %s, "
 		"irqs %d waits %d", Ours ? "our own bring-up" : "adopted or not up", Vendor, UicErrors, FatalErrors, Timeouts,
 		Resets, ResetFails, Broken ? ", BROKEN" : "", IrqOn ? "interrupts" : "polled", Irqs, Waits);
-	Kern::Printf("[ufs] writes: %s; system_b sectors %d..%d (found %d)", !KWritable ? "off (read-only build)" :
-		KBootDrive ? "C: + E: on system_b" : "monitor only", (TInt)Parts[0].iFirst, (TInt)Parts[0].iLast,
-		Parts[0].iFound);
+	Kern::Printf("[ufs] writes: %s; system_b sectors %d..%d (found %d), its start: %s", !KWritable ?
+		"off (read-only build)" : KBootDrive ? "C: on system_b" : "monitor only", (TInt)Parts[0].iFirst,
+		(TInt)Parts[0].iLast, Parts[0].iFound, HeadNote);
 	for (TInt i = 0; i < NReport; ++i)
 		Kern::Printf("[ufs] %S", &Report[i]);
 	}
@@ -1266,6 +1306,22 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		NKern::ThreadLeaveCS();
 		return r;
 		}
+	if (Is(aArg[1], "head") && aArgc >= 3)					// "head zero|ext4" (DISK_C=2): system_b's first 4 KB
+		{
+		const TBool ext4 = Is(aArg[2], "ext4");
+		if (KBootDrive || (!ext4 && !Is(aArg[2], "zero")) || !WriteAllowed(Parts[0].iFirst, 8))
+			return KErrAccessDenied;
+		static TUint8 head[4096];
+		memclr(head, sizeof(head));
+		if (ext4)
+			{
+			head[1080] = 0x53;								// a test: only the ext4 superblock's magic
+			head[1081] = 0xef;
+			}
+		TInt r = A64BlkDev_Write(Parts[0].iFirst, 8, head);
+		A64Device_Format(aOut, "ufs: system_b's first 4 KB %s -> %d", ext4 ? "carry an ext4 magic" : "zeroed", r);
+		return r;
+		}
 	if (Is(aArg[1], "inject") && aArgc >= 3)				// "inject <n> [dev]": the n-th request from now meets a fault
 		{
 		TLock lock;
@@ -1284,7 +1340,7 @@ TInt A64BlkDev_Monitor(TInt aArgc, const TPtrC8* aArg, const TUint64* aNum, TDes
 		return IrqOn == IrqWanted ? KErrNone : KErrNotSupported;
 		}
 	aOut.Append((const TUint8*)"blk init | reset | gear | luns | lun <n> | speed [MB] | irq on|off | guard <sector> | "
-		"wspeed [MB] | hash <part> [MB] | wtest | inject <n> [dev]", 143);
+		"wspeed [MB] | hash <part> [MB] | wtest | inject <n> [dev] | head zero|ext4", 160);
 	return KErrArgument;
 	}
 

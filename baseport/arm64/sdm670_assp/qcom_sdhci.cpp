@@ -9,7 +9,7 @@
 // The window (a64_blk.cpp) is the GPT partition "userdata" (C: and E: inside it, through the MBR a64_medblk.cpp
 // keeps in its sector 0); below it, writes must fall inside an enabled partition of the allow-list (Parts), whoever
 // asks. FAT's delete notifications become eMMC TRIM (A64BlkDev_Discard).
-// Writes stay off unless built with EMMC_C=1 (-DA64_EMMC_C): without it, the backend only reports (Volume Up) and
+// Writes stay off unless built with DISK_C=1 (-DA64_DISK_C): without it, the backend only reports (Volume Up) and
 // C: stays the RAM drive.
 // shortcut: polled, bounded spins, no HS200/HS400 (tuning) and no command queue: DDR52 is the top mode.
 #include <kernel/kern_priv.h>
@@ -32,11 +32,11 @@ enum { EModeDma = 1 << 0, EModeCount = 1 << 1, EModeAutoCmd12 = 1 << 2, EModeRea
 enum { ERespR1 = 0x1a, ERespR1Data = 0x3a };			// 48-bit response, CRC + index check (+ data present)
 const TInt KSpin = 2000000;							// ~0.2 s of register reads: fail fast, never stall boot
 
-// EMMC_C=1: C: is the window at boot; EMMC_C=2: writes allowed, but only the monitor touches the eMMC (C: stays
+// DISK_C=1: C: is the window at boot; DISK_C=2: writes allowed, but only the monitor touches the eMMC (C: stays
 // the RAM drive); unset: read-only
-#ifdef A64_EMMC_C
+#ifdef A64_DISK_C
 const TBool KWritable = ETrue;
-const TBool KBootDrive = A64_EMMC_C == 1;
+const TBool KBootDrive = A64_DISK_C == 1;
 #else
 const TBool KWritable = EFalse;
 const TBool KBootDrive = EFalse;
@@ -51,8 +51,8 @@ static TUint32 EraseBytes;								// EXT_CSD HC_ERASE_GRP_SIZE, if it divides KA
 
 // vendor_a/_b: the firmware ext4 (the factory image's /vendor/firmware: IPA, ADSP), owner's OK 2026-11-09. ABL refuses
 // to flash them outside fastbootd, whose partition map our ROFS replaced, so only the monitor's "blk put" writes them,
-// and only in an EMMC_C=2 build (telephony C5b)
-#if defined(A64_EMMC_C) && A64_EMMC_C == 2
+// and only in an DISK_C=2 build (telephony C5b)
+#if defined(A64_DISK_C) && A64_DISK_C == 2
 const TBool KVendorWritable = ETrue;
 #else
 const TBool KVendorWritable = EFalse;
@@ -538,7 +538,7 @@ static TInt Reinit()
 
 static TInt DoInit(TUint64& aSectors);
 
-// at boot only in the EMMC_C build; else the monitor's "blk init" (a hang then stops only the console's thread)
+// at boot only in the DISK_C build; else the monitor's "blk init" (a hang then stops only the console's thread)
 TInt A64BlkDev_Init(TUint64& aSectors)
 	{
 	if (!KBootDrive)
@@ -844,7 +844,7 @@ static TUint64 GapEnd()
 	return end;
 	}
 
-// the monitor's "blk wtest" (EMMC_C builds, after "blk init"): write, read back and compare a pattern on window
+// the monitor's "blk wtest" (DISK_C builds, after "blk init"): write, read back and compare a pattern on window
 // sectors 1..8 (free, between the MBR and C:), then zero them
 TInt A64BlkDev_SelfTest()
 	{
@@ -897,7 +897,7 @@ static TA64DevState EmmcStatus(TDes8& aDetail)
 	{
 	if (InitResult == KErrNotReady)
 		{
-		A64Device_Format(aDetail, KBootDrive ? "not started yet" : "not used by this build (EMMC_C=1 puts C: and E: on it)");
+		A64Device_Format(aDetail, KBootDrive ? "not started yet" : "not used by this build (DISK_C=1 puts C: and E: on it)");
 		return KBootDrive ? EA64DevStarting : EA64DevOff;
 		}
 	if (InitResult != KErrNone)
